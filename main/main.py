@@ -4,7 +4,7 @@ import re
 import telebot
 import sqlite3
 
-from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu
+from .bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu
 from math import ceil
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, ReplyKeyboardMarkup, \
@@ -1837,3 +1837,4 @@ def edit_post_details(message):
 # Запуск бота
 if __name__ == "__main__":
     bot.polling(none_stop=True)
+    #pizdec
