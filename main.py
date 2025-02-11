@@ -4,7 +4,7 @@ import re
 import telebot
 import sqlite3
 
-from .bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu
+from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu
 from math import ceil
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, ReplyKeyboardMarkup, \
@@ -33,7 +33,7 @@ def save_post(chat_id, photo, price, description, quantity):
     if not price.isdigit() or not str(quantity).isdigit():
         raise ValueError("Цена и количество должны быть числами.")
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute(
         'INSERT INTO posts (chat_id, photo, price, description, quantity, is_sent) VALUES (?, ?, ?, ?, ?, ?)',
@@ -42,7 +42,7 @@ def save_post(chat_id, photo, price, description, quantity):
     conn.close()
 
 def save_reservation(user_id, post_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('INSERT INTO reservations (user_id, post_id) VALUES (?, ?)', (user_id, post_id))
     conn.commit()
@@ -50,7 +50,7 @@ def save_reservation(user_id, post_id):
 
 def set_user_role(user_id, role):
     """Устанавливаем или обновляем роль пользователя."""
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('REPLACE INTO clients (user_id, role) VALUES (?, ?)', (user_id, role))
     conn.commit()
@@ -58,7 +58,7 @@ def set_user_role(user_id, role):
 
 def get_user_role(user_id):
     """Получаем роль пользователя."""
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('SELECT role FROM clients WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
@@ -74,7 +74,7 @@ def list_unsent_posts(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем неотправленные посты
@@ -222,7 +222,7 @@ def handle_phone(message):
 
 # Проверка на черный список
 def is_user_blacklisted(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM black_list WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
@@ -232,7 +232,7 @@ def is_user_blacklisted(user_id):
 
 # Проверка регистрации пользователя
 def is_user_registered(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM clients WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
@@ -243,7 +243,7 @@ def is_user_registered(user_id):
 # Функция для сохранения данных в базу с user_id
 def save_user(name, phone, user_id):
     """Сохранение пользователя с проверкой на роль администратора."""
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     # Определяем роль: "admin" для определённого user_id, иначе "client"
     role = "admin" if user_id == 5411051275 else "client"  # Подставьте ваш user_id администратора
@@ -256,7 +256,7 @@ def save_user(name, phone, user_id):
 # Функция для сохранения данных в базу с user_id
 def save_user(name, phone, user_id):
     """Сохранение пользователя с проверкой на роль администратора."""
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
 
@@ -305,7 +305,7 @@ def handle_reservation(call):
             show_alert=True
         )
     else:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
 
         # Проверяем доступное количество товара, а также получаем данные
@@ -380,7 +380,7 @@ def delete_previous_messages(user_id, user_request_id=None):
             user_messages[user_id] = []  # Очистка сохраненных сообщений
 
 def get_user_reservations(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Добавляем is_fulfilled для каждого заказа
@@ -437,7 +437,7 @@ def handle_delete_post(call):
         post_id = int(call.data.split("_")[2])  # Получаем ID поста из callback_data
 
         # Подключение к базе данных
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
 
         # Удаляем пост из базы данных
@@ -461,7 +461,7 @@ def handle_delete_post(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("order_"))
 def order_details(call):
     reservation_id = call.data.split("_")[1]
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     # Получаем информацию о заказе
     cursor.execute("""
@@ -506,7 +506,7 @@ def my_orders(message):
     user_id = message.chat.id
     name = message.from_user.first_name
     message_id = message.message_id  # ID сообщения, которое отправил пользователь
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем информацию о заказах пользователя
@@ -596,7 +596,7 @@ def send_order_page(user_id, message_id, orders, page):
         InlineKeyboardButton(f"🧾 Общая сумма: {total_sum} ₽.", callback_data="total_sum")
     )
 
-    photo_placeholder = open("../images/my_cart.jpg", "rb")  # Путь к фото
+    photo_placeholder = open("images/my_cart.jpg", "rb")  # Путь к фото
 
     if message_id:
         # Изменяем текущее сообщение
@@ -622,7 +622,7 @@ def send_order_page(user_id, message_id, orders, page):
 @bot.callback_query_handler(func=lambda call: call.data in ["next_page","prev_page"])
 def paginate_orders(call):
     user_id = call.message.chat.id
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute("""
         SELECT reservations.id, posts.description, reservations.is_fulfilled, posts.price
@@ -660,7 +660,7 @@ def cancel_reservation(call):
     try:
         user_id = call.from_user.id
         reservation_id = int(call.data.split("_")[1])
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
         cursor.execute("""
             SELECT reservations.post_id, posts.quantity, reservations.is_fulfilled
@@ -728,7 +728,7 @@ def update_user_orders_menu(chat_id, message_id, page=0):
     Функция для обновления раздела "Ваши заказы" с поддержкой страниц
     """
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
         # Получаем все заказы пользователя
         cursor.execute("""
@@ -769,7 +769,7 @@ def update_user_orders_menu(chat_id, message_id, page=0):
 
         # Заглушка с фото для обновления сообщения
         if current_orders:
-            photo_placeholder = open("../images/my_cart.jpg", "rb")  # Смените путь к вашей картинке
+            photo_placeholder = open("images/my_cart.jpg", "rb")  # Смените путь к вашей картинке
             bot.edit_message_media(
                 media=InputMediaPhoto(media=photo_placeholder, caption=f"Ваши заказы (стр. {page + 1} из {total_pages}):"),
                 chat_id=chat_id,
@@ -785,7 +785,7 @@ def update_user_orders_menu(chat_id, message_id, page=0):
 
 @bot.message_handler(func=lambda message: message.text == "🔄 Переслать забронированные посты")
 def forward_reserved_posts(message):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем забронированные посты
@@ -819,7 +819,7 @@ def send_all_reserved_to_group(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     try:
@@ -872,7 +872,7 @@ def delete_message_from_group(call):
 
     try:
         # Обновляем статус выполнения заказа
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
         cursor.execute('UPDATE reservations SET is_fulfilled = 1 WHERE id = ?', (reservation_id,))
         conn.commit()
@@ -902,7 +902,7 @@ def mark_fulfilled(call):
     reservation_id = int(call.data.split("_")[2])
 
     # Обновляем статус выполнения заказа
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('UPDATE reservations SET is_fulfilled = 1 WHERE id = ?', (reservation_id,))
     conn.commit()
@@ -916,7 +916,7 @@ def mark_fulfilled(call):
 def view_cart(call):
     client_id = int(call.data.split("_")[2])  # Извлечение ID клиента из callback_data
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем список товаров в корзине клиента
@@ -949,7 +949,7 @@ def mark_fulfilled(call):
     reservation_id = int(call.data.split("_")[2])
 
     # Обновляем статус выполнения заказа в базе данных
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('UPDATE reservations SET is_fulfilled = 1 WHERE id = ?', (reservation_id,))
     conn.commit()
@@ -969,7 +969,7 @@ def sync_posts_with_channel(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('SELECT id, message_id FROM posts')
     posts = cursor.fetchall()
@@ -998,7 +998,7 @@ def mark_fulfilled(call):
     reservation_id = int(call.data.split("_")[2])
 
     # Обновляем статус выполнения заказа
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('UPDATE reservations SET is_fulfilled = 1 WHERE id = ?', (reservation_id,))
     conn.commit()
@@ -1008,7 +1008,7 @@ def mark_fulfilled(call):
     bot.send_message(call.message.chat.id, "Товар успешно обновлён.")
 
 def get_user_reservations_split(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Разделяем зарезервированные и выполненные заказы
@@ -1029,7 +1029,7 @@ def get_user_reservations_split(user_id):
 def clear_cart(call):
     client_id = int(call.data.split("_")[2])
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Удаляем все заказы клиента
@@ -1043,7 +1043,7 @@ def clear_cart(call):
     bot.send_message(call.message.chat.id, "Корзина клиента успешно расформирована.")
 
 def get_all_posts():
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     # Запрос всех постов независимо от chat_id
     cursor.execute('SELECT id, chat_id, photo, price, description, quantity FROM posts')
@@ -1054,7 +1054,7 @@ def get_all_posts():
 def update_post(post_id, price, description, quantity):
     if not price.isdigit() or not str(quantity).isdigit():
         raise ValueError("Цена и количество должны быть числами.")
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('UPDATE posts SET price = ?, description = ?, quantity = ? WHERE id = ?',
                    (price, description, quantity, post_id))
@@ -1062,7 +1062,7 @@ def update_post(post_id, price, description, quantity):
     conn.close()
 
 def is_registered(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM clients WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
@@ -1071,7 +1071,7 @@ def is_registered(user_id):
 
 def register_client(user_id, name, phone):
     """Регистрация клиента с ролью 'client' по умолчанию."""
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Подготовка запроса для вставки данных с ролью 'client'
@@ -1153,7 +1153,7 @@ def process_delete_client_phone(message):
         bot.send_message(user_id, "У вас недостаточно прав.")
         return
     phone = message.text
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     protected_user_id = 5411051275
 
@@ -1217,7 +1217,7 @@ def search_client_by_phone(message):
 def handle_client_search(message):
     search_query = message.text.strip()
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     if search_query.lower() == "все":  # Если пользователь ввел "Все" (регистр не важен)
@@ -1281,7 +1281,7 @@ def calculate_sums_for_client(client_id):
     """
     Рассчитывает общую сумму заказов клиента и сумму выполненных заказов.
     """
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем user_id клиента
@@ -1312,7 +1312,7 @@ def calculate_sums_for_client(client_id):
 def view_cart(call):
     client_id = int(call.data.split("_")[2])  # Извлечение ID клиента из callback_data
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем содержимое корзины клиента
@@ -1343,7 +1343,7 @@ def view_cart(call):
 def mark_fulfilled(call):
     reservation_id = int(call.data.split("_")[2])  # Извлечение ID брони
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Обновляем статус выполнения заказа
@@ -1366,7 +1366,7 @@ def handle_manage_clients_command(message):
     # Если пользователь администратор, вызываем функцию manage_clients
     manage_clients_v2(message)
 def manage_clients_v2(message):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, name, phone, role FROM clients ORDER BY role DESC")  # Отображать сначала админов и воркеров
@@ -1398,7 +1398,7 @@ def handle_set_role(call):
     client_id = int(call.data.split("_")[2])
     new_role = "worker" if "set_worker" in call.data else "client"
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Установим новую роль для пользователя
@@ -1447,7 +1447,7 @@ def update_client_data(message):
     client_id = temp_user_data[message.chat.id]["client_id"]
     new_value = message.text
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     if state == "EDITING_NAME":
         cursor.execute("UPDATE clients SET name = ? WHERE id = ?", (new_value, client_id))
@@ -1465,7 +1465,7 @@ def handle_delete_client(call):
     client_id = int(call.data.split("_")[2])
 
     # Удаляем клиента из базы данных
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
     cursor.execute("DELETE FROM clients WHERE id = ?", (client_id,))
     conn.commit()
@@ -1542,7 +1542,7 @@ def manage_posts(message):
 
     # Подключение к базе данных и извлечение необходимых постов
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = sqlite3.connect('main/bot_database.db')
         cursor = conn.cursor()
         cursor.execute('SELECT id, photo, price, description, quantity FROM posts WHERE is_sent = 0')
         posts = cursor.fetchall()
@@ -1596,7 +1596,7 @@ def manage_posts(message):
             bot.send_message(user_id, f"Ошибка при отправке поста #{post_id}: {e}")
 
 def get_reserved_count():
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Подсчитываем общее количество забронированных товаров
@@ -1631,7 +1631,7 @@ def send_new_posts_to_channel(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect('main/bot_database.db')
     cursor = conn.cursor()
 
     # Получаем имя пользователя
