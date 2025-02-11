@@ -1,0 +1,9 @@
+{
+  "database": {
+  "host": "91.135.157.20",
+  "port": "5432",
+  "username": "gen_user",
+  "password": "Anubis22052002",
+  "name": "default_db"
+  }
+}
