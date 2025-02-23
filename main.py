@@ -346,47 +346,6 @@ def is_user_registered(phone: str) -> bool:
         print(f"Ошибка проверки пользователя: {e}")
         return False
 
-# Установка роли для человека
-# @bot.message_handler(commands=["setrole"])
-# def set_role_command(message):
-#     user_id = message.chat.id
-#
-#     # Проверяем, есть ли у текущего пользователя права администратора
-#     user_data = Clients.get_row(user_id)  # Передаем только ID
-#     if not user_data or user_data.role != "admin":
-#         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
-#         return
-#
-#     try:
-#         # Ожидаем ввод в формате "/setrole user_id role"
-#         _, target_user_id, role = message.text.split()  # Команда, ID, роль
-#         target_user_id = int(target_user_id)  # Преобразуем ID в int
-#
-#         # Проверяем валидность роли
-#         if role not in ["client", "worker", "admin"]:
-#             bot.send_message(
-#                 user_id, "Некорректная роль. Используйте одну из: client, worker, admin."
-#             )
-#             return
-#
-#         # Проверяем, существует ли пользователь с указанным ID
-#         target_user_data = Clients.get_row(target_user_id)  # Снова передаем только ID
-#         if not target_user_data:
-#             bot.send_message(user_id, f"Пользователь с ID {target_user_id} не найден.")
-#             return
-#
-#         # Обновляем роль пользователя в базе
-#         Clients.update_row_to_role({"id": target_user_id}, {"role": role})
-#
-#         bot.send_message(
-#             user_id,
-#             f"Роль '{role}' успешно установлена для пользователя {target_user_id}.",
-#         )
-#     except ValueError:
-#         bot.send_message(user_id, "Неверный формат команды. Используйте: /setrole user_id role")
-#     except Exception as e:
-#         bot.send_message(user_id, f"Произошла ошибка: {e}")
-
 # Обработчик запроса бронирования
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reserve_"))
 def handle_reservation(call):
@@ -623,7 +582,7 @@ def my_orders(message):
             user_last_message_id[user_id] = new_message.message_id  # Сохраняем последнее сообщение для пользователя
         else:
             # Если заказов нет, отправляем сообщение с предложением перейти на канал
-            keyboard.add(InlineKeyboardButton(text="На канал", url="https://t.me/mgskidkitest"))
+            keyboard.add(InlineKeyboardButton(text="На канал", url="https://t.me/MegaSkidkiTg"))
             new_message = bot.send_message(
                 chat_id=user_id,
                 text="У вас пока нет заказов. Начните покупки, перейдя на наш канал.",
