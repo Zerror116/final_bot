@@ -694,68 +694,78 @@ def paginate_orders(call):
 # Обработка отмены заказа
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
 def cancel_reservation(call):
-    reservation_id = int(call.data.split("_")[1])  # Извлекаем ID бронирования
-    user_id = call.from_user.id  # Берём ID пользователя
+       reservation_id = int(call.data.split("_")[1])  # Извлекаем ID бронирования
+       user_id = call.from_user.id  # Берём ID пользователя
 
-    try:
-        # Получаем данные о бронировании через ORM
-        order = Reservations.get_row_by_id(reservation_id)
-        if not order or order.user_id != user_id:
-            bot.answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
-            return
+       try:
+           # Получаем данные о бронировании через ORM
+           order = Reservations.get_row_by_id(reservation_id)
+           if not order or order.user_id != user_id:
+               bot.answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
+               return
 
-        # Проверяем, выполнено ли бронирование
-        if order.is_fulfilled:
-            bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
-            return
+           # Проверяем, выполнено ли бронирование
+           if order.is_fulfilled:
+               bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
+               return
 
-        # Получаем информацию о товаре
-        post = Posts.get_row_by_id(order.post_id)
-        if not post:
-            bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
-            return
+           # Получаем информацию о товаре
+           post = Posts.get_row_by_id(order.post_id)
+           if not post:
+               bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
+               return
 
-        # Удаляем заказ из Reservations
-        success = Reservations.cancel_order_by_id(reservation_id)
-        if not success:
-            bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
-            return
+           # Удаляем заказ из Reservations
+           success = Reservations.cancel_order_by_id(reservation_id)
+           if not success:
+               bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
+               return
 
-        # Увеличиваем количество товара
-        Posts.increment_quantity_by_id(order.post_id)
+           # Увеличиваем количество товара
+           Posts.increment_quantity_by_id(order.post_id)
 
-        # Обновляем пост на канале, увеличив количество
-        if post.message_id:  # Если у товара сохранён message_id поста
-            new_quantity = post.quantity + 1  # Увеличенное количество
-            updated_caption = (
-                f"Товар: {post.description}\n"
-                f"Цена: {post.price} ₽\n"
-                f"Количество: {new_quantity}"
-            )
-            markup = InlineKeyboardMarkup()
-            reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
-            to_bot_button = InlineKeyboardButton("В Бота", url="https://t.me/MegaSkidkiTgBot?start=start")
-            markup.add(reserve_button, to_bot_button)
+           # Удаляем сообщение о товаре в группе (основано на post.message_id)
+           if post.message_id:  # Если сообщение связано с товаром
+               try:
+                   bot.delete_message(chat_id=TARGET_GROUP_ID, message_id=post.message_id)
+                   print(f"Сообщение с ID {post.message_id} удалено из группы {TARGET_GROUP_ID}.")
+               except Exception as e:
+                   print(f"Ошибка удаления сообщения из группы: {e}")
+           else:
+               print("Не найден message_id для удаления сообщения из группы.")
 
-            try:
-                bot.edit_message_caption(
-                    chat_id=CHANNEL_ID,
-                    message_id=post.message_id,
-                    caption=updated_caption,
-                    reply_markup=markup,
-                )
-            except Exception as e:
-                print(f"Ошибка обновления поста на канале: {e}")
+           # Обновляем пост на канале, увеличив количество
+           if post.message_id:  # Если у товара сохранён message_id поста
+               new_quantity = post.quantity + 1  # Увеличенное количество
+               updated_caption = (
+                   f"Товар: {post.description}\n"
+                   f"Цена: {post.price} ₽\n"
+                   f"Количество: {new_quantity}"
+               )
+               markup = InlineKeyboardMarkup()
+               reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
+               to_bot_button = InlineKeyboardButton("В Бота", url="https://t.me/MegaSkidkiTgBot?start=start")
+               markup.add(reserve_button, to_bot_button)
 
-        # Уведомляем об успешной отмене
-        bot.answer_callback_query(call.id, "Вы успешно отказались от товара.", show_alert=False)
+               try:
+                   bot.edit_message_caption(
+                       chat_id=CHANNEL_ID,
+                       message_id=post.message_id,
+                       caption=updated_caption,
+                       reply_markup=markup,
+                   )
+               except Exception as e:
+                   print(f"Ошибка обновления поста на канале: {e}")
 
-        # Перенаправляем пользователя в меню "Мои заказы"
-        my_orders(call.message)
+           # Уведомляем об успешной отмене
+           bot.answer_callback_query(call.id, "Вы успешно отказались от товара.", show_alert=False)
 
-    except Exception as e:
-        print(f"Ошибка при отказе от заказа: {e}")
-        bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+           # Перенаправляем пользователя в меню "Мои заказы"
+           my_orders(call.message)
+
+       except Exception as e:
+           print(f"Ошибка при попытке отказаться от заказа: {e}")
+           bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
 
 # Возврат в меню заказов
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
@@ -883,51 +893,74 @@ def mark_fulfilled(call):
         # Получаем ID брони из callback_data
         reservation_id = int(call.data.split("_")[2])
 
-        # Получаем бронирование из базы данных
+        # Загружаем бронирование из базы данных
         reservation = Reservations.get_row_by_id(reservation_id)
         if not reservation:
             bot.answer_callback_query(call.id, "Бронь не найдена.", show_alert=True)
             return
 
-        # Проверяем, не было ли уже обработано
+        # Проверяем, не было ли уже отмечено
         if reservation.is_fulfilled:
-            bot.answer_callback_query(call.id, "Этот товар уже отмечен как положенный.", show_alert=True)
+            bot.answer_callback_query(
+                call.id, "Этот товар уже отмечен как положенный.", show_alert=True
+            )
             return
 
         # Получаем имя пользователя (кто положил)
         user_first_name = call.from_user.first_name or "Администратор"
         user_username = call.from_user.username
-        user_who = f"{user_first_name} (@{user_username})" if user_username else user_first_name
+        user_who = (
+            f"{user_first_name} (@{user_username})"
+            if user_username
+            else user_first_name
+        )
 
-        # Обновляем статус брони в базе данных
-        reservation.is_fulfilled = True
+        # Обновляем статус текущей брони
         with Session(bind=engine) as session:
+            reservation.is_fulfilled = True
             session.merge(reservation)
             session.commit()
 
+            # Проверяем, остались ли ещё необработанные брони
+            remaining_reservations = (
+                session.query(Reservations).filter_by(is_fulfilled=False).count()
+            )
+
+        # Если больше нет необработанных товаров, удаляем сообщение
+        if remaining_reservations == 0:
+            bot.delete_message(
+                chat_id=call.message.chat.id, message_id=call.message.message_id
+            )
+            bot.answer_callback_query(
+                call.id, "Все товары обработаны, сообщение удалено из канала."
+            )
+            return
+
         # Формируем обновлённое описание поста
-        original_caption = call.message.caption or call.message.text  # Сохраняем оригинальный текст
+        original_caption = (
+            call.message.caption or call.message.text
+        )  # Сохраняем оригинальный текст
         updated_caption = (
             f"{original_caption}\n\n"
             f"✅ Этот заказ был обработан.\n"
             f"👤 Кто положил: {user_who}"
         )
 
-        # Изменяем сообщение в группе (обновляем caption или текст)
+        # Обновляем описание сообщения (caption или text)
         if call.message.photo:
             bot.edit_message_caption(
-                chat_id=call.message.chat.id,  # Сообщение остается в том же месте, где была нажата кнопка
+                chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                caption=updated_caption
+                caption=updated_caption,
             )
         else:
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=updated_caption
+                text=updated_caption,
             )
 
-        # Уведомляем пользователя через callback, что действие выполнено
+        # Уведомляем администратора, что товар положен
         bot.answer_callback_query(call.id, "Товар отмечен как положенный!")
 
     except Exception as e:

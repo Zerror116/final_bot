@@ -91,4 +91,3 @@ class Reservations(AbstractModel):
                 query = query.filter(Reservations.user_id == user_id)
             return query.all()
 
-
