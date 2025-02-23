@@ -36,10 +36,16 @@ class Clients(AbstractModel):
                 raise
 
     @staticmethod
-    def get_row_all(user_id: int):
+    def get_row_all(user_id=None):
+        """
+        Получить все строки из таблицы клиентов.
+        Если указан user_id, фильтровать по нему.
+        """
         with Session(bind=engine) as session:
-            query = session.query(Clients).filter(Clients.user_id == user_id).all()
-            return query
+            query = session.query(Clients)
+            if user_id is not None:
+                query = query.filter(Clients.user_id == user_id)
+            return query.all()
 
     @staticmethod
     def get_row(user_id):
@@ -122,6 +128,6 @@ class Clients(AbstractModel):
         """
         Метод для поиска клиента по последним цифрам его номера телефона.
         """
-        from db import Session, engine
         with Session(bind=engine) as session:
             return session.query(Clients).filter(Clients.phone.endswith(phone_digits)).first()
+
