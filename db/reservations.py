@@ -91,3 +91,21 @@ class Reservations(AbstractModel):
                 query = query.filter(Reservations.user_id == user_id)
             return query.all()
 
+    @staticmethod
+    def delete_row(reservation_id: int):
+        """Удаляет строку из таблицы reservations по id."""
+        with Session(bind=engine) as session:
+            try:
+                # Ищем запись по reservation_id
+                reservation = session.query(Reservations).filter_by(id=reservation_id).first()
+
+                # Если запись найдена - удаляем
+                if reservation:
+                    session.delete(reservation)
+                    session.commit()
+                    return True  # Запись успешно удалена
+                else:
+                    return False  # Запись с таким id не найдена
+            except Exception as e:
+                session.rollback()  # В случае ошибки откатываем изменения
+                raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")

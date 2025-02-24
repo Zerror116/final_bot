@@ -27,13 +27,15 @@ def worker_main_menu():
 
 def admin_main_menu():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    create_new_post = KeyboardButton("➕ Новый пост")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
+    my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
-    keyboard.add( manage_posts, send_new_posts_to_channel, manage_clients, send_all_reserved_to_group)
+    keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
+                 send_all_reserved_to_group)
     return keyboard
-
 def unknown_main_menu():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     registration_button = KeyboardButton("Регистрация")

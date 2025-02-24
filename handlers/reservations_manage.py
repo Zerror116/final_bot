@@ -1,11 +1,8 @@
 from db import Reservations, Posts
 
 
-# from db import engine, Session
-
 
 def delete_cart(user_id: int):
-    """Очистка корзины клиента."""
     try:
         # with Session(bind=engine) as session:
         #     reservations = session.query(Reservations).filter(Reservations.user_id == user_id).all()

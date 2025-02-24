@@ -1,7 +1,7 @@
 from db.clients import Clients
-from db.reservations import Reservations
 from db import engine, Session, Posts
 
+# Сохранение клиента в базе
 def save_client(name: str, phone: str, user_id: int, role: str = "client") -> str:
     """Сохраняет клиента в базе данных без дублирования номера."""
     try:
@@ -27,6 +27,7 @@ def save_client(name: str, phone: str, user_id: int, role: str = "client") -> st
     except Exception as e:
         return f"Ошибка при сохранении клиента: {e}"
 
+# Установка роли клиента
 def set_client_role(user_id: int, role: str = "client"):
     """Назначение клиенту роли."""
     try:
@@ -42,6 +43,7 @@ def set_client_role(user_id: int, role: str = "client"):
     except Exception as e:
         print(f"Ошибка при назначении роли: {e}")
 
+# Назначение роли клиенту/пользователю
 def manage_client_role(user_id: int, new_role: str):
     """Изменение роли клиента."""
     if new_role not in ["client", "worker", "admin"]:
@@ -54,6 +56,7 @@ def manage_client_role(user_id: int, new_role: str):
     except Exception as e:
         print(f"Ошибка при изменении роли: {e}")
 
+# Удаление клиента
 def delete_client(client_id: int):
     """Удаление клиента из базы данных."""
     try:
@@ -65,6 +68,7 @@ def delete_client(client_id: int):
     except Exception as e:
         print(f"Ошибка при удалении клиента: {e}")
 
+# Получение роли клиента
 def get_client_role(user_id: int) -> str:
     """Возвращает роль клиента по его user_id."""
     try:
@@ -77,24 +81,14 @@ def get_client_role(user_id: int) -> str:
         print(f"Ошибка при получении роли клиента: {e}")
         return "error"  # Возвращаем статус ошибки в случае сбоя
 
+# Возвращает инфу о клиенте
 def get_user_data(chat_id: int):
-    """
-    Возвращает информацию о пользователе. Например, имя пользователя.
-    Можно адаптировать для запроса данных из базы.
-    """
-    # Пример: Получение данных из базы Post (замените на реальную модель пользователя)
     return {"name": f"User {chat_id}"}  # Заглушка для примера
-
 
 # Получение постов пользователя
 def get_user_posts(chat_id: int):
-    """
-    Возвращает список постов пользователя по chat_id.
-    Предполагается использование модели Posts из базы данных.
-    """
     posts = Posts.get_row(chat_id=chat_id)
 
-    # Преобразуем данные в ожидаемый формат
     result = []
     for post in posts:
         result.append({

@@ -1,22 +1,22 @@
 import re
+import time
+
 import telebot
-import psycopg2
 
 
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-from database.config import TOKEN, CHANNEL_ID, ADMIN_USER_ID, TARGET_GROUP_ID
+from database.config import *
 from telebot.apihelper import ApiTelegramException
-from db import Reservations, Posts, Clients, BlackList
+from handlers.black_list import *
 from handlers.clients_manage import *
 from handlers.posts_manage import *
+from handlers.reservations_manage import *
 from types import SimpleNamespace
-from datetime import datetime, timedelta
-
 from handlers.reservations_manage import calculate_total_sum, calculate_processed_sum
 
-# Настройка бота
+# Настройка бота и кэш
 bot = telebot.TeleBot(TOKEN)
 user_messages = {}
 user_pages = {}
@@ -59,7 +59,7 @@ def list_unsent_posts(message):
     role = get_client_role(user_id)
 
     # Проверяем роль пользователя
-    if role not in ["admin", "worker"]:
+    if role not in ["admin", "worker", "supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -97,9 +97,6 @@ def handle_start(message):
     }
     greeting = greetings.get(role, "Привет, прошу пройти регистрацию")
 
-    # Ссылки для инлайн-клавиатуры
-    support_link = "https://t.me/+Li2_LC6Anm9iMTli"  # Ссылка на поддержку
-    channel_link = "https://t.me/MegaSkidkiTg"  # Ссылка на канал
 
     inline_markup = InlineKeyboardMarkup()
     inline_markup.add(InlineKeyboardButton("В поддержку", url=support_link))
@@ -162,7 +159,7 @@ def handle_start(message):
     except Exception as e:
         print(f"Ошибка при удалении сообщения пользователя {message.message_id}: {e}")
 
-
+# Хэндлер регистрации
 @bot.message_handler(func=lambda message: message.text == "Регистрация")
 def handle_registration(message):
     chat_id = message.chat.id
@@ -182,6 +179,7 @@ def handle_registration(message):
     set_user_state(chat_id, UserState.REGISTERING_NAME)
     bot.send_message(chat_id, "Введите ваше имя:")
 
+# Имя для регистрации
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == UserState.REGISTERING_NAME)
 def handle_name_registration(message):
     chat_id = message.chat.id
@@ -201,6 +199,7 @@ def handle_name_registration(message):
     set_user_state(chat_id, UserState.STARTED_REGISTRATION)
     bot.send_message(chat_id, "Введите ваш номер телефона:")
 
+# Номер для регистрации
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == UserState.STARTED_REGISTRATION)
 def handle_phone_registration(message):
     chat_id = message.chat.id
@@ -233,6 +232,7 @@ def handle_phone_registration(message):
     else:
         bot.send_message(chat_id, "❌ Введите корректный номер телефона. Например, +7XXXXXXXXXX")
 
+# Валидация номера телефона
 def is_phone_valid(phone):
     pattern = r"^(8|7|\+7)\d{10}$"
     return re.match(pattern, phone) is not None
@@ -329,14 +329,7 @@ def create_yes_no_keyboard():
     markup.add(types.KeyboardButton("Да"), types.KeyboardButton("Нет"))
     return markup
 
-# Проверка на черный список no
-def is_user_blacklisted(user_id: int) -> bool:
-    # Используем метод get_row для получения строки из таблицы black_list
-    blacklisted_user = BlackList.get_row(user_id)
-    # Если результат не пустой, то пользователь в черном списке
-    return bool(blacklisted_user)
-
-# Проверка регистрации пользователя no
+# Проверка регистрации пользователя
 def is_user_registered(phone: str) -> bool:
     try:
         with Session(bind=engine) as session:
@@ -540,12 +533,9 @@ def order_details(call):
         print(f"Ошибка отображения деталей заказа: {e}")
         bot.answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
 
+# Отображает список заказов
 @bot.callback_query_handler(func=lambda call: call.data == "my_orders")
 def show_my_orders(call):
-    """
-    Обработчик кнопки 'Назад'.
-    Отображает список заказов.
-    """
     message = call.message
     my_orders(message)  # Вызываем my_orders, передаём исходное сообщение
     bot.answer_callback_query(call.id)  # Подтверждаем обработку нажатия
@@ -753,15 +743,13 @@ def send_all_reserved_to_group(message):
     role = get_client_role(user_id)  # Получение роли клиента
 
     # Проверка ролей
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
     try:
         # Получение всех резерваций без фильтрации по конкретному пользователю
-        reservations = (
-            Reservations.get_row_all()
-        )  # Предполагается, что вы добавите метод `get_all` в Reservations
+        reservations = Reservations.get_row_all()  # Метод `get_all` в Reservations
 
         # Проверка: есть ли резервации
         if not reservations:
@@ -787,9 +775,7 @@ def send_all_reserved_to_group(message):
                 )
 
                 # Получение данных о посте через его ID
-                post_data = Posts.get_row(
-                    reservation.post_id
-                )  # Предполагается наличие метода get_row
+                post_data = Posts.get_row(reservation.post_id)  # Метод `get_row`
 
                 if not post_data:
                     bot.send_message(
@@ -807,9 +793,7 @@ def send_all_reserved_to_group(message):
                 description = post_data.description or "Описание отсутствует"
 
                 # Получение информации о клиенте
-                client_data = Clients.get_row(
-                    reservation.user_id
-                )  # Аналогично, проверка пользователя
+                client_data = Clients.get_row(reservation.user_id)
 
                 if not client_data:
                     bot.send_message(
@@ -860,6 +844,9 @@ def send_all_reserved_to_group(message):
                 )
                 print(f"⚠️ Ошибка при обработке резервации ID {reservation_id}: {e}")
 
+            # Задержка секунда перед обработкой следующего заказа
+            time.sleep(4)
+
         # Уведомление об успешной отправке
         bot.send_message(
             user_id, "✅ Все забронированные товары успешно отправлены в группу."
@@ -876,7 +863,7 @@ def mark_fulfilled(call):
     user_id = call.from_user.id
     role = get_client_role(user_id)  # Проверяем роль пользователя
 
-    if role != "admin":
+    if role != ["admin","supreme_leader"]:
         bot.answer_callback_query(
             call.id, "У вас нет прав доступа к этой функции.", show_alert=True
         )
@@ -965,7 +952,7 @@ def mark_fulfilled(call):
 def sync_posts_with_channel(message):
     role = get_client_role(message.chat.id)
     user_id = message.chat.id
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -1019,7 +1006,7 @@ def clear_cart(call):
 
     bot.send_message(call.message.chat.id, "Корзина клиента успешно расформирована.")
 
-# Проверка на регистрацию
+# Проверка на регистрацию(стэйты статуса)
 def is_registered(user_id):
     """
     Проверяет, зарегистрирован ли пользователь в таблице clients.
@@ -1041,14 +1028,13 @@ def clear_user_state(user_id):
     else:
         print(f"Состояние не найдено для пользователя {user_id}")
 
-
 # Обработчик кнопки "⚙️ Клиенты"
 @bot.message_handler(func=lambda message: message.text == "⚙️ Клиенты")
 def manage_clients(message):
     user_id = message.chat.id
     role = get_client_role(message.chat.id)
     # Проверяем, является ли пользователь администратором
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас недостаточно прав.")
         return
 
@@ -1057,65 +1043,33 @@ def manage_clients(message):
     markup.add("Удалить клиента по номеру телефона", "Просмотреть корзину", "⬅️ Назад")
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
 
-
 # Обработчик нажатия на кнопку "Просмотреть корзину"
 @bot.message_handler(func=lambda message: message.text == "Просмотреть корзину")
 def request_phone_last_digits(message):
     bot.send_message(
         message.chat.id,
-        "Введите последние 4 цифры номера телефона клиента или напишите 'Все', чтобы увидеть список всех пользователей:",
+        "Введите последние 4 цифры номера телефона клиента:",
     )
     set_user_state(message.chat.id, "AWAITING_PHONE_LAST_4")
 
 
-# Обработчик ввода последних 4 цифр номера телефона или текста "Все"
-@bot.message_handler( func=lambda message: get_user_state(message.chat.id) == "AWAITING_PHONE_LAST_4")
-def handle_phone_input_or_list_clients(message):
+@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "AWAITING_PHONE_LAST_4")
+def handle_phone_input(message):
     input_text = message.text.strip()
 
-    if input_text.lower() == "все":
-        # Получаем список всех пользователей
-        clients = Clients.get_row_all()
-
-        if not clients:
-            bot.send_message(message.chat.id, "Список пользователей пуст.")
-            clear_user_state(message.chat.id)
-            return
-
-        # Формируем сообщение без инлайн-кнопок "Просмотреть корзину"
-        for client in clients:
-            # Рассчитываем общую сумму заказов и обработанных заказов
-            total_orders = calculate_total_sum(client.user_id)
-            processed_orders = calculate_processed_sum(client.user_id)
-
-            bot.send_message(
-                message.chat.id,
-                f"Имя: {client.name}\n"
-                f"Телефон: {client.phone}\n"
-                f"Роль: {client.role}\n"
-                f"Общая сумма заказов: {total_orders} руб.\n"
-                f"Общая сумма обработанных заказов: {processed_orders} руб.",
-            )
-
-        clear_user_state(message.chat.id)  # Очищаем состояние
-        return
-
-    # Если ввод — последние 4 цифры номера телефона
+    # Проверяем, что введены последние 4 цифры номера телефона
     if not input_text.isdigit() or len(input_text) != 4:
         bot.send_message(
             message.chat.id,
-            "Введите корректные последние 4 цифры номера телефона (4 цифры) или 'Все'.",
+            "Введите корректные последние 4 цифры номера телефона (4 цифры).",
         )
         return
 
-    # Обрабатываем как ввод последних 4 цифр
+    # Показ корзины по последним 4 цифрам номера телефона
     show_cart_by_last_phone_digits(message, input_text)
 
 
 def show_cart_by_last_phone_digits(message, last_4_digits):
-    """
-    Показывает корзину по последним 4 цифрам номера телефона.
-    """
     client = Clients.get_row_by_phone_digits(last_4_digits)
 
     if not client:
@@ -1144,9 +1098,75 @@ def show_cart_by_last_phone_digits(message, last_4_digits):
     if not reservations:
         bot.send_message(message.chat.id, "Корзина пользователя пуста.")
     else:
-        send_cart_content(message.chat.id, reservations)
+        # Показываем содержимое корзины и добавляем кнопку "Расформировать"
+        send_cart_content(message.chat.id, reservations, client.user_id)
 
     clear_user_state(message.chat.id)
+
+
+def send_cart_content(chat_id, reservations, user_id):
+    """Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров"""
+    for reservation in reservations:
+        post = Posts.get_row_by_id(reservation.post_id)
+
+        if post:
+            # Отправляем фото и информацию о товаре
+            if post.photo:
+                bot.send_photo(
+                    chat_id,
+                    photo=post.photo,
+                    caption=(
+                        f"Описание: {post.description}\n"
+                        f"Количество: {reservation.quantity}\n"
+                        f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
+                    ),
+                )
+            else:
+                bot.send_message(
+                    chat_id,
+                    f"Описание: {post.description}\n"
+                    f"Количество: {reservation.quantity}\n"
+                    f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}",
+                )
+        else:
+            bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
+
+    # Добавляем кнопку "Расформировать обработанные"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
+    bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
+
+
+# Callback для кнопки "Расформировать обработанные"
+@bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
+def handle_clear_processed(call):
+    user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
+
+    # Удаляем только обработанные товары пользователя
+    cleared_items = clear_processed(user_id)
+
+    if cleared_items > 0:
+        bot.send_message(call.message.chat.id,
+                         f"Все обработанные товары (количество: {cleared_items}) были удалены из корзины.")
+    else:
+        bot.send_message(call.message.chat.id, "У пользователя нет обработанных товаров для удаления.")
+
+
+def clear_processed(user_id):
+    """Удаляет обработанные товары из корзины пользователя"""
+    # Получаем содержимое корзины пользователя
+    reservations = Reservations.get_row_by_user_id(user_id)
+
+    # Фильтруем только выполненные (обработанные) товары
+    processed_items = [item for item in reservations if item.is_fulfilled]
+
+    # Удаляем обработанные товары из БД
+    for item in processed_items:
+        Reservations.delete_row(item.id)
+
+    # Возвращаем количество удаленных товаров
+    return len(processed_items)
+
 
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
@@ -1172,44 +1192,13 @@ def callback_view_cart(call):
     else:
         send_cart_content(call.message.chat.id, reservations)
 
-
-def send_cart_content(chat_id, reservations):
-    """
-    Форматирует и отправляет содержимое корзины.
-    """
-    for reservation in reservations:
-        post = Posts.get_row_by_id(reservation.post_id)
-
-        if post:
-            # Отправляем фото и информацию о товаре
-            if post.photo:  # Если есть фото
-                bot.send_photo(
-                    chat_id,
-                    photo=post.photo,
-                    caption=(
-                        f"Описание: {post.description}\n"
-                        f"Количество: {reservation.quantity}\n"
-                        f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
-                    ),
-                )
-            else:
-                # Если фото нет, просто описываем товар текстом
-                bot.send_message(
-                    chat_id,
-                    f"Описание: {post.description}\n"
-                    f"Количество: {reservation.quantity}\n"
-                    f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}",
-                )
-        else:
-            bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
-
 # Удаление клиента по номеру телефона
 @bot.message_handler(func=lambda message: message.text == "Удалить клиента по номеру телефона")
 def delete_client_by_phone(message):
     user_id = message.chat.id
     role = get_client_role(message.chat.id)
     # Проверяем, является ли пользователь администратором
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас недостаточно прав.")
         return
     bot.send_message(message.chat.id, "Введите номер телефона клиента для удаления:")
@@ -1222,12 +1211,11 @@ def process_delete_client_phone(message):
     role = get_client_role(user_id)
 
     # Проверяем права пользователя
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас недостаточно прав.")
         return
 
     phone = message.text.strip()  # Убираем лишние пробелы
-    protected_user_id = 5411051275  # ID специального защищенного пользователя
 
     try:
         # Получаем клиента по номеру телефона
@@ -1271,9 +1259,6 @@ def process_delete_client_phone(message):
     finally:
         clear_user_state(user_id)
 
-#Просмотр корзины по 4 последним цифрам телефона(Доделать)
-
-
 # Возможность установить клиенту статус рабочего
 @bot.callback_query_handler(func=lambda call: call.data.startswith("set_worker_") or call.data.startswith("set_client_"))
 def handle_set_role(call):
@@ -1303,7 +1288,7 @@ def handle_set_role(call):
 def is_admin(user_id):
     """Проверяет, является ли пользователь администратором."""
     role = get_client_role(user_id)
-    return role == "admin"
+    return role == ["admin", "supreme_leader"]
 
 # Изменение клиента
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_client_"))
@@ -1339,7 +1324,7 @@ def create_new_post(message):
     user_id = message.chat.id
     role = get_client_role(user_id)
 
-    if role not in ["worker", "admin"]:
+    if role not in ["worker", "admin","supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -1355,7 +1340,7 @@ def handle_photo(message):
     user_id = message.chat.id
     role = get_client_role(user_id)
     state = get_user_state(message.chat.id)
-    if role not in ["worker", "admin"]:
+    if role not in ["worker", "admin","supreme_leader"]:
         bot.send_message(
             user_id, "Если у вас возникли вопросы, задайте их в чате поддержки"
         )
@@ -1407,23 +1392,43 @@ def handle_post_details(message):
 @bot.message_handler(func=lambda message: message.text == "📄 Посты")
 def manage_posts(message):
     user_id = message.chat.id
+    message_id = message.message_id  # ID самого запроса
+
+    # Удаляем запрос пользователя сразу же
+    try:
+        bot.delete_message(chat_id=user_id, message_id=message_id)
+    except Exception as e:
+        print(f"Не удалось удалить сообщение-запрос пользователя {user_id}: {e}")
+
     role = get_client_role(user_id)
 
     # Проверяем, что пользователь имеет соответствующую роль
-    if role not in ["admin", "worker"]:
+    if role not in ["admin", "worker", "supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
+
+    # Удаляем предыдущие сообщения, если они есть
+    if user_id in user_last_message_id:
+        for msg_id in user_last_message_id[user_id]:
+            try:
+                bot.delete_message(chat_id=user_id, message_id=msg_id)
+            except Exception as e:
+                print(f"Не удалось удалить сообщение {msg_id} для пользователя {user_id}: {e}")
+
+    # Очищаем список сообщений пользователя после удаления
+    user_last_message_id[user_id] = []
 
     try:
         # Получаем все посты, которые ещё не были отправлены на канал
         posts = Posts.get_unsent_posts()  # Используем метод get_unsent_posts для фильтрации
-
     except Exception as e:
-        bot.send_message(user_id, f"Пизда постам: {e}")
+        error_msg = bot.send_message(user_id, f"Ошибка получения постов: {e}")
+        user_last_message_id[user_id].append(error_msg.message_id)
         return
 
     if not posts:
-        bot.send_message(user_id, "Нет доступных постов.")
+        no_posts_msg = bot.send_message(user_id, "Нет доступных постов.")
+        user_last_message_id[user_id].append(no_posts_msg.message_id)
         return
 
     # Выводим информацию о каждом посте
@@ -1447,7 +1452,7 @@ def manage_posts(message):
         # Отправляем сообщение с фото или текстом
         try:
             if photo:
-                bot.send_photo(
+                msg = bot.send_photo(
                     chat_id=user_id,
                     photo=photo,
                     caption=f"**Пост #{post_id}:**\n"
@@ -1458,7 +1463,7 @@ def manage_posts(message):
                     reply_markup=markup,
                 )
             else:
-                bot.send_message(
+                msg = bot.send_message(
                     chat_id=user_id,
                     text=f"**Пост #{post_id}:**\n"
                          f"📍 *Описание:* {description}\n"
@@ -1467,8 +1472,11 @@ def manage_posts(message):
                     parse_mode="Markdown",
                     reply_markup=markup,
                 )
+            # Сохраняем ID отправленных сообщений
+            user_last_message_id[user_id].append(msg.message_id)
         except Exception as e:
-            bot.send_message(user_id, f"Ошибка при отправке поста #{post_id}: {e}")
+            error_msg = bot.send_message(user_id, f"Ошибка при отправке поста #{post_id}: {e}")
+            user_last_message_id[user_id].append(error_msg.message_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_post_"))
 def delete_post_handler(call):
@@ -1492,7 +1500,6 @@ def delete_post_handler(call):
         # Обработка исключений, если что-то пошло не так
         bot.answer_callback_query(call.id, f"Ошибка: {e}")
 
-
 # Кнопка назад
 @bot.message_handler(func=lambda message: message.text == "⬅️ Назад")
 def go_back(message):
@@ -1508,12 +1515,9 @@ def send_new_posts_to_channel(message):
     role = get_client_role(user_id)
 
     # Проверяем, есть ли права на отправку постов
-    if role not in ["admin"]:
+    if role not in ["admin","supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
-
-    # Получаем имя пользователя
-    user_first_name = message.chat.first_name or "Без имени"
 
     # Получаем посты, которые ещё не были отправлены в канал
     posts = Posts.get_unsent_posts()
@@ -1525,6 +1529,12 @@ def send_new_posts_to_channel(message):
             price = post.price
             description = post.description
             quantity = post.quantity
+
+            # Используем user_id из Posts, чтобы найти имя создателя поста в Clients
+            creator_user_id = post.chat_id
+            creator_name = Clients.get_name_by_user_id(creator_user_id) or "Неизвестный автор"
+
+            # Формируем описание поста для канала
             caption = f"Цена: {price}\nОписание: {description}\nОстаток: {quantity}"
 
             # Добавляем кнопки
@@ -1544,12 +1554,15 @@ def send_new_posts_to_channel(message):
 
             # Формируем сообщение для группы
             group_caption = (
-                f"Пост был выложен пользователем: {user_first_name}\n\n{caption}"
+                f"Пост был создан пользователем: {creator_name}\n\n{caption}"
             )
-            bot.send_photo(-1002330057848, photo=photo, caption=group_caption)
+            bot.send_photo(ARCHIVE, photo=photo, caption=group_caption)
 
             # Обновляем статус публикации
             Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
+
+            # Задержка секунда перед отправкой следующего поста
+            time.sleep(4)
 
         bot.send_message(
             user_id,
@@ -1573,7 +1586,7 @@ def edit_post(call):
 
     # Проверяем, имеет ли пользователь права на редактирование
     role = get_client_role(user_id)
-    if role not in ["admin", "worker"]:
+    if role not in ["admin", "worker","supreme_leader"]:
         bot.answer_callback_query(
             callback_query_id=call.id,
             text="У вас нет прав доступа к этой функции.",
@@ -1674,28 +1687,70 @@ def edit_post_details(message):
             )
 
 @bot.message_handler(commands=['statistic'])
-def handle_statistic_command(message):
-    """Обработчик команды /statistic."""
-    chat_id = message.chat.id
+def handle_statistic(message):
+    from datetime import datetime, timedelta
 
-    # Расчет статистики пользователя
-    statistics = calculate_user_statistics(chat_id)
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    days_range = {'today': (today.date(), today.date()), 'week': (monday.date(), today.date())}
 
-    username = statistics.get("username", "Неизвестный пользователь")
+    statistics = {"today": {}, "week": {}}
 
-    post_count_week = statistics.get("post_count", 0)
-    active_days = statistics.get("active_days", 0)
-    post_count_today = statistics.get("post_count_today", 0)
+    # Получение данных из базы данных
+    all_posts = Posts.get_row_all()  # Получаем все посты
+    print("Содержимое all_posts:", all_posts)  # Проверяем посты
 
-    # Формирование сообщения
-    response = (
-        f"Статистика для: {username}\n"
-        f"- Количество постов за неделю: {post_count_week}\n"
-        f"- Количество постов сегодня: {post_count_today}\n"
-        f"- Активных дней: {active_days}"
-    )
-    # Отправка сообщения пользователю
-    bot.send_message(chat_id, response)
+    all_clients = Clients.get_row_all()  # Получаем всех клиентов
+    print("Содержимое all_clients:", all_clients)  # Проверяем клиентов
+
+    # Преобразование клиентов в словарь {user_id: name}
+    clients_dict = {}
+    if not all_clients:
+        print("Данные all_clients пусты или None!")
+        clients_dict = {}
+    elif isinstance(all_clients, dict):
+        print("all_clients — это словарь. Преобразуем его в clients_dict.")
+        clients_dict = {key: value.get("name", "Неизвестный пользователь") for key, value in all_clients.items()}
+    elif isinstance(all_clients, list):
+        if all(isinstance(client, dict) for client in all_clients):
+            print("all_clients — это список словарей. Преобразуем в clients_dict.")
+            clients_dict = {client["user_id"]: client.get("name", "Неизвестный пользователь") for client in all_clients}
+        else:
+            print("all_clients — это список объектов. Преобразуем в clients_dict.")
+            clients_dict = {client.user_id: client.name for client in all_clients}
+    else:
+        raise TypeError(f"Unsupported data type for 'all_clients': {type(all_clients)}")
+
+    print("Преобразованный clients_dict:", clients_dict)
+
+    # Генерация статистики постов
+    for key, date_range in days_range.items():
+        for post in all_posts:
+            created_at = post.created_at.date()
+            print(f"Пост ID: {post.id}, chat_id: {post.chat_id}, created_at: {post.created_at}")
+
+            if date_range[0] <= created_at <= date_range[1]:
+                creator_name = clients_dict.get(post.chat_id, "Неизвестный пользователь")
+                print(f"Создатель поста с chat_id {post.chat_id}: {creator_name}")
+
+                if creator_name not in statistics[key]:
+                    statistics[key][creator_name] = 0
+
+                statistics[key][creator_name] += 1
+
+    # Формирование текста ответа
+    response = "📊 Статистика постов:\n"
+    for period, names_data in statistics.items():
+        period_label = "Сегодня" if period == "today" else "На этой неделе"
+        response += f"\n{period_label}:\n"
+
+        for name, count in names_data.items():
+            response += f"  - {name}: {count} постов\n"
+
+    if not statistics["today"] and not statistics["week"]:
+        response = "Нет статистики по постам за сегодня или неделю."
+
+    bot.send_message(message.chat.id, response)
 
 # Запуск бота
 if __name__ == "__main__":

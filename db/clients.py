@@ -36,16 +36,11 @@ class Clients(AbstractModel):
                 raise
 
     @staticmethod
-    def get_row_all(user_id=None):
-        """
-        Получить все строки из таблицы клиентов.
-        Если указан user_id, фильтровать по нему.
-        """
-        with Session(bind=engine) as session:
-            query = session.query(Clients)
-            if user_id is not None:
-                query = query.filter(Clients.user_id == user_id)
-            return query.all()
+    def get_row_all():
+        from sqlalchemy.orm import sessionmaker
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        return session.query(Clients.user_id, Clients.name, Clients.role).all()
 
     @staticmethod
     def get_row(user_id):
@@ -131,3 +126,9 @@ class Clients(AbstractModel):
         with Session(bind=engine) as session:
             return session.query(Clients).filter(Clients.phone.endswith(phone_digits)).first()
 
+    @staticmethod
+    def get_name_by_user_id(user_id):
+        client = Clients.get_row_by_user_id(user_id)
+        if client:
+            return client.name
+        return None
