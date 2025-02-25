@@ -743,8 +743,8 @@ def send_all_reserved_to_group(message):
     role = get_client_role(user_id)  # Получение роли клиента
 
     # Проверка ролей
-    if role not in ["admin","supreme_leader"]:
-        bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
+    if role not in ["supreme_leader", "admin"]:
+        bot.send_message(user_id, f"У вас нет прав доступа к этой функции. Ваша роль: {role}")
         return
 
     try:
@@ -791,6 +791,7 @@ def send_all_reserved_to_group(message):
                 photo = post_data.photo
                 price = post_data.price or "Не указана"
                 description = post_data.description or "Описание отсутствует"
+                data = post_data.created_at.strftime("%d.%m") if post_data.created_at else "Дата отсутствует"
 
                 # Получение информации о клиенте
                 client_data = Clients.get_row(reservation.user_id)
@@ -813,7 +814,8 @@ def send_all_reserved_to_group(message):
                     f"👤 Клиент: {client_name}\n"
                     f"📞 Телефон: {client_phone}\n"
                     f"💰 Цена: {price}₽\n"
-                    f"📦 Описание: {description}"
+                    f"📦 Описание: {description}\n"
+                    f"📅Дата:{data}"
                 )
 
                 # Создание кнопки
@@ -863,7 +865,7 @@ def mark_fulfilled(call):
     user_id = call.from_user.id
     role = get_client_role(user_id)  # Проверяем роль пользователя
 
-    if role != ["admin","supreme_leader"]:
+    if role not in ["admin", "supreme_leader"]:
         bot.answer_callback_query(
             call.id, "У вас нет прав доступа к этой функции.", show_alert=True
         )
@@ -1168,7 +1170,6 @@ def clear_processed(user_id):
     return len(processed_items)
 
 
-
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
 def callback_view_cart(call):
@@ -1288,7 +1289,7 @@ def handle_set_role(call):
 def is_admin(user_id):
     """Проверяет, является ли пользователь администратором."""
     role = get_client_role(user_id)
-    return role == ["admin", "supreme_leader"]
+    return role == ["admin"]
 
 # Изменение клиента
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_client_"))
