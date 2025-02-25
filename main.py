@@ -9,6 +9,8 @@ from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from database.config import *
 from telebot.apihelper import ApiTelegramException
+
+from db.temp_reservations import TempReservations
 from handlers.black_list import *
 from handlers.clients_manage import *
 from handlers.posts_manage import *
@@ -75,7 +77,7 @@ def list_unsent_posts(message):
         response = "📮 Неотправленные посты:\n"
         for post in unsent_posts:
             post_id, price, description, quantity = post
-            response += f"ID: {post_id} | Цена: {price}₽ | Описание: {description} | Количество: {quantity}\n"
+            response += f"ID: {post_id} | Цена: {price} ₽ | Описание: {description} | Количество: {quantity}\n"
         bot.send_message(user_id, response)
     else:
         bot.send_message(user_id, "✅ Все посты отправлены.")
@@ -342,7 +344,7 @@ def is_user_registered(phone: str) -> bool:
 # Обработчик запроса бронирования
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reserve_"))
 def handle_reservation(call):
-    post_id = int(call.data.split("_")[1])
+    post_id = int(call.data.split("_", 1)[1])
     user_id = call.from_user.id
 
     if is_user_blacklisted(user_id):
@@ -370,12 +372,42 @@ def handle_reservation(call):
 
     # Проверяем доступное количество товара
     if current_quantity == 0:
-        bot.answer_callback_query(
-            callback_query_id=call.id,
-            text="Этот товар уже забронирован полностью!",
-            show_alert=True,
-        )
+        # Проверяем, есть ли пользователь уже в очереди
+        with Session(bind=engine) as session:
+            user_in_queue = session.query(TempReservations).filter(
+                TempReservations.user_id == user_id,
+                TempReservations.post_id == post_id,
+                TempReservations.temp_fulfilled == False
+            ).first()
+
+            if user_in_queue:
+                bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text="Вы уже стоите в очереди за этим товаром!",
+                    show_alert=True,
+                )
+                return
+
+            # Добавляем в очередь, если не стоит
+            TempReservations.insert(
+                user_id=user_id,
+                quantity=1,  # Количество можно передавать динамически
+                post_id=post_id,
+                temp_fulfilled=False,
+            )
+            bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Вы добавлены в очередь на этот товар.",
+                show_alert=True,
+            )
         return
+
+    # Если товар доступен для бронирования
+    bot.answer_callback_query(
+        callback_query_id=call.id,
+        text="Ваш товар успешно забронирован.",
+        show_alert=False,
+    )
 
     # Сохраняем бронирование
     Reservations.insert(user_id=user_id, quantity=1, post_id=post_id, is_fulfilled=False)
@@ -391,7 +423,7 @@ def handle_reservation(call):
 
     # Формируем новое описание для сообщения в канале
     new_caption = (
-        f"Цена: {price}\nОписание: {description}\nОстаток: {new_quantity}"
+        f"Цена: {price} ₽\nОписание: {description}\nОстаток: {new_quantity}"
     )
 
     # Обновляем сообщение в канале
@@ -511,8 +543,7 @@ def order_details(call):
             return
 
         status = "✔️ Обработан" if order.is_fulfilled else "⌛ В обработке"
-        caption = f"Товар: {post.description}\nЦена: {post.price}\nСтатус: {status}"
-
+        caption = f"Цена: {post.price} ₽\nОписание: {post.description}\nСтатус: {status}"
         # Создаём кнопки возврата или отмены
         markup = InlineKeyboardMarkup()
         back_btn = InlineKeyboardButton("⬅️ Назад", callback_data="my_orders")
@@ -657,78 +688,132 @@ def paginate_orders(call):
 # Обработка отмены заказа
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_"))
 def cancel_reservation(call):
-       reservation_id = int(call.data.split("_")[1])  # Извлекаем ID бронирования
-       user_id = call.from_user.id  # Берём ID пользователя
+    reservation_id = int(call.data.split("_")[1])  # Извлекаем ID бронирования
+    user_id = call.from_user.id  # Берём ID пользователя
 
-       try:
-           # Получаем данные о бронировании через ORM
-           order = Reservations.get_row_by_id(reservation_id)
-           if not order or order.user_id != user_id:
-               bot.answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
-               return
+    try:
+        # Получаем данные о бронировании через ORM
+        order = Reservations.get_row_by_id(reservation_id)
+        if not order or order.user_id != user_id:
+            bot.answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
+            return
 
-           # Проверяем, выполнено ли бронирование
-           if order.is_fulfilled:
-               bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
-               return
+        # Проверяем, выполнено ли бронирование
+        if order.is_fulfilled:
+            bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
+            return
 
-           # Получаем информацию о товаре
-           post = Posts.get_row_by_id(order.post_id)
-           if not post:
-               bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
-               return
+        # Получаем информацию о товаре
+        post = Posts.get_row_by_id(order.post_id)
+        if not post:
+            bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
+            return
 
-           # Удаляем заказ из Reservations
-           success = Reservations.cancel_order_by_id(reservation_id)
-           if not success:
-               bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
-               return
+        # Удаляем заказ из Reservations
+        success = Reservations.cancel_order_by_id(reservation_id)
+        if not success:
+            bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
+            return
 
-           # Увеличиваем количество товара
-           Posts.increment_quantity_by_id(order.post_id)
+        # Проверяем очередь пользователей на этот товар
+        with Session(bind=engine) as session:
+            next_in_queue = session.query(TempReservations).filter(
+                TempReservations.post_id == order.post_id,
+                TempReservations.temp_fulfilled == False
+            ).order_by(TempReservations.created_at).first()  # Берём первого из очереди
 
-           # Удаляем сообщение о товаре в группе (основано на post.message_id)
-           if post.message_id:  # Если сообщение связано с товаром
-               try:
-                   bot.delete_message(chat_id=TARGET_GROUP_ID, message_id=post.message_id)
-                   print(f"Сообщение с ID {post.message_id} удалено из группы {TARGET_GROUP_ID}.")
-               except Exception as e:
-                   print(f"Ошибка удаления сообщения из группы: {e}")
-           else:
-               print("Не найден message_id для удаления сообщения из группы.")
+            if next_in_queue:
+                # Если очередь не пуста: добавляем товар следующему пользователю
+                Reservations.insert(
+                    user_id=next_in_queue.user_id,
+                    post_id=order.post_id,
+                    quantity=1,
+                    is_fulfilled=False
+                )
 
-           # Обновляем пост на канале, увеличив количество
-           if post.message_id:  # Если у товара сохранён message_id поста
-               new_quantity = post.quantity + 1  # Увеличенное количество
-               updated_caption = (
-                   f"Товар: {post.description}\n"
-                   f"Цена: {post.price} ₽\n"
-                   f"Количество: {new_quantity}"
-               )
-               markup = InlineKeyboardMarkup()
-               reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
-               to_bot_button = InlineKeyboardButton("В Бота", url="https://t.me/MegaSkidkiTgBot?start=start")
-               markup.add(reserve_button, to_bot_button)
+                # Отмечаем, что очередь пользователя выполнена
+                next_in_queue.temp_fulfilled = True
+                session.commit()
 
-               try:
-                   bot.edit_message_caption(
-                       chat_id=CHANNEL_ID,
-                       message_id=post.message_id,
-                       caption=updated_caption,
-                       reply_markup=markup,
-                   )
-               except Exception as e:
-                   print(f"Ошибка обновления поста на канале: {e}")
+                # Уведомляем пользователя из очереди
+                bot.send_message(
+                    chat_id=next_in_queue.user_id,
+                    text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
+                )
 
-           # Уведомляем об успешной отмене
-           bot.answer_callback_query(call.id, "Вы успешно отказались от товара.", show_alert=False)
+                # Если товар передан из очереди, НЕ увеличиваем количество на канале
+                bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
+                                          show_alert=False)
+                # Перенаправляем пользователя в меню "Мои заказы"
+                my_orders(call.message)
+                return  # Завершаем обработку, дальше ничего не делаем
 
-           # Перенаправляем пользователя в меню "Мои заказы"
-           my_orders(call.message)
+        # Если никто не в очереди, увеличиваем количество товара (товар вернётся на канал)
+        Posts.increment_quantity_by_id(order.post_id)
 
-       except Exception as e:
-           print(f"Ошибка при попытке отказаться от заказа: {e}")
-           bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+        # Удаляем сообщение о товаре в группе (основано на post.message_id)
+        if post.message_id:  # Если сообщение связано с товаром
+            try:
+                bot.delete_message(chat_id=TARGET_GROUP_ID, message_id=post.message_id)
+                print(f"Сообщение с ID {post.message_id} удалено из группы {TARGET_GROUP_ID}.")
+            except Exception as e:
+                print(f"Ошибка удаления сообщения из группы: {e}")
+        else:
+            print("Не найден message_id для удаления сообщения из группы.")
+
+        # Обновляем пост на канале, увеличив количество
+        if post.message_id:  # Если у товара сохранён message_id поста
+            new_quantity = post.quantity + 1  # Увеличенное количество
+            updated_caption = (
+                f"Цена: {post.price} ₽\n"
+                f"Описание: {post.description}\n"
+                f"Остаток: {new_quantity}"
+            )
+            markup = InlineKeyboardMarkup()
+            reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
+            to_bot_button = InlineKeyboardButton("В Бота", url="https://t.me/MegaSkidkiTgBot?start=start")
+            markup.add(reserve_button, to_bot_button)
+
+            try:
+                bot.edit_message_caption(
+                    chat_id=CHANNEL_ID,
+                    message_id=post.message_id,
+                    caption=updated_caption,
+                    reply_markup=markup,
+                )
+            except Exception as e:
+                print(f"Ошибка обновления поста на канале: {e}")
+
+        # Уведомляем об успешной отмене
+        bot.answer_callback_query(call.id, "Вы успешно отказались от товара.", show_alert=False)
+
+        # Перенаправляем пользователя в меню "Мои заказы"
+        my_orders(call.message)
+
+    except Exception as e:
+        print(f"Ошибка при попытке отказаться от заказа: {e}")
+        bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("enqueue_"))
+def handle_enqueue(call):
+    user_id = call.message.chat.id
+    post_id = int(call.data.split("_")[1])
+
+    # Проверяем, существует ли запись уже в TempReservations
+    with Session(bind=engine) as session:
+        existing_entry = session.query(TempReservations).filter(
+            TempReservations.user_id == user_id,
+            TempReservations.post_id == post_id,
+            TempReservations.temp_fulfilled == False
+        ).first()
+
+        if existing_entry:
+            return
+
+    # Добавляем в таблицу TempReservations
+    TempReservations.insert(user_id=user_id, quantity=1, post_id=post_id, temp_fulfilled=False)
+    bot.send_message(user_id, "Вы добавлены в очередь. Как только товар станет доступен, вы будете уведомлены.")
+
 
 # Возврат в меню заказов
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
@@ -1408,13 +1493,18 @@ def manage_posts(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
+    # Убедимся, что user_last_message_id[user_id] - это список
+    if user_id not in user_last_message_id:
+        user_last_message_id[user_id] = []
+    elif not isinstance(user_last_message_id[user_id], list):
+        user_last_message_id[user_id] = [user_last_message_id[user_id]]
+
     # Удаляем предыдущие сообщения, если они есть
-    if user_id in user_last_message_id:
-        for msg_id in user_last_message_id[user_id]:
-            try:
-                bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception as e:
-                print(f"Не удалось удалить сообщение {msg_id} для пользователя {user_id}: {e}")
+    for msg_id in user_last_message_id[user_id]:
+        try:
+            bot.delete_message(chat_id=user_id, message_id=msg_id)
+        except Exception as e:
+            print(f"Не удалось удалить сообщение {msg_id} для пользователя {user_id}: {e}")
 
     # Очищаем список сообщений пользователя после удаления
     user_last_message_id[user_id] = []
@@ -1458,7 +1548,7 @@ def manage_posts(message):
                     photo=photo,
                     caption=f"**Пост #{post_id}:**\n"
                             f"📍 *Описание:* {description}\n"
-                            f"💰 *Цена:* {price}\n"
+                            f"💰 *Цена:* {price} ₽\n"
                             f"📦 *Количество:* {quantity}",
                     parse_mode="Markdown",
                     reply_markup=markup,
@@ -1468,7 +1558,7 @@ def manage_posts(message):
                     chat_id=user_id,
                     text=f"**Пост #{post_id}:**\n"
                          f"📍 *Описание:* {description}\n"
-                         f"💰 *Цена:* {price}\n"
+                         f"💰 *Цена:* {price} ₽\n"
                          f"📦 *Количество:* {quantity}",
                     parse_mode="Markdown",
                     reply_markup=markup,
@@ -1536,7 +1626,7 @@ def send_new_posts_to_channel(message):
             creator_name = Clients.get_name_by_user_id(creator_user_id) or "Неизвестный автор"
 
             # Формируем описание поста для канала
-            caption = f"Цена: {price}\nОписание: {description}\nОстаток: {quantity}"
+            caption = f"Цена: {price} ₽\nОписание: {description}\nОстаток: {quantity}"
 
             # Добавляем кнопки
             markup = InlineKeyboardMarkup()
@@ -1547,6 +1637,8 @@ def send_new_posts_to_channel(message):
                 "В бота", url="https://t.me/MegaSkidkiTgBot?start=start"
             )
             markup.add(reserve_btn, to_bot_button)
+
+
 
             # Отправка поста в канал
             sent_message = bot.send_photo(
@@ -1752,6 +1844,7 @@ def handle_statistic(message):
         response = "Нет статистики по постам за сегодня или неделю."
 
     bot.send_message(message.chat.id, response)
+
 
 # Запуск бота
 if __name__ == "__main__":
