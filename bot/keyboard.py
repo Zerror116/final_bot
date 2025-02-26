@@ -33,8 +33,9 @@ def admin_main_menu():
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
+    send_for_delivery = KeyboardButton("Отправить рассылку")
     keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                 send_all_reserved_to_group)
+                 send_all_reserved_to_group, send_for_delivery)
     return keyboard
 def unknown_main_menu():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
