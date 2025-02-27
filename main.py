@@ -2603,7 +2603,7 @@ def confirm_delivery(message):
             message.chat.id,
             f"❌ Ошибка при подтверждении доставки: {str(e)}"
         )
-
+# zis is right
 # Запуск бота
 if __name__ == "__main__":
     bot.polling(none_stop=True)
