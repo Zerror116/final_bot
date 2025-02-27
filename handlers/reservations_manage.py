@@ -78,4 +78,3 @@ def calculate_processed_sum(user_id):
     print(f"Общая сумма обработанных заказов: {processed_sum}")
     return processed_sum
 
-

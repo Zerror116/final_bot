@@ -24,7 +24,6 @@ class Reservations(AbstractModel):
     quantity = mapped_column(Integer, nullable=False)
     post_id = mapped_column(Integer, nullable=False)
     is_fulfilled = mapped_column(Boolean, nullable=False)
-    return_order = mapped_column(Integer, default=0)
 
 
     @staticmethod

@@ -1,45 +1,43 @@
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 def supreme_leader_main_menu():
-    leader_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     create_new_post = KeyboardButton("➕ Новый пост")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
-    leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        send_all_reserved_to_group)
-    return leader_keyboard
+    keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients, send_all_reserved_to_group)
+    return keyboard
 
 def client_main_menu():
-    client_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     my_orders = KeyboardButton("🛒 Мои заказы")
-    orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
-    client_keyboard.add(my_orders, orders_in_delivery)
-    return client_keyboard
+    keyboard.add(my_orders)
+    return keyboard
 
 def worker_main_menu():
-    worker_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     create_new_post = KeyboardButton("➕ Новый пост")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
-    worker_keyboard.add(create_new_post, my_orders, manage_posts)
-    return worker_keyboard
+    keyboard.add(create_new_post, my_orders, manage_posts)
+    return keyboard
 
 def admin_main_menu():
-    admin_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     create_new_post = KeyboardButton("➕ Новый пост")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
-    admin_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
+    keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
                  send_all_reserved_to_group)
-    return admin_keyboard
+    return keyboard
 def unknown_main_menu():
-    unknown_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     registration_button = KeyboardButton("Регистрация")
-    unknown_keyboard.add(registration_button)
-    return unknown_keyboard
+    keyboard.add(registration_button)
+    return keyboard
