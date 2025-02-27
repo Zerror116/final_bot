@@ -3,7 +3,6 @@ charset-normalizer==3.4.1
 et_xmlfile==2.0.0
 idna==3.10
 openpyxl==3.1.5
-psycopg2==2.9.10
 psycopg2-binary==2.9.10
 pyTelegramBotAPI==4.26.0
 requests==2.32.3

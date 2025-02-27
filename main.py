@@ -1,6 +1,5 @@
 import re
 import time
-import psycopg2
 import telebot
 
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu
