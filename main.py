@@ -980,6 +980,7 @@ def send_all_reserved_to_group(message):
                         chat_id=TARGET_GROUP_ID, text=caption, reply_markup=markup
                     )
 
+
             except Exception as e:
                 bot.send_message(
                     user_id, f"⚠️ Ошибка при обработке заказа: {e}")
@@ -1058,7 +1059,8 @@ def mark_fulfilled_group(call):
             )
 
         bot.answer_callback_query(call.id, "Резервация успешно обработана!")
-
+        # Задержка секунда перед отправкой следующего поста
+        time.sleep(4)
     except Exception as e:
         bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
         print(f"Ошибка в обработчике mark_fulfilled_group: {e}")
