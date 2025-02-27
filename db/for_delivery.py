@@ -48,6 +48,21 @@ class ForDelivery(AbstractModel):
             query = session.query(ForDelivery).filter(ForDelivery.user_id == user_id).all()
             return query
 
+    @staticmethod
+    def get_all_rows():
+        with Session(bind=engine) as session:
+            return session.query(ForDelivery).all()
+
+    @staticmethod
+    def delete_all_rows():
+        with Session(bind=engine) as session:
+            try:
+                session.query(ForDelivery).delete()
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                raise e
+
     # @staticmethod
     # def update_row(post_id: int, price: int, description: str, quantity: int):
     #
