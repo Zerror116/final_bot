@@ -51,7 +51,6 @@ class Clients(AbstractModel):
             result = session.query(Clients).filter(Clients.user_id == user_id).first()
 
             # Логируем результат проверки
-            print(f"[get_row] Проверяем user_id={user_id}. Результат: {result}")
             return result
 
     @staticmethod
@@ -60,7 +59,6 @@ class Clients(AbstractModel):
         Возвращает клиента по номеру телефона или None, если записи нет.
         """
         with Session(bind=engine) as session:
-            print(f"[DEBUG]: Проверка номера телефона {phone} в базе.")
             result = session.query(Clients).filter(Clients.phone == phone).first()  # Поиск клиента в базе
             return result
 

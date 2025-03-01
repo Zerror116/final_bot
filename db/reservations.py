@@ -26,7 +26,6 @@ class Reservations(AbstractModel):
     is_fulfilled = mapped_column(Boolean, nullable=False)
     return_order = mapped_column(Integer, default=0)
 
-
     @staticmethod
     def insert(user_id: int, quantity: int, post_id: int, is_fulfilled: bool):
         with Session(bind=engine) as session:
@@ -34,7 +33,7 @@ class Reservations(AbstractModel):
             user_id=user_id,
             quantity=quantity,
             post_id=post_id,
-            is_fulfilled=is_fulfilled
+            is_fulfilled=is_fulfilled,
             )
             session.add(reservations)
             session.commit()
@@ -66,9 +65,9 @@ class Reservations(AbstractModel):
             return True, "Данные успешно обновлены."
 
     @staticmethod
-    def get_row_by_id(reservation_id: int):
+    def get_row_by_id(reservation_id):
         with Session(bind=engine) as session:
-            return session.query(Reservations).filter(Reservations.id == reservation_id).first()
+            return session.query(Reservations).filter_by(id=reservation_id).first()
 
     @staticmethod
     def cancel_order_by_id(reservation_id: int):
@@ -110,3 +109,22 @@ class Reservations(AbstractModel):
             except Exception as e:
                 session.rollback()  # В случае ошибки откатываем изменения
                 raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")
+
+    @staticmethod
+    def update_quantity_by_id(reservation_id, new_quantity):
+        with Session(bind=engine) as session:
+            reservation = session.query(Reservations).filter_by(id=reservation_id).first()
+            if reservation:
+                reservation.quantity = new_quantity
+                session.commit()
+                return True
+            return False
+
+    @staticmethod
+    def update_message_group_id(reservation_id, new_message_id):
+        with Session(bind=engine) as session:
+            reservation = session.query(Reservations).filter_by(id=reservation_id).first()
+            if reservation:
+                reservation.message_group_id = new_message_id
+                session.commit()
+

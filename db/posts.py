@@ -127,3 +127,4 @@ class Posts(AbstractModel):
             query = session.query(Posts).all()
             return query
 
+

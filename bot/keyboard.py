@@ -8,8 +8,9 @@ def supreme_leader_main_menu():
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
+    orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        send_all_reserved_to_group)
+                        send_all_reserved_to_group,orders_in_delivery)
     return leader_keyboard
 
 def client_main_menu():
@@ -29,13 +30,11 @@ def worker_main_menu():
 
 def admin_main_menu():
     admin_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    create_new_post = KeyboardButton("➕ Новый пост")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
-    my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
-    admin_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
+    admin_keyboard.add( manage_posts, send_new_posts_to_channel, manage_clients,
                  send_all_reserved_to_group)
     return admin_keyboard
 def unknown_main_menu():
@@ -43,3 +42,4 @@ def unknown_main_menu():
     registration_button = KeyboardButton("Регистрация")
     unknown_keyboard.add(registration_button)
     return unknown_keyboard
+
