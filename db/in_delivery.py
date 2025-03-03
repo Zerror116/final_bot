@@ -43,9 +43,8 @@ class InDelivery(AbstractModel):
                 )
                 session.add(new_entry)
                 session.commit()
-            except Exception as e:
-                session.rollback()
-                raise e
+            except Exception:
+                raise
 
     @staticmethod
     def get_all_rows():

@@ -17,8 +17,8 @@ def delete_cart(user_id: int):
             # session.delete(reservation)
         # session.commit()
         print(f"Корзина клиента с ID {user_id} успешно очищена.")
-    except Exception as e:
-        print(f"Ошибка при очистке корзины: {e}")
+    except Exception:
+        pass
 
 
 def get_all_reservations(user_id: int):
@@ -31,8 +31,8 @@ def get_all_reservations(user_id: int):
         for reservation in reservations:
             print(
                 f"Бронирование ID {reservation.id}: Кол-во: {reservation.quantity}, Пост ID: {reservation.post_id}, Выполнено: {reservation.is_fulfilled}")
-    except Exception as e:
-        print(f"Ошибка при получении бронирований: {e}")
+    except Exception:
+        pass
 
 # Вспомогательные функции для вычислений
 def calculate_total_sum(user_id):

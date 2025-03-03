@@ -37,11 +37,6 @@ class Reservations(AbstractModel):
             )
             session.add(reservations)
             session.commit()
-    @staticmethod
-    def get_row(user_id: int):
-        with Session(bind=engine) as session:
-            query = session.query(Reservations).filter(Reservations.user_id == user_id).all()
-            return query
 
 
     @staticmethod
@@ -110,21 +105,4 @@ class Reservations(AbstractModel):
                 session.rollback()  # В случае ошибки откатываем изменения
                 raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")
 
-    @staticmethod
-    def update_quantity_by_id(reservation_id, new_quantity):
-        with Session(bind=engine) as session:
-            reservation = session.query(Reservations).filter_by(id=reservation_id).first()
-            if reservation:
-                reservation.quantity = new_quantity
-                session.commit()
-                return True
-            return False
-
-    @staticmethod
-    def update_message_group_id(reservation_id, new_message_id):
-        with Session(bind=engine) as session:
-            reservation = session.query(Reservations).filter_by(id=reservation_id).first()
-            if reservation:
-                reservation.message_group_id = new_message_id
-                session.commit()
 

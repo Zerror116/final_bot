@@ -61,15 +61,25 @@ class Posts(AbstractModel):
                 return False, f"Ошибка при удалении поста: {str(e)}"
 
     @staticmethod
-    def update_row(post_id: int, price: int, description: str, quantity: int):
+    def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None, is_sent: bool = None,
+                   created_at: datetime = None):
         with Session(bind=engine) as session:
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:
                 return False, "Пост не найден"
 
-            post.price = price
-            post.description = description
-            post.quantity = quantity
+            # Обновляем только те значения, которые переданы
+            if price is not None:
+                post.price = price
+            if description is not None:
+                post.description = description
+            if quantity is not None:
+                post.quantity = quantity
+            if is_sent is not None:
+                post.is_sent = is_sent
+            if created_at is not None:
+                post.created_at = created_at
+
             session.commit()
             return True, "Данные успешно обновлены"
 
@@ -101,11 +111,6 @@ class Posts(AbstractModel):
             query = session.query(Posts).filter(Posts.id == post_id).first()
             return query
 
-    @staticmethod
-    def get_row_by_chat_id(chat_id: int):
-        with Session(bind=engine) as session:
-            query = session.query(Posts).filter(Posts.chat_id == chat_id).first()
-            return query
 
     @staticmethod
     def get_posts_in_last_week(chat_id: int):

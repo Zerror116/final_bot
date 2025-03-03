@@ -28,8 +28,7 @@ class BlackList(AbstractModel):
                 entry = BlackList(user_id=user_id, phone=phone)
                 session.add(entry)
                 session.commit()
-            except Exception as e:
-                print(f"[BlackList.insert] Ошибка при добавлении в черный список: {e}")
+            except Exception:
                 raise
 
     @staticmethod

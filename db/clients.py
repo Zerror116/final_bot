@@ -31,8 +31,7 @@ class Clients(AbstractModel):
                 client = Clients(user_id=user_id, name=name, phone=phone, role=role)
                 session.add(client)
                 session.commit()
-            except Exception as e:
-                print(f"[insert] Ошибка при сохранении клиента: {e}")
+            except Exception:
                 raise
 
     @staticmethod
@@ -100,29 +99,13 @@ class Clients(AbstractModel):
             return True, "Данные пользователя обновлены успешно."
 
     @staticmethod
-    def update_row_to_role(filters, update_values):
-        # filters — словарь, например {"id": 123}
-        # update_values — словарь, например {"role": "admin"}
-        with Session() as session:
-            # Находим записи по фильтру
-            query = session.query(Clients).filter_by(**filters)
-            # Выполняем обновление только указанных полей
-            query.update(update_values)
-            session.commit()
-
-    @staticmethod
-    def validate_phone(phone):
-        if not isinstance(phone, str) or not phone.isdigit():
-            raise ValueError("Некорректное значение номера телефона")
-        return phone
-
-    @staticmethod
-    def get_row_by_phone_digits(phone_digits: str):
-        """
-        Метод для поиска клиента по последним цифрам его номера телефона.
-        """
+    def get_row_by_phone_digits(phone_digits):
+        """Получение всех пользователей с совпадающими последними цифрами номера."""
         with Session(bind=engine) as session:
-            return session.query(Clients).filter(Clients.phone.endswith(phone_digits)).first()
+            query = session.query(Clients).filter(
+                Clients.phone.like(f"%{phone_digits}")
+            ).all()
+            return query  # Возвращаем список объектов
 
     @staticmethod
     def get_name_by_user_id(user_id):
@@ -130,3 +113,28 @@ class Clients(AbstractModel):
         if client:
             return client.name
         return None
+
+    @staticmethod
+    def get_row_for_work_name_number(name: str, phone_ending: str):
+        """
+        Поиск пользователя по имени и последним цифрам номера телефона.
+        """
+        with Session(bind=engine) as session:
+            query = session.query(Clients).filter(
+                Clients.name == name,
+                Clients.phone.like(f"%{phone_ending}")
+            ).first()
+            return query
+
+    @staticmethod
+    def update_row_for_work(user_id, updates):
+        try:
+            # Пример обновления через SQLAlchemy
+            with Session(bind=engine) as session:
+                session.query(Clients).filter(Clients.user_id == user_id).update(updates)
+                session.commit()  # Убедитесь, что изменения фиксируются
+            return True
+        except Exception as e:
+            print(f"Error in update_row_for_work: {e}")
+            session.rollback()  # Отменяем изменения при возникновении ошибки
+            return False

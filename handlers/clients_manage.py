@@ -46,7 +46,7 @@ def set_client_role(user_id: int, role: str = "client"):
 # Назначение роли клиенту/пользователю
 def manage_client_role(user_id: int, new_role: str):
     """Изменение роли клиента."""
-    if new_role not in ["client", "worker", "admin"]:
+    if new_role not in ["client", "worker", "admin", "audit"]:
         print(f"Недопустимая роль: {new_role}")
         return
 
