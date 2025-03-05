@@ -1,6 +1,7 @@
 import datetime
 from ast import Bytes
 
+
 from sqlalchemy import (
     String,
     ForeignKey,
@@ -13,7 +14,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import mapped_column, Session, Mapped, MappedColumn
 
-from . import Posts
+from . import Posts, Clients
 # from main import user_data
 from .db import AbstractModel, engine
 
@@ -37,7 +38,6 @@ class Reservations(AbstractModel):
             )
             session.add(reservations)
             session.commit()
-
 
     @staticmethod
     def get_row_by_user_id(user_id: int):
@@ -104,5 +104,3 @@ class Reservations(AbstractModel):
             except Exception as e:
                 session.rollback()  # В случае ошибки откатываем изменения
                 raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")
-
-

@@ -9,7 +9,7 @@ def supreme_leader_main_menu():
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
-    manage_workers = KeyboardButton("Назначить работника")
+    manage_workers = KeyboardButton("👔 Назначить работника")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
                         send_all_reserved_to_group,orders_in_delivery,manage_workers)
     return leader_keyboard
@@ -44,7 +44,7 @@ def admin_main_menu():
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
-    manage_workres = KeyboardButton("Назначить работника")
+    manage_workres = KeyboardButton("👔 Назначить работника")
     admin_keyboard.add( manage_posts, send_new_posts_to_channel, manage_clients,
                  send_all_reserved_to_group,manage_workres)
     return admin_keyboard

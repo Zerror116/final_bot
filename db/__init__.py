@@ -13,5 +13,3 @@ from sqlalchemy.orm import mapped_column, Session
 AbstractModel.metadata.create_all(engine)
 
 __all__ = {"Posts", "Clients", "BlackList", "Reservations", "TempReservations", "ForDelivery", "InDelivery"}
-
-print('Запуск')

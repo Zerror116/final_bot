@@ -10,7 +10,6 @@ from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_mai
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputFile, InputMediaAnimation
 from database.config import *
-from telebot.apihelper import ApiTelegramException
 from db.for_delivery import ForDelivery
 from db.temp_reservations import TempReservations
 from db.in_delivery import InDelivery
@@ -733,8 +732,8 @@ def my_orders(message):
         if user_id in user_last_message_id:
             try:
                 bot.delete_message(chat_id=user_id, message_id=user_last_message_id[user_id])
-            except Exception as e:
-                print(f"Ошибка при удалении предыдущего сообщения бота: {e}")
+            except Exception:
+                pass
 
         # Проверяем, зарегистрирован ли пользователь
         current_user = Clients.get_row_by_user_id(user_id)
@@ -783,9 +782,9 @@ def send_order_page(user_id, message_id, orders, page):
     for order in selected_orders:
         post = Posts.get_row_by_id(order.post_id)  # Проверка и получение данных поста через ORM
         if post:
-            status = "✔️ Обработан" if order.is_fulfilled else "⌛ В обработке"
+            status = "✅В корзине" if order.is_fulfilled else "❌Не в корзине"
             keyboard.add(InlineKeyboardButton(
-                text=f"{post.price} ₽ - {post.description} ({status})",
+                text=f"({status})- {post.price} ₽ - {post.description}",
                 callback_data=f"order_{order.id}"
             ))
 
@@ -968,8 +967,23 @@ def handle_enqueue(call):
 # Возврат в меню заказов
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
 def go_back_to_menu(call):
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "Главное меню! Выберите интересующий вас пункт.")
+    # Если объект — сообщение (Message), то работаем с ним напрямую
+    if isinstance(call, telebot.types.Message):
+        chat_id = call.chat.id
+    # Если объект — CallbackQuery, извлекаем его компонент message
+    elif isinstance(call, telebot.types.CallbackQuery):
+        chat_id = call.message.chat.id
+        # Сразу подтверждаем callback_query
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            print(f"Failed to answer callback query: {e}")
+    else:
+        print("Unsupported object type passed to go_back_to_menu")
+        return
+
+    # Отправляем сообщение пользователю
+    bot.send_message(chat_id, "Вы вернулись в главное меню.")
 
 # Обработчик функции 🚗 Заказы в доставке
 @bot.message_handler(func=lambda message: message.text == "🚗 Заказы в доставке")
@@ -1082,8 +1096,8 @@ def send_delivery_order_page(user_id, message_id, orders, page):
             )
 
 
-# Хэндлер для команды "Назначить работника"
-@bot.message_handler(func=lambda message: message.text == "Назначить работника")
+# Хэндлер для команды "👔 Назначить работника"
+@bot.message_handler(func=lambda message: message.text == "👔 Назначить работника")
 def manage_user(message):
     # Проверяем, является ли пользователь администратором или лидером
     user_id = message.from_user.id
@@ -1516,44 +1530,6 @@ def mark_fulfilled_group(call):
         print(f"Ошибка в обработчике mark_fulfilled_group: {e}")
 
 
-# Синхронизация вручную удаленного поста с группы и бота
-@bot.message_handler(commands=["sync_posts"])
-def sync_posts_with_channel(message):
-    role = get_client_role(message.chat.id)
-    user_id = message.chat.id
-    if role not in ["admin","supreme_leader"]:
-        bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
-        return
-
-    # Получаем все посты из таблицы Posts
-    posts = Posts.get_row_all()  # Метод для получения всех строк таблицы
-    deleted_posts = []
-
-    for post in posts:
-        # Проверяем, является ли `post` объектом и используем атрибуты
-        post_id = post.id  # Предположим, что `post` – объект модели с атрибутами
-        message_id = post.message_id  # Аналогично, если у объекта есть `message_id`
-
-        try:
-            # Проверяем, существует ли сообщение
-            bot.forward_message(
-                chat_id=message.chat.id,
-                from_chat_id=CHANNEL_ID,
-                message_id=message_id
-            )
-        except ApiTelegramException:
-            # Если сообщение не найдено в канале, добавляем его в список на удаление
-            deleted_posts.append(post_id)
-
-    # Удаляем из базы данные о постах, которых больше нет
-    for post_id in deleted_posts:
-        Posts.delete_row(post_id)  # Используем метод удаления строки
-
-    bot.send_message(
-        message.chat.id,
-        f"Синхронизация завершена. Удалено записей: {len(deleted_posts)}.",
-    )
-
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
 def clear_cart(call):
@@ -1605,11 +1581,133 @@ def manage_clients(message):
 
     # Создаем клавиатуру с кнопками
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("Удалить клиента по номеру телефона", "Просмотреть корзину", "Управление доставкой", "⬅️ Назад")
+    markup.add("🗑 Удалить клиента 📞", "🧺 Просмотреть корзину", "🚚 Управление доставкой","❌ Брак", "⬅️ Назад")
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
 
+# Обработчик для кнопки "❌ Брак"
+@bot.message_handler(func=lambda message: message.text == "❌ Брак")
+def defective_order(message):
+    # Устанавливаем состояние пользователя
+    set_user_state(message.chat.id, "awaiting_last_digits_defective")
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера телефона для поиска пользователя:")
+
+
+# Поиск пользователя по последним 4 цифрам телефона
+@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "awaiting_last_digits_defective")
+def search_user_for_defective(message):
+    last_digits = message.text.strip()
+
+    # Ищем пользователя в Clients
+    users = Clients.get_row_by_phone_digits(last_digits)
+
+    if users:  # Если список пользователей найден
+        user = users[0]  # Берем первого пользователя или делаем выбор из нескольких
+        user_id = user.user_id
+        user_name = user.name
+        user_phone = user.phone
+
+        # Отправляем информацию о пользователе и подтверждение
+        keyboard = create_defective_confirmation_keyboard()
+        bot.send_message(
+            message.chat.id,
+            f"Найден пользователь:\nИмя: {user_name}\nТелефон: {user_phone}\nВы хотите продолжить обработку для данного пользователя?",
+            reply_markup=keyboard
+        )
+
+        # Сохраняем user_id для дальнейшей обработки
+        temp_user_data[message.chat.id] = {"user_id": user_id}
+        set_user_state(message.chat.id, "awaiting_defective_action")
+    else:
+        bot.send_message(message.chat.id, "Пользователи с такими цифрами номера не найдены. Попробуйте еще раз.")
+
+
+# Обработка действия (подтверждения или отмены)
+@bot.callback_query_handler(func=lambda call: get_user_state(call.message.chat.id) == "awaiting_defective_action")
+def handle_defective_action(call):
+    if call.data == "confirm_defective":
+        set_user_state(call.message.chat.id, "awaiting_defective_sum")
+        bot.send_message(call.message.chat.id, "Введите сумму брака:")
+    elif call.data == "cancel_defective":
+        bot.send_message(call.message.chat.id, "Операция отменена. Возвращаю вас в главное меню.")
+        clear_user_state(call.message.chat.id)
+        go_back_to_menu(call.message)
+
+
+# Ввод суммы брака
+@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "awaiting_defective_sum")
+def handle_defective_sum_entry(message):
+    try:
+        defective_sum = int(message.text.strip())
+        user_id = temp_user_data[message.chat.id]["user_id"]  # Берем найденный user_id
+
+        # Получаем заказы пользователя из таблицы Reservations
+        reservations = Reservations.get_row_by_user_id(user_id)
+
+        if reservations:
+            # Указание места, где будет добавлена сумма брака
+            keyboard = create_select_reservation_keyboard(reservations)
+            bot.send_message(
+                message.chat.id,
+                "Выберите заказ, чтобы добавить сумму брака:",
+                reply_markup=keyboard
+            )
+            set_user_state(message.chat.id, "select_reservation_for_defective")
+            temp_user_data[message.chat.id]["defective_sum"] = defective_sum
+        else:
+            bot.send_message(message.chat.id, "Заказы у данного пользователя не найдены. Попробуйте еще раз.")
+            clear_user_state(message.chat.id)
+            go_back_to_menu(message)
+    except ValueError:
+        bot.send_message(message.chat.id, "Некорректное значение. Введите числовую сумму.")
+
+
+# Обработка выбора заказа для дефектного товара
+@bot.callback_query_handler(
+    func=lambda call: get_user_state(call.message.chat.id) == "select_reservation_for_defective")
+def handle_reservation_selection(call):
+    # Отвечаем на callback_query сразу
+    bot.answer_callback_query(call.id, text="Ваш выбор обрабатывается...")
+
+    reservation_id = int(call.data.split("_")[1])  # Получаем ID заказа из callback_data
+    defective_sum = temp_user_data[call.message.chat.id]["defective_sum"]
+
+    # Обновляем return_order в базе данных
+    with Session(bind=engine) as session:
+        reservation = session.query(Reservations).filter_by(id=reservation_id).first()
+        if reservation:
+            reservation.return_order += defective_sum
+            session.commit()
+            bot.send_message(call.message.chat.id, f"Сумма брака {defective_sum} успешно добавлена в заказ.")
+        else:
+            bot.send_message(call.message.chat.id, "Ошибка: Заказ не найден.")
+
+    # Завершаем процесс
+    clear_user_state(call.message.chat.id)
+    go_back_to_menu(call.message)  # Передаем только сообщение
+
+
+# Клавиатура для выбора конкретного заказа
+def create_select_reservation_keyboard(reservations):
+    keyboard = types.InlineKeyboardMarkup()
+    for reservation in reservations:
+        btn = types.InlineKeyboardButton(
+            text=f"Заказ ID {reservation.id} (Возврат: {reservation.return_order})",
+            callback_data=f"select_{reservation.id}"
+        )
+        keyboard.add(btn)
+    return keyboard
+
+
+# Уникальная клавиатура подтверждения
+def create_defective_confirmation_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    btn_confirm = types.InlineKeyboardButton("Подтвердить ❌ Брак", callback_data="confirm_defective")
+    btn_cancel = types.InlineKeyboardButton("Отмена ❌ Брак", callback_data="cancel_defective")
+    keyboard.add(btn_confirm, btn_cancel)
+    return keyboard
+
 # Обработчик нажатия на кнопку "Просмотреть корзину"
-@bot.message_handler(func=lambda message: message.text == "Просмотреть корзину")
+@bot.message_handler(func=lambda message: message.text == "🧺 Просмотреть корзину")
 def request_phone_last_digits(message):
     bot.send_message(
         message.chat.id,
@@ -1618,11 +1716,11 @@ def request_phone_last_digits(message):
     set_user_state(message.chat.id, "AWAITING_PHONE_LAST_4")
 
 
-@bot.message_handler(func=lambda message: message.text == "Управление доставкой")
+@bot.message_handler(func=lambda message: message.text == "🚚 Управление доставкой")
 def handle_delivery_management(message):
     # Создаем клавиатуру с кнопками
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("Отправить рассылку","✅ Подтвердить доставку", "Архив доставки", "⬅️ Назад")
+    markup.add("📤 Отправить рассылку","✅ Подтвердить доставку", "🗄 Архив доставки", "⬅️ Назад")
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
 
 
@@ -1772,7 +1870,7 @@ def callback_view_cart(call):
         send_cart_content(call.message.chat.id, reservations)
 
 # Удаление клиента по номеру телефона
-@bot.message_handler(func=lambda message: message.text == "Удалить клиента по номеру телефона")
+@bot.message_handler(func=lambda message: message.text == "🗑 Удалить клиента 📞")
 def delete_client_by_phone(message):
     user_id = message.chat.id
     role = get_client_role(message.chat.id)
@@ -1878,34 +1976,6 @@ def is_audit(user_id):
     """Проверяет, является ли пользователь Аудитом"""
     role = get_client_role(user_id)
     return role and "audit" in role
-
-# Изменение клиента
-@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_client_"))
-def handle_edit_client(call):
-    client_id = int(call.data.split("_")[2])
-    temp_user_data[call.from_user.id] = {"client_id": client_id}  # Сохраняем ID клиента
-
-    # Выводим выбор, что менять
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("Изменить имя", callback_data="edit_name"),
-        InlineKeyboardButton("Изменить телефон", callback_data="edit_phone"),
-    )
-    bot.send_message(
-        call.message.chat.id, "Что вы хотите изменить?", reply_markup=markup
-    )
-
-# Обработка выбора (имя или телефон)
-@bot.callback_query_handler(func=lambda call: call.data in ["edit_name", "edit_phone"])
-def handle_edit_choice(call):
-    user_id = call.from_user.id
-
-    if call.data == "edit_name":
-        bot.send_message(call.message.chat.id, "Введите новое имя:")
-        set_user_state(user_id, "EDITING_NAME")
-    elif call.data == "edit_phone":
-        bot.send_message(call.message.chat.id, "Введите новый номер телефона:")
-        set_user_state(user_id, "EDITING_PHONE")
 
 # Новый пост
 @bot.message_handler(func=lambda message: message.text == "➕ Новый пост")
@@ -2461,26 +2531,33 @@ def handle_statistic(message):
 
 
 # Обработчик для кнопки 'Отправить рассылку'.
-@bot.message_handler(func=lambda message: message.text == "Отправить рассылку")
+@bot.message_handler(func=lambda message: message.text == "📤 Отправить рассылку")
 def send_broadcast(message):
     user_id = message.from_user.id
-
     bot.send_message(chat_id=user_id, text="Начинаю рассылку подходящим пользователям...")
-
     try:
         # Получаем список клиентов для рассылки
         eligible_users = calculate_for_delivery()
-
         if eligible_users:
             for user in eligible_users:
                 send_delivery_offer(bot, user["user_id"], user["name"])
-
-            # bot.send_message(chat_id=user_id, text="Рассылка завершена!")
         else:
             bot.send_message(chat_id=user_id, text="Подходящих пользователей для рассылки не найдено.")
     except Exception as e:
-        # Обработка ошибок
         bot.send_message(chat_id=user_id, text=f"Ошибка при выполнении рассылки: {str(e)}")
+
+def merge_carts_by_phone(primary_user_id, secondary_user_id):
+    # Найти все товары secondary_user_id
+    secondary_reservations = Reservations.get_row_by_user_id(secondary_user_id)
+
+    # Перенос товаров от secondary_user_id к primary_user_id
+    for reservation in secondary_reservations:
+        update_fields = {
+            "user_id": primary_user_id
+        }
+        Reservations.update_row(reservation.id, update_fields)
+
+    print(f"Объединены товары: {secondary_user_id} -> {primary_user_id}")
 
 # Обрабатывает ответ пользователя на предложение доставки с инлайн-клавиатуры.
 @bot.callback_query_handler(func=lambda call: call.data in ["yes", "no"])
@@ -2526,12 +2603,47 @@ def handle_address_input(message):
 
     name = user_data.name
     phone = user_data.phone
-    final_sum = calculate_sum_for_user(user_id)  # Вычисляем сумму заказов (см. ниже)
+
+    # Вычисляем сумму заказов текущего пользователя
+    user_orders_sum = calculate_sum_for_user(user_id)
+
+    # Выполняем новый запрос к базе данных, чтобы получить всех клиентов с тем же номером телефона
+    from db import Session, engine
+    with Session(bind=engine) as session:
+        same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
+
+    # Проверяем, есть ли клиенты с таким же номером телефона
+    if not same_phone_users:
+        bot.send_message(chat_id=user_id, text="Ошибка! Не удалось найти других заказов с данным номером телефона.")
+        return
+
+    # Вычисляем суммы заказов для каждого клиента с тем же телефоном
+    others_orders_sum = 0
+    all_user_orders_details = []  # Для хранения детальной информации о заказах
+    for client in same_phone_users:
+        client_sum = calculate_sum_for_user(client.user_id)  # Вычисляем заказы каждого клиента
+        all_user_orders_details.append({
+            "name": client.name,
+            "orders_sum": client_sum
+        })
+        if client.user_id != user_id:  # Суммируем заказы других пользователей
+            others_orders_sum += client_sum
+
+    # Общая сумма заказов всех клиентов с этим номером телефона
+    total_orders_sum = user_orders_sum + others_orders_sum
+
+    # Формируем текст для вывода информации
+    orders_details_text = f"Ваши заказы: {user_orders_sum}\n"
+    for detail in all_user_orders_details:
+        # Убираем user_id из сообщения
+        if detail["name"] != name:  # Показываем только других клиентов
+            orders_details_text += f"{detail['name']}: {detail['orders_sum']}\n"
+    orders_details_text += f"Общая сумма: {total_orders_sum}"
 
     # Отправляем сообщение для подтверждения
     bot.send_message(
         chat_id=user_id,
-        text=f"Ваши данные:\nИмя: {name}\nТелефон: {phone}\nСумма заказов: {final_sum}\nАдрес: {address}\n\nПодтверждаете?",
+        text=f"Ваши данные:\nИмя: {name}\nТелефон: {phone}\nАдрес: {address}\n\n{orders_details_text}\n\nПодтверждаете?",
         reply_markup=keyboard_for_confirmation()  # Клавиатура "Подтвердить"/"Отменить"
     )
 
@@ -2539,7 +2651,9 @@ def handle_address_input(message):
     temp_user_data[user_id] = {
         "name": name,
         "phone": phone,
-        "final_sum": final_sum,
+        "final_sum": user_orders_sum,
+        "others_orders_sum": others_orders_sum,
+        "total_sum_by_phone": total_orders_sum,
         "address": address
     }
 
@@ -2560,7 +2674,7 @@ def calculate_sum_for_user(user_id):
         return result.final_sum if result.final_sum else 0
 
 
-@bot.message_handler(func=lambda message: message.text == "Архив доставки")
+@bot.message_handler(func=lambda message: message.text == "🗄 Архив доставки")
 def archive_delivery_to_excel(message):
     """
     Формирует Excel-файл с архивом доставок из таблицы in_delivery,
@@ -2617,57 +2731,264 @@ def archive_delivery_to_excel(message):
     # Уведомление об успешной очистке
     bot.send_message(message.chat.id, "Все записи из таблицы in_delivery удалены.")
 
-
 @bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_CONFIRMATION")
 def handle_confirmation(call):
     """
-    Обработка подтверждения или отмены от пользователя.
+    Обработка подтверждения данных. Считывается телефон пользователя из базы данных,
+    и выполняется подсчёт общей суммы всех клиентов, связанных с этим телефоном.
     """
     user_id = call.from_user.id
     confirmation = call.data  # "confirm_yes" или "confirm_no"
 
-
     if confirmation == "confirm_yes":
-        # Проверка временных данных пользователя
+        # Получаем временные данные пользователя (новые данные)
         user_temp_data = temp_user_data.get(user_id)
-        if user_temp_data:
-            name = user_temp_data.get("name", "Не указано")
-            phone = user_temp_data.get("phone", "Не указан")
-            address = user_temp_data.get("address", "Не указан")
-            final_sum = user_temp_data.get("final_sum", "Не указана")
 
-            # Сохраняем данные в таблицу "ForDelivery"
-            ForDelivery.insert(
-                user_id=user_id,
-                name=name,
-                phone=phone,
-                address=address,
-                total_sum=final_sum
-            )
-
-            # Подтверждаем заказ пользователю
+        if not user_temp_data:
             bot.send_message(
                 chat_id=user_id,
-                text=(
-                    f"Спасибо! Ваш заказ доставлен на указанный адрес:\n"
-                    f"Имя: {name}\nТелефон: {phone}\nАдрес: {address}\nСумма заказов: {final_sum}."
-                )
+                text="Ошибка! Временные данные отсутствуют. Попробуйте снова."
             )
-
-            # Очищаем временные данные
-            if user_id in temp_user_data:
-                del temp_user_data[user_id]
             set_user_state(user_id, None)
-        else:
-            bot.send_message(chat_id=user_id,
-                             text="Ошибка! Временные данные пользователя отсутствуют. Попробуйте снова.")
-            set_user_state(user_id, None)
+            return
+
+        # Извлекаем данные из временного хранилища
+        name = user_temp_data.get("name", "Не указано")
+        new_phone = user_temp_data.get("phone", "Не указан")  # Новый телефон, введённый пользователем
+        address = user_temp_data.get("address", "Не указан")
+        final_sum = user_temp_data.get("final_sum", 0)  # Сумма текущего заказа
 
 
+        from db import Session, engine, Clients, ForDelivery
 
-    # Уведомляем Telegram, что callback обработан
+        # Подключаемся к базе данных
+        with Session(bind=engine) as session:
+            try:
+                # Ищем клиента в базе по user_id (получаем данные из таблицы Clients)
+                client = session.query(Clients).filter(Clients.user_id == user_id).first()
+                if not client:
+                    print(f"[ERROR] Клиент с user_id={user_id} не найден в таблице Clients.")
+                    bot.send_message(
+                        chat_id=user_id,
+                        text="Ошибка! Клиент не найден в базе данных. Попробуйте снова.",
+                    )
+                    return
+
+                # Телефон клиента из базы данных (актуальный)
+                current_phone_in_db = client.phone
+
+                # Находим всех клиентов с этим номером телефона
+                related_clients = session.query(Clients).filter(Clients.phone == current_phone_in_db).all()
+
+                # Собираем данные о клиентах и их заказах
+                total_sum_by_phone = final_sum  # Начинаем с текущей суммы заказа
+                all_names = [name]
+
+                if related_clients:
+                    for related_client in related_clients:
+                        # Для всех связанных клиентов (кроме текущего)
+                        if related_client.user_id != user_id:
+                            all_names.append(related_client.name)
+                            order_sum = calculate_sum_for_user(related_client.user_id)
+                            total_sum_by_phone += order_sum
+                else:
+                    print(f"[DEBUG] Связанных клиентов для телефона {current_phone_in_db} не найдено.")
+
+                # Составляем строку с именами клиентов
+                all_names_str = ", ".join(all_names)
+
+            except Exception as e:
+                print(f"[ERROR] Ошибка при работе с базой данных: {e}")
+                bot.send_message(
+                    chat_id=user_id,
+                    text="Произошла ошибка при обработке данных. Попробуйте снова.",
+                )
+                return
+
+        # Сохранение подтверждённых данных в таблицу ForDelivery
+        with Session(bind=engine) as session:
+            try:
+                delivery_entry = ForDelivery(
+                    user_id=user_id,
+                    name=name,
+                    phone=new_phone,  # Новый телефон
+                    address=address,  # Новый адрес
+                    total_sum=total_sum_by_phone  # Итоговая сумма заказов
+                )
+                session.add(delivery_entry)
+                session.commit()
+            except Exception as e:
+                print(f"[ERROR] Ошибка при записи в ForDelivery: {e}")
+                bot.send_message(
+                    chat_id=user_id,
+                    text="Произошла ошибка при сохранении данных. Попробуйте снова.",
+                )
+                return
+
+        # Уведомляем пользователя о подтверждении данных
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text=(
+                f"Ваш заказ подтверждён и будет доставлен на указанный адрес:\n"
+                f"Связанные клиенты: {all_names_str}\n"
+                f"Общая сумма заказов: {total_sum_by_phone}\n"
+                f"Адрес доставки: {address}"
+            )
+        )
+
+        # Удаляем временные данные и сбрасываем состояние пользователя
+        if user_id in temp_user_data:
+            del temp_user_data[user_id]
+        set_user_state(user_id, None)
+
+    elif confirmation == "confirm_no":
+        # Если пользователь отказался подтверждать данные
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Вы хотите изменить данные? Выберите вариант ниже:",
+            reply_markup=keyboard_for_editing()
+        )
+        set_user_state(user_id, "WAITING_FOR_DATA_EDIT")
+
+    # Завершаем callback
     bot.answer_callback_query(call.id)
 
+def keyboard_for_editing():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("Изменить адрес", callback_data="edit_address"))
+    keyboard.add(types.InlineKeyboardButton("Изменить номер телефона", callback_data="new_phone"))
+    keyboard.add(types.InlineKeyboardButton("Отказаться от доставки", callback_data="delivery_otmena"))
+    return keyboard
+
+@bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_DATA_EDIT")
+def handle_data_editing(call):
+    user_id = call.from_user.id
+    action = call.data
+
+
+    if action == "new_phone":
+        set_user_state(user_id, "WAITING_FOR_NEW_PHONE")
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Введите новый номер телефона:"
+        )
+    elif action == "edit_address":
+        set_user_state(user_id, "WAITING_FOR_NEW_ADDRESS")
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Введите новый адрес доставки:"
+        )
+    else:
+        print(f"DEBUG ERROR: Неизвестное значение 'call.data': {action}' для пользователя ID={user_id}")
+
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id) == "WAITING_FOR_NEW_ADDRESS")
+def handle_new_address(message):
+    """
+    Обработка нового адреса от пользователя.
+    """
+    user_id = message.from_user.id
+    new_address = message.text
+    temp_user_data[user_id]["address"] = new_address  # Сохранение нового адреса
+
+    # Получаем временные данные пользователя
+    name = temp_user_data[user_id].get("name", "Не указано")
+    phone = temp_user_data[user_id].get("phone", "Не указан")
+    final_sum = temp_user_data[user_id].get("final_sum", 0)
+
+    # Получаем всех клиентов с таким же номером телефона
+    from db import Session, engine
+    with Session(bind=engine) as session:
+        same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
+
+    # Считаем общую сумму заказов и собираем имена всех клиентов
+    total_sum_by_phone = final_sum
+    all_names = [name]  # Добавляем текущее имя
+    for client in same_phone_users:
+        if client.user_id != user_id:  # Пропускаем текущего клиента
+            all_names.append(client.name)
+            total_sum_by_phone += calculate_sum_for_user(client.user_id)
+
+    # Формируем строку с именами всех клиентов
+    all_names_str = ", ".join(all_names)
+
+    # Отправляем обновлённое сообщение с данными
+    bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"Данные обновлены:\n"
+            f"Имя: {name}\nТелефон: {phone}\nНовый адрес: {new_address}\n"
+            f"Имена заказчиков: {all_names_str}\n"
+            f"Общая сумма заказов: {total_sum_by_phone}.\n\n"
+            f"Подтверждаете изменения?"
+        ),
+        reply_markup=keyboard_for_confirmation()
+    )
+    set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
+
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id) == "WAITING_FOR_NEW_PHONE")
+def handle_new_phone(message):
+    """
+    Обработка нового номера телефона пользователя.
+    Должен учитывать информацию по старому номеру телефона и временно сохранять новый номер.
+    """
+    user_id = message.from_user.id
+    new_phone = message.text.strip()  # Убираем лишние пробелы
+
+    # Временные данные текущего пользователя
+    name = temp_user_data[user_id].get("name", "Не указано")
+    current_phone = temp_user_data[user_id].get("phone", "Не указан")  # Это старый номер телефона
+    address = temp_user_data[user_id].get("address", "Не указан")
+    final_sum = temp_user_data[user_id].get("final_sum", 0)
+
+
+    # Подключаемся к базе данных, чтобы найти тех, у кого такой же старый номер телефона (current_phone)
+    from db import Session, engine, Clients
+    with Session(bind=engine) as session:
+        try:
+            # Найти всех клиентов с текущим (старым) номером телефона
+            same_phone_users = session.query(Clients).filter(Clients.phone == current_phone).all()
+
+
+        except Exception as e:
+            print(f"[ERROR] Ошибка при запросе к базе: {e}")
+            same_phone_users = []
+
+    # Подсчитываем общую сумму всех заказов и собираем имена
+    total_sum_by_phone = final_sum  # Начинаем с суммы текущего пользователя
+    all_names = [name]  # Добавляем название текущего клиента
+    for client in same_phone_users:
+        if client.user_id != user_id:  # Избегаем дублирования текущего пользователя
+            all_names.append(client.name)
+            order_sum = calculate_sum_for_user(client.user_id)  # Посчитать сумму заказов клиента
+            total_sum_by_phone += order_sum
+
+    # Формируем строку с именами всех клиентов
+    all_names_str = ", ".join(all_names)
+
+    # Сохраняем новый номер временно
+    temp_user_data[user_id]["phone"] = new_phone
+
+    # Отправляем итоговое сообщение
+    bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"Обновление данных:\n"
+            f"Текущий номер (старый): {current_phone}\n"
+            f"Новый номер: {new_phone}\n"
+            f"Имя: {name}\nАдрес: {address}\n"
+            f"Имена заказчиков с текущим номером: {all_names_str}\n"
+            f"Общая сумма заказов: {total_sum_by_phone}.\n\n"
+            f"Подтверждаете изменения?"
+        ),
+        reply_markup=keyboard_for_confirmation()
+    )
+
+    # Переводим пользователя в состояние ожидания подтверждения
+    set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
 
 def keyboard_for_confirmation():
     """
@@ -2679,33 +3000,140 @@ def keyboard_for_confirmation():
     return keyboard
 
 
-
 # Обработчик подтверждения или отмены изменений
-@bot.callback_query_handler(func=lambda call: call.data in ["confirm_yes", "confirm_no"])
+@bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_CONFIRMATION")
 def handle_confirmation(call):
-    try:
-        user_id = call.from_user.id
-        action = call.data
+    """
+    Обработка подтверждения данных. Телефон и другая информация извлекаются:
+    - Старый телефон — только из таблицы Clients.
+    - Новые данные (телефон, адрес) — из temp_user_data.
+    """
+    user_id = call.from_user.id
+    confirmation = call.data  # "confirm_yes" или "confirm_no"
 
-        if action == "confirm_yes":
-            # Данные подтверждены, выводим результат и сбрасываем состояние
-            address = temp_user_data.get(user_id, {}).get("address", "не указан")
-            phone = temp_user_data.get(user_id, {}).get("phone", "не указан")
+    if confirmation == "confirm_yes":
+        # Получаем временные данные пользователя (новые данные)
+        user_temp_data = temp_user_data.get(user_id)
+
+        if not user_temp_data:
             bot.send_message(
                 chat_id=user_id,
-                text=f"Данные подтверждены!\n\nАдрес: {address}\nТелефон: {phone}"
+                text="Ошибка! Временные данные отсутствуют. Попробуйте снова."
             )
-            set_user_state(user_id, None)  # Возвращаем в исходное состояние
-        elif action == "confirm_no":
-            # Пользователь отменил изменения, сбрасываем состояние
-            bot.send_message(chat_id=user_id, text="Изменения отменены.")
             set_user_state(user_id, None)
+            return
 
-        # Отвечаем на callback обязательно
-        bot.answer_callback_query(call.id)
-    except Exception as e:
-        print(f"[ERROR] Ошибка в обработчике подтверждения: {e}")
+        # Извлекаем новые данные из временного хранилища
+        name = user_temp_data.get("name", "Не указано")
+        phone = user_temp_data.get("phone", "Не указан")  # Новый телефон
+        address = user_temp_data.get("address", "Не указан")
+        final_sum = user_temp_data.get("final_sum", 0)  # Сумма текущего заказа
 
+
+        from db import Session, engine, Clients, ForDelivery
+
+        # Подключаемся к базе для извлечения старого телефона из Clients
+        with Session(bind=engine) as session:
+            try:
+                # Ищем клиента в таблице Clients по user_id
+                client = session.query(Clients).filter(Clients.user_id == user_id).first()
+                if not client:
+                    # Если клиент отсутствует в таблице Clients, сообщаем об ошибке
+                    print(f"[ERROR] Клиент с user_id={user_id} не найден в таблице Clients.")
+                    bot.send_message(
+                        chat_id=user_id,
+                        text="Ошибка! Клиент не найден в базе данных. Попробуйте снова.",
+                    )
+                    return
+
+                # Старый телефон: извлекаем его из записи в Clients
+                old_phone = client.phone
+                print(f"[DEBUG] Старый телефон из базы Clients: {old_phone}")
+
+                # Инициализируем общую сумму и список связанных клиентов
+                total_sum_by_phone = final_sum
+                all_names = [name]
+
+                # Если новый телефон отличается от старого, ищем связанные записи
+                if old_phone != phone:
+                    print(f"[DEBUG] Телефон изменен. Ищем клиентов с телефоном {old_phone}...")
+                    same_phone_users = session.query(Clients).filter(Clients.phone == old_phone).all()
+
+                    if same_phone_users:
+                        print(
+                            f"[DEBUG] Найдены клиенты с телефоном {old_phone}: {[client.name for client in same_phone_users]}")
+
+                        # Вычисляем общую сумму заказов всех связанных клиентов
+                        for other_client in same_phone_users:
+                            if other_client.user_id != user_id:  # Исключаем текущего клиента
+                                all_names.append(other_client.name)
+                                order_sum = calculate_sum_for_user(other_client.user_id)
+                                total_sum_by_phone += order_sum
+                    else:
+                        print(f"[DEBUG] Клиенты с телефоном {old_phone} не найдены.")
+                else:
+                    print(f"[DEBUG] Телефон не изменялся. Сумма остается: {final_sum}")
+
+                # Формируем список имен клиентов
+                all_names_str = ", ".join(all_names)
+
+            except Exception as e:
+                print(f"[ERROR] Ошибка при работе с базой данных: {e}")
+                bot.send_message(
+                    chat_id=user_id,
+                    text="Произошла ошибка при обработке данных. Попробуйте снова.",
+                )
+                return
+
+        # Сохраняем новые данные в таблицу ForDelivery
+        with Session(bind=engine) as session:
+            try:
+                delivery_entry = ForDelivery(
+                    user_id=user_id,
+                    name=name,
+                    phone=phone,  # Сохраняем новый телефон
+                    address=address,  # Сохраняем новый адрес
+                    total_sum=total_sum_by_phone,  # Итоговая сумма
+                )
+                session.add(delivery_entry)
+                session.commit()
+            except Exception as e:
+                print(f"[ERROR] Ошибка записи в ForDelivery: {e}")
+                bot.send_message(
+                    chat_id=user_id,
+                    text="Произошла ошибка при сохранении данных. Попробуйте снова.",
+                )
+                return
+
+        # Отправляем подтверждающее сообщение пользователю
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text=(
+                f"Ваш заказ подтвержден и будет доставлен на указанный адрес:\n"
+                f"Связанные клиенты: {all_names_str}\n"
+                f"Общая сумма заказов: {total_sum_by_phone}\n"
+                f"Адрес доставки: {address}"
+            )
+        )
+
+        # Удаляем временные данные и сбрасываем состояние пользователя
+        if user_id in temp_user_data:
+            del temp_user_data[user_id]
+        set_user_state(user_id, None)
+
+    elif confirmation == "confirm_no":
+        # Пользователь отказался подтверждать данные
+        bot.edit_message_text(
+            chat_id=user_id,
+            message_id=call.message.message_id,
+            text="Вы хотите изменить данные? Выберите вариант ниже:",
+            reply_markup=keyboard_for_editing()
+        )
+        set_user_state(user_id, "WAITING_FOR_DATA_EDIT")
+
+    # Завершаем callback
+    bot.answer_callback_query(call.id)
 
 # Клавиатура для доставки да или нет
 def keyboard_for_delivery():
@@ -2719,35 +3147,132 @@ def keyboard_for_delivery():
     return keyboard
 
 
-# Вычисляет общую сумму обработанных заказов клиента из Posts, минусуя возвраты (return_order),и возвращает список клиентов, сумма заказов которых превышает установленный порог.
-def calculate_for_delivery(min_order_sum=2000):
+def calculate_for_delivery():
+    """
+    Вычисляет общую сумму заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
+    Сообщение отправляется одному клиенту с минимальным ID. Логи содержат индивидуальную сумму, суммы других клиентов, и итоговую сумму.
+    """
+
+    # Шаг 1: Подготовка данных (загрузка из таблиц)
+    from db import Session, engine
     with Session(bind=engine) as session:
-        # Создаем запрос для вычисления итоговых сумм заказов
-        query = session.query(
-            Reservations.user_id,
-            Clients.name,
-            Clients.phone,
-            # Итоговая сумма: сумма заказов из Posts минус возвраты из Reservations
-            (func.sum(Posts.price) - func.sum(Reservations.return_order)).label("final_sum")
-        ).join(
-            Clients, Reservations.user_id == Clients.user_id
-        ).join(
-            Posts, Reservations.post_id == Posts.id  # Соединяем с таблицей Posts через post_id
-        ).filter(
-            Reservations.is_fulfilled == True  # Только выполненные заказы
-        ).group_by(
-            Reservations.user_id, Clients.name, Clients.phone
-        ).having(
-            (func.sum(Posts.price) - func.sum(Reservations.return_order)) >= min_order_sum
-        ).all()
+        all_clients = session.query(Clients).all()
 
-        # Преобразуем результаты в удобный формат
-        results = [
-            {"user_id": row.user_id, "name": row.name, "phone": row.phone, "final_sum": row.final_sum}
-            for row in query
-        ]
+    if not all_clients:
+        print("[WARNING] Данные о клиентах не найдены!")
+        return []
 
-        return results
+
+    with Session(bind=engine) as session:
+        all_reservations = session.query(Reservations).all()
+
+    if not all_reservations:
+        print("[WARNING] Данные о заказах не найдены!")
+        return []
+
+
+    with Session(bind=engine) as session:
+        all_posts = session.query(Posts).all()
+
+    if not all_posts:
+        print("[WARNING] Данные о постах не найдены!")
+        return []
+
+
+    # Преобразуем списки клиентов и постов в словари для быстрого доступа
+    clients_dict = {client.user_id: client for client in all_clients}
+    clients_by_phone = {}
+    for client in all_clients:
+        phone = getattr(client, "phone", None)
+        if phone:
+            if phone not in clients_by_phone:
+                clients_by_phone[phone] = []
+            clients_by_phone[phone].append(client)
+
+    posts_dict = {post.id: post for post in all_posts}
+
+    # Шаг 2: Группировка заказов по user_id
+    grouped_totals = {}
+    for reservation in all_reservations:
+        try:
+            user_id = reservation.user_id
+            post_id = reservation.post_id
+            quantity = reservation.quantity
+            return_order = reservation.return_order
+
+            # Проверка: существует ли пользователь с данным user_id
+            if user_id not in clients_dict:
+                print(f"[WARNING] Пропуск заказа: не найден пользователь с user_id={user_id}.")
+                continue
+
+            # Проверка: существует ли пост (товар) с данным post_id
+            if post_id not in posts_dict:
+                print(f"[WARNING] Пропуск заказа: не найден пост с post_id={post_id}.")
+                continue
+
+            # Вычисление стоимости заказа
+            post = posts_dict[post_id]
+            price = post.price
+            total_amount = (price * quantity) - return_order
+
+            if user_id not in grouped_totals:
+                grouped_totals[user_id] = 0
+            grouped_totals[user_id] += total_amount
+
+
+        except Exception as e:
+            print(f"[ERROR] Ошибка при обработке заказа: {str(e)}")
+            continue
+
+    # Шаг 3: Группировка заказов по телефону
+    summed_by_phone = {}
+    details_by_phone = {}  # Для хранения данных по отдельной сумме каждого клиента
+    for user_id, total in grouped_totals.items():
+        client = clients_dict[user_id]
+        phone = getattr(client, "phone", None)
+
+        if phone:
+            if phone not in summed_by_phone:
+                summed_by_phone[phone] = 0
+                details_by_phone[phone] = []
+
+            summed_by_phone[phone] += total
+            details_by_phone[phone].append({
+                "user_id": user_id,
+                "name": client.name,
+                "individual_total": total
+            })
+
+
+    # Шаг 4: Выбор клиента с минимальным ID и вывод данных логов
+    delivery_users = []
+    threshold = 1000  # Пороговое значение для рассылки
+
+    for phone, total_amount in summed_by_phone.items():
+        # Найти всех клиентов с этим номером телефона
+        clients = clients_by_phone.get(phone, [])
+
+        # Найти клиента с минимальным id
+        if clients:
+            clients.sort(key=lambda c: c.id)  # Сортируем по ID
+            selected_client = clients[0]
+
+
+
+            # Добавляем выбранного клиента в рассылку, если сумма превышает порог
+            if total_amount > threshold:
+                delivery_users.append({
+                    "user_id": getattr(selected_client, "user_id"),
+                    "name": getattr(selected_client, "name"),
+                    "total_amount": total_amount
+                })
+
+            else:
+                print(
+                    f"[INFO] Клиент с телефоном {phone} не добавлен в рассылку. Общая сумма заказов={total_amount} ниже порога={threshold}.")
+
+
+    return delivery_users
 
 # Отправка рассылки
 def send_delivery_offer(bot, user_id, user_name):
@@ -2773,67 +3298,105 @@ def handle_delivery_response(bot, user_id, response):
 def confirm_delivery(message):
     try:
         with Session(bind=engine) as session:
-            # Получаем всех пользователей из ForDelivery
+            # Получаем все записи из ForDelivery
             for_delivery_rows = session.query(ForDelivery).all()
 
             if not for_delivery_rows:
                 bot.send_message(
                     message.chat.id,
-                    "❌ В списке ForDelivery никого нет для подтверждения доставки."
+                    "❌ Список доставки пуст. Нет данных для обработки."
                 )
                 return
 
-            # Перемещаем данные
-            for row in for_delivery_rows:
-                # Ищем связанные обработанные заказы в Reservations только для текущего пользователя
-                reservations = session.query(Reservations).filter(
-                    Reservations.user_id == row.user_id,
-                    Reservations.is_fulfilled == True
+            # Множество для отслеживания обработанных телефонов (чтобы не повторяться)
+            processed_phones = set()
+
+            for current_for_delivery in for_delivery_rows:
+                # Шаг 1: Получить актуальный номер телефона из Clients
+                client = session.query(Clients).filter(
+                    Clients.user_id == current_for_delivery.user_id
+                ).first()
+
+                if not client:
+                    # Если пользователя нет в Clients, пропускаем
+                    continue
+
+                phone = client.phone
+
+                # Если этот номер уже обработан, пропускаем
+                if phone in processed_phones:
+                    continue
+
+                # Добавляем номер в множество уже обработанных
+                processed_phones.add(phone)
+
+                # Шаг 2: Найти всех пользователей с этим же телефоном из Clients
+                related_users = session.query(Clients).filter(
+                    Clients.phone == phone
                 ).all()
 
-                # Подсчитываем уникальные заказы для каждого пользователя
-                total_sum = 0
-                order_descriptions = []  # Добавляем описание всех товаров клиента
+                # Собираем user_id всех связанных пользователей
+                related_user_ids = [user.user_id for user in related_users]
 
-                for reservation in reservations:
-                    # Получаем описание товара из Posts
-                    post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
-                    item_description = post.description if post else "Неизвестный товар"
+                # Шаг 3: Сбор всех выполненных заказов из Reservations
+                item_descriptions = []  # Список для описания заказов
+                total_sum = 0  # Общая сумма всех заказов
 
-                    # Добавляем данные по количеству и описаниям
-                    order_descriptions.append(f"{item_description} x{reservation.quantity}")
-                    total_sum += reservation.quantity * (post.price if post else 0)  # Умножаем цену на количество
+                reservations_to_delete = []  # Собираем заказы для последующего удаления
 
-                    # Удаляем обработанные заказы из Reservations
+                for user_id in related_user_ids:
+                    # Получаем выполненные заказы для текущего user_id
+                    user_reservations = session.query(Reservations).filter(
+                        Reservations.user_id == user_id,
+                        Reservations.is_fulfilled == True
+                    ).all()
+
+                    for reservation in user_reservations:
+                        # Получаем данные о товаре из связанной таблицы Posts
+                        post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
+                        if post:
+                            # Формируем описание "Товар x Количество"
+                            item_descriptions.append(f"{post.description} x{reservation.quantity}")
+                            # Увеличиваем общую сумму
+                            total_sum += post.price * reservation.quantity
+
+                        # Добавляем заказ в список для удаления
+                        reservations_to_delete.append(reservation)
+
+                # Если товаров нет, добавляем заглушку
+                if not item_descriptions:
+                    item_descriptions.append("Нет выполненных заказов")
+
+                # Шаг 4: Создаём запись в InDelivery для основного пользователя
+                new_delivery = InDelivery(
+                    user_id=current_for_delivery.user_id,  # ID пользователя из ForDelivery
+                    item_description="\n".join(item_descriptions),  # Описание всех товаров
+                    quantity=len(item_descriptions),  # Количество строк с описанием
+                    total_sum=total_sum,  # Общая цена
+                    delivery_address=current_for_delivery.address,  # Адрес текущего пользователя
+                )
+                session.add(new_delivery)
+
+                # Шаг 5: Удалить обработанные заказы из Reservations
+                for reservation in reservations_to_delete:
                     session.delete(reservation)
 
-                # Если заказы найдены, добавляем в InDelivery
-                if order_descriptions:
-                    new_delivery = InDelivery(
-                        user_id=row.user_id,
-                        item_description="\n".join(order_descriptions),  # Описание всех товаров
-                        quantity=len(order_descriptions),  # Общее количество позиций
-                        total_sum=total_sum if total_sum > 0 else row.total_sum,
-                        # Если общий подсчет не удался, берем старое значение
-                        delivery_address=row.address,
-                    )
-                    session.add(new_delivery)
+            # Шаг 6: Удалить все записи из ForDelivery
+            session.query(ForDelivery).delete(synchronize_session=False)
 
-            # Удаляем все записи из ForDelivery
-            ForDelivery.delete_all_rows()
-
-            # Сохраняем изменения
+            # Применяем все изменения
             session.commit()
+
             bot.send_message(
                 message.chat.id,
-                "✅ Все заказы успешно перемещены из ForDelivery в InDelivery!"
+                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Записи удалены из ForDelivery."
             )
-
     except Exception as e:
         bot.send_message(
             message.chat.id,
             f"❌ Ошибка при подтверждении доставки: {str(e)}"
         )
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_"))
 def handle_edit_choice(call):
     print(f"Получено callback_data: {call.data}")  # Логирование данных

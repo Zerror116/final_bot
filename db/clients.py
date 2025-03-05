@@ -1,6 +1,3 @@
-import datetime
-from ast import Bytes
-
 from sqlalchemy import (
     String,
     ForeignKey,
@@ -36,10 +33,13 @@ class Clients(AbstractModel):
 
     @staticmethod
     def get_row_all():
-        from sqlalchemy.orm import sessionmaker
-        Session = sessionmaker(bind=engine)
-        session = Session()
-        return session.query(Clients.user_id, Clients.name, Clients.role).all()
+        """
+        Получить всех клиентов из базы данных.
+        """
+        from db import Session, engine
+        with Session(bind=engine) as session:
+            query = session.query(Clients)
+            return query.all()
 
     @staticmethod
     def get_row(user_id):

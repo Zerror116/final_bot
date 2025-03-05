@@ -6,7 +6,6 @@ from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
 
-
 class Posts(AbstractModel):
     __tablename__ = "posts"
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -61,8 +60,7 @@ class Posts(AbstractModel):
                 return False, f"Ошибка при удалении поста: {str(e)}"
 
     @staticmethod
-    def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None, is_sent: bool = None,
-                   created_at: datetime = None):
+    def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None, is_sent: bool = None,created_at: datetime = None):
         with Session(bind=engine) as session:
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:

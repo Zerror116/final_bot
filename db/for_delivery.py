@@ -25,6 +25,7 @@ class ForDelivery(AbstractModel):
     total_sum = mapped_column(Integer, nullable=False)
     address = mapped_column(String, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
+
     @staticmethod
     def insert(user_id, name, phone, address, total_sum):
         with Session(bind=engine) as session:
@@ -43,12 +44,6 @@ class ForDelivery(AbstractModel):
                 raise e
 
     @staticmethod
-    def get_row(user_id: int):
-        with Session(bind=engine) as session:
-            query = session.query(ForDelivery).filter(ForDelivery.user_id == user_id).all()
-            return query
-
-    @staticmethod
     def get_all_rows():
         with Session(bind=engine) as session:
             return session.query(ForDelivery).all()
@@ -62,9 +57,3 @@ class ForDelivery(AbstractModel):
             except Exception as e:
                 session.rollback()
                 raise e
-
-    # @staticmethod
-    # def update_row(post_id: int, price: int, description: str, quantity: int):
-    #
-    # @staticmethod
-    # def delete_row():

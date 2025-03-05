@@ -31,15 +31,6 @@ class BlackList(AbstractModel):
             except Exception:
                 raise
 
-    @staticmethod
-    def is_blacklisted(user_id: int):
-        """
-           Проверяет, находится ли пользователь в черном списке.
-           Возвращает True, если пользователь заблокирован.
-           """
-        with Session(bind=engine) as session:
-            result = session.query(BlackList).filter(BlackList.user_id == user_id).first()
-            return result is not None
 
     @staticmethod
     def get_row(user_id: int):
@@ -47,22 +38,3 @@ class BlackList(AbstractModel):
             query = session.query(BlackList).filter(BlackList.user_id == user_id).all()
             return query
 
-    @staticmethod
-    def delete_row(black_id: int):
-        with Session(bind=engine) as session:
-            query = session.query(BlackList).filter(BlackList.id == black_id).first()
-            if query is None:
-                # на самомо деле лучше просто falsе
-                return False, "Account not found"
-            session.delete(query)
-            session.commit()
-
-    @staticmethod
-    def update_row(black_id: int, phone: str):
-        with Session(bind=engine) as session:
-            query = session.query(BlackList).filter(BlackList.id == black_id).first()
-            if query is None:
-                return False, "Account not found"
-            query.phone = phone
-            session.add(query)
-            session.commit()
