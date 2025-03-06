@@ -37,8 +37,6 @@ last_start_time = {}
 delivery_active = False
 
 
-# Состояния пользователя
-
 # Сохранение бронирования
 def save_reservation(user_id, post_id, quantity=1, is_fulfilled=False):
     try:
@@ -160,7 +158,6 @@ def handle_start(message):
         bot.delete_message(chat_id=user_id, message_id=message.message_id)
     except Exception:
         pass
-
 
 # Хэндлер регистрации
 @bot.message_handler(func=lambda message: message.text == "Регистрация")
@@ -488,7 +485,6 @@ def is_user_registered(phone: str) -> bool:
         print(f"Ошибка проверки пользователя: {e}")
         return False
 
-
 # Обработчик запроса бронирования
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reserve_"))
 def handle_reservation(call):
@@ -762,6 +758,7 @@ def my_orders(message):
     except Exception as ex:
         print(f"Ошибка в обработке команды '🛒 Мои заказы': {ex}")
 
+
 # Создает страницу с заказами
 def send_order_page(user_id, message_id, orders, page):
     orders_per_page = 5  # Количество заказов на одной странице
@@ -771,8 +768,15 @@ def send_order_page(user_id, message_id, orders, page):
     selected_orders = orders[start:end]
 
     # Считаем общую сумму всех заказов
-    total_sum = sum(
+    total_sum_all = sum(
         Posts.get_row_by_id(order.post_id).price for order in orders if Posts.get_row_by_id(order.post_id)
+    )
+
+    # Считаем сумму только выполненных заказов
+    total_sum_fulfilled = sum(
+        Posts.get_row_by_id(order.post_id).price
+        for order in orders
+        if order.is_fulfilled and Posts.get_row_by_id(order.post_id)
     )
 
     # Формирование текста для страницы. Колонки: описание, цена, статус заказа.
@@ -788,8 +792,9 @@ def send_order_page(user_id, message_id, orders, page):
                 callback_data=f"order_{order.id}"
             ))
 
-    # Добавляем строку с общей суммой заказов
-    text += f"\nОбщая сумма заказов: {total_sum} ₽\n"
+    # Добавляем строки с общей суммой заказов и суммой выполненных заказов
+    text += f"\nОбщая сумма заказов: {total_sum_all} ₽"
+    text += f"\nОбщая сумма обработанных заказов: {total_sum_fulfilled} ₽\n"
 
     # Навигация по страницам
     if page > 0:
@@ -1095,7 +1100,6 @@ def send_delivery_order_page(user_id, message_id, orders, page):
                 parse_mode="Markdown",
             )
 
-
 # Хэндлер для команды "👔 Назначить работника"
 @bot.message_handler(func=lambda message: message.text == "👔 Назначить работника")
 def manage_user(message):
@@ -1111,7 +1115,6 @@ def manage_user(message):
         "Введите Имя пользователя и последние 4 цифры номера через пробел (например, Иван 1234):"
     )
     bot.register_next_step_handler(message, process_user_input)
-
 
 # Обработка ввода имени и последних 4 цифр номера для поиска
 def process_user_input(message):
@@ -1151,7 +1154,6 @@ def process_user_input(message):
     except Exception as e:
         bot.send_message(message.chat.id, "Произошла ошибка при обработке данных.")
         print(f"Ошибка: {e}")
-
 
 # Обработчик изменения роли
 @bot.callback_query_handler(func=lambda call: call.data.startswith("promote_") or call.data.startswith("demote_"))
@@ -1237,7 +1239,6 @@ def find_user_by_name_and_last_digits(name, last_digits):
         print(f"Ошибка при поиске пользователя: {e}")
         return None
 
-
 # Обновление роли пользователя
 def update_user_role(user_id, new_role):
     try:
@@ -1268,7 +1269,6 @@ def paginate_delivery_orders(call):
         print(f"Ошибка при попытке пагинации заказов в доставке: {e}")
     finally:
         bot.answer_callback_query(call.id)  # Подтверждаем успешную обработку
-
 
 def confirm_delivery():
     """
@@ -1301,7 +1301,6 @@ def confirm_delivery():
         print("Все обработанные заказы перемещены в in_delivery.")
     except Exception as e:
         raise Exception(f"Ошибка при подтверждении доставки: {e}")
-
 
 # Перессылка забронированного товара в группу Брони Мега Скидки
 @bot.message_handler(func=lambda message: message.text == "📦 Заказы клиентов")
@@ -1529,7 +1528,6 @@ def mark_fulfilled_group(call):
         bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
         print(f"Ошибка в обработчике mark_fulfilled_group: {e}")
 
-
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
 def clear_cart(call):
@@ -1591,7 +1589,6 @@ def defective_order(message):
     set_user_state(message.chat.id, "awaiting_last_digits_defective")
     bot.send_message(message.chat.id, "Введите последние 4 цифры номера телефона для поиска пользователя:")
 
-
 # Поиск пользователя по последним 4 цифрам телефона
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "awaiting_last_digits_defective")
 def search_user_for_defective(message):
@@ -1620,7 +1617,6 @@ def search_user_for_defective(message):
     else:
         bot.send_message(message.chat.id, "Пользователи с такими цифрами номера не найдены. Попробуйте еще раз.")
 
-
 # Обработка действия (подтверждения или отмены)
 @bot.callback_query_handler(func=lambda call: get_user_state(call.message.chat.id) == "awaiting_defective_action")
 def handle_defective_action(call):
@@ -1631,7 +1627,6 @@ def handle_defective_action(call):
         bot.send_message(call.message.chat.id, "Операция отменена. Возвращаю вас в главное меню.")
         clear_user_state(call.message.chat.id)
         go_back_to_menu(call.message)
-
 
 # Ввод суммы брака
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "awaiting_defective_sum")
@@ -1660,10 +1655,8 @@ def handle_defective_sum_entry(message):
     except ValueError:
         bot.send_message(message.chat.id, "Некорректное значение. Введите числовую сумму.")
 
-
 # Обработка выбора заказа для дефектного товара
-@bot.callback_query_handler(
-    func=lambda call: get_user_state(call.message.chat.id) == "select_reservation_for_defective")
+@bot.callback_query_handler(func=lambda call: get_user_state(call.message.chat.id) == "select_reservation_for_defective")
 def handle_reservation_selection(call):
     # Отвечаем на callback_query сразу
     bot.answer_callback_query(call.id, text="Ваш выбор обрабатывается...")
@@ -1685,7 +1678,6 @@ def handle_reservation_selection(call):
     clear_user_state(call.message.chat.id)
     go_back_to_menu(call.message)  # Передаем только сообщение
 
-
 # Клавиатура для выбора конкретного заказа
 def create_select_reservation_keyboard(reservations):
     keyboard = types.InlineKeyboardMarkup()
@@ -1696,7 +1688,6 @@ def create_select_reservation_keyboard(reservations):
         )
         keyboard.add(btn)
     return keyboard
-
 
 # Уникальная клавиатура подтверждения
 def create_defective_confirmation_keyboard():
@@ -1715,7 +1706,7 @@ def request_phone_last_digits(message):
     )
     set_user_state(message.chat.id, "AWAITING_PHONE_LAST_4")
 
-
+# Хэндлер для кнопки Управление доставкой
 @bot.message_handler(func=lambda message: message.text == "🚚 Управление доставкой")
 def handle_delivery_management(message):
     # Создаем клавиатуру с кнопками
@@ -1723,7 +1714,7 @@ def handle_delivery_management(message):
     markup.add("📤 Отправить рассылку","✅ Подтвердить доставку", "🗄 Архив доставки", "⬅️ Назад")
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
 
-
+# Хэедлнр для поиска по последним 4 цифрам номера
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "AWAITING_PHONE_LAST_4")
 def handle_phone_input(message):
     input_text = message.text.strip()
@@ -1739,9 +1730,8 @@ def handle_phone_input(message):
     # Показ корзины по последним 4 цифрам номера телефона
     show_cart_by_last_phone_digits(message, input_text)
 
-
+# Получаем всех клиентов с такими последними цифрами телефона
 def show_cart_by_last_phone_digits(message, last_4_digits):
-    # Получаем всех клиентов с такими последними цифрами телефона
     clients = Clients.get_row_by_phone_digits(last_4_digits)
 
     if not clients:
@@ -1781,9 +1771,8 @@ def show_cart_by_last_phone_digits(message, last_4_digits):
     # Очистить состояние пользователя
     clear_user_state(message.chat.id)
 
-
+# Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров
 def send_cart_content(chat_id, reservations, user_id):
-    """Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров"""
     for reservation in reservations:
         post = Posts.get_row_by_id(reservation.post_id)
 
@@ -1814,7 +1803,6 @@ def send_cart_content(chat_id, reservations, user_id):
     markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
     bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
 
-
 # Callback для кнопки "Расформировать обработанные"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
 def handle_clear_processed(call):
@@ -1829,9 +1817,8 @@ def handle_clear_processed(call):
     else:
         bot.send_message(call.message.chat.id, "У пользователя нет обработанных товаров для удаления.")
 
-
+# Удаляет обработанные товары из корзины пользователя
 def clear_processed(user_id):
-    """Удаляет обработанные товары из корзины пользователя"""
     # Получаем содержимое корзины пользователя
     reservations = Reservations.get_row_by_user_id(user_id)
 
@@ -1844,7 +1831,6 @@ def clear_processed(user_id):
 
     # Возвращаем количество удаленных товаров
     return len(processed_items)
-
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
@@ -2087,8 +2073,13 @@ def manage_posts(message):
     user_last_message_id[user_id] = []
 
     try:
-        # Получаем все посты, которые ещё не были отправлены на канал
-        posts = Posts.get_unsent_posts()  # Используем метод get_unsent_posts для фильтрации
+        # Получаем посты в зависимости от роли пользователя
+        if role in ["admin", "supreme_leader"]:
+            posts = Posts.get_all_posts()  # Используем метод класса для получения всех постов
+        else:
+            posts = Posts.get_user_posts(
+                user_id)  # Используем метод класса для получения постов только текущего пользователя
+
     except Exception as e:
         error_msg = bot.send_message(user_id, f"Ошибка получения постов: {e}")
         user_last_message_id[user_id].append(error_msg.message_id)
@@ -2187,7 +2178,6 @@ def edit_post(call):
         )
         user_last_message_id.setdefault(user_id, []).append(msg.message_id)  # Сохраняем ID сообщения
 
-
 # Обработчик кнопки "Редактировать цену"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_price_"))
 def handle_edit_price(call):
@@ -2200,7 +2190,6 @@ def handle_edit_price(call):
 
     # Просим пользователя ввести новую цену
     bot.send_message(user_id, "Введите новую цену для поста:")
-
 
 # Обработчик кнопки "Редактировать описание"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_description_"))
@@ -2215,7 +2204,6 @@ def handle_edit_description(call):
     # Просим ввести новое описание
     bot.send_message(user_id, "Введите новое описание для поста:")
 
-
 # Обработчик кнопки "Редактировать количество"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_quantity_"))
 def handle_edit_quantity(call):
@@ -2228,7 +2216,6 @@ def handle_edit_quantity(call):
 
     # Просим ввести новое количество
     bot.send_message(user_id, "Введите новое количество товара:")
-
 
 # Обработчик ввода новой цены
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_PRICE)
@@ -2261,7 +2248,6 @@ def edit_post_price(message):
     finally:
         clear_user_state(user_id)  # Сбрасываем состояние пользователя
 
-
 # Обработчик ввода нового описания
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_DESCRIPTION)
 def edit_post_description(message):
@@ -2287,7 +2273,6 @@ def edit_post_description(message):
         bot.send_message(user_id, f"Ошибка обновления описания: {e}")
     finally:
         clear_user_state(user_id)  # Сбрасываем состояние пользователя
-
 
 # Обработчик ввода нового количества
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_QUANTITY)
@@ -2319,7 +2304,6 @@ def edit_post_quantity(message):
         bot.send_message(user_id, f"Ошибка обновления количества: {e}")
     finally:
         clear_user_state(user_id)  # Очистка состояния
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_post_"))
 def delete_post_handler(call):
@@ -2374,7 +2358,6 @@ def go_back(message):
         bot.send_message(
             message.chat.id, "Произошла ошибка. Пожалуйста, попробуйте снова позже."
         )
-
 
 # Отправка в канал
 @bot.message_handler(func=lambda message: message.text == "📢 Отправить посты в канал")
@@ -2529,7 +2512,6 @@ def handle_statistic(message):
 
     bot.send_message(message.chat.id, response)
 
-
 # Обработчик для кнопки 'Отправить рассылку'.
 @bot.message_handler(func=lambda message: message.text == "📤 Отправить рассылку")
 def send_broadcast(message):
@@ -2672,7 +2654,6 @@ def calculate_sum_for_user(user_id):
         ).first()
 
         return result.final_sum if result.final_sum else 0
-
 
 @bot.message_handler(func=lambda message: message.text == "🗄 Архив доставки")
 def archive_delivery_to_excel(message):
@@ -3014,7 +2995,6 @@ def keyboard_for_confirmation():
     keyboard.add(types.InlineKeyboardButton("Нет", callback_data="confirm_no"))
     return keyboard
 
-
 # Обработчик подтверждения или отмены изменений
 @bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_CONFIRMATION")
 def handle_confirmation(call):
@@ -3161,10 +3141,9 @@ def keyboard_for_delivery():
     keyboard.add(yes_button, no_button)  # Добавляем кнопки в клавиатуру
     return keyboard
 
-
 def calculate_for_delivery():
     """
-    Вычисляет общую сумму заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
+    Вычисляет общую сумму обработанных заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
     Сообщение отправляется одному клиенту с минимальным ID. Логи содержат индивидуальную сумму, суммы других клиентов, и итоговую сумму.
     """
 
@@ -3177,14 +3156,13 @@ def calculate_for_delivery():
         print("[WARNING] Данные о клиентах не найдены!")
         return []
 
-
     with Session(bind=engine) as session:
-        all_reservations = session.query(Reservations).all()
+        # Добавляем фильтр для обработанных заказов
+        all_reservations = session.query(Reservations).filter(Reservations.is_fulfilled == True).all()
 
     if not all_reservations:
         print("[WARNING] Данные о заказах не найдены!")
         return []
-
 
     with Session(bind=engine) as session:
         all_posts = session.query(Posts).all()
@@ -3192,7 +3170,6 @@ def calculate_for_delivery():
     if not all_posts:
         print("[WARNING] Данные о постах не найдены!")
         return []
-
 
     # Преобразуем списки клиентов и постов в словари для быстрого доступа
     clients_dict = {client.user_id: client for client in all_clients}
@@ -3208,7 +3185,7 @@ def calculate_for_delivery():
 
     # Шаг 2: Группировка заказов по user_id
     grouped_totals = {}
-    for reservation in all_reservations:
+    for reservation in all_reservations:  # Здесь all_reservations содержит только обработанные заказы
         try:
             user_id = reservation.user_id
             post_id = reservation.post_id
@@ -3234,7 +3211,6 @@ def calculate_for_delivery():
                 grouped_totals[user_id] = 0
             grouped_totals[user_id] += total_amount
 
-
         except Exception as e:
             print(f"[ERROR] Ошибка при обработке заказа: {str(e)}")
             continue
@@ -3258,10 +3234,9 @@ def calculate_for_delivery():
                 "individual_total": total
             })
 
-
     # Шаг 4: Выбор клиента с минимальным ID и вывод данных логов
     delivery_users = []
-    threshold = 1000  # Пороговое значение для рассылки
+    threshold = 2000  # Пороговое значение для рассылки
 
     for phone, total_amount in summed_by_phone.items():
         # Найти всех клиентов с этим номером телефона
@@ -3272,20 +3247,16 @@ def calculate_for_delivery():
             clients.sort(key=lambda c: c.id)  # Сортируем по ID
             selected_client = clients[0]
 
-
-
             # Добавляем выбранного клиента в рассылку, если сумма превышает порог
             if total_amount > threshold:
                 delivery_users.append({
                     "user_id": getattr(selected_client, "user_id"),
                     "name": getattr(selected_client, "name"),
-                    "total_amount": total_amount
+                    "total_amount": total_amount,
                 })
-
             else:
                 print(
                     f"[INFO] Клиент с телефоном {phone} не добавлен в рассылку. Общая сумма заказов={total_amount} ниже порога={threshold}.")
-
 
     return delivery_users
 
@@ -3492,9 +3463,7 @@ def manage_audit_posts(message):
         "unique_dates": [str(date) for date in unique_dates]
     }
 
-
-@bot.message_handler(
-    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
+@bot.message_handler(func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
 def show_posts_by_date(message):
     selected_date = message.text
 

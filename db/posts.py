@@ -131,3 +131,16 @@ class Posts(AbstractModel):
             return query
 
 
+    @staticmethod
+    def get_all_posts():
+            """Возвращает все посты, которые ещё не были отправлены на канал."""
+            # Фильтруем из всех постов те, у которых is_sent равно False
+            posts = Posts.get_row_all()  # Получение всех постов
+            return [post for post in posts if not post.is_sent]
+
+    @staticmethod
+    def get_user_posts(user_id):
+            """Возвращает посты, созданные конкретным пользователем, которые ещё не отправлены."""
+            posts = Posts.get_row_all()  # Получаем все посты
+            # Фильтруем по user_id и только те посты, которые ещё не отправлены
+            return [post for post in posts if post.chat_id == user_id and not post.is_sent]
