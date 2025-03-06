@@ -2570,7 +2570,7 @@ def handle_delivery_response_callback(call):
     # Проверяем текущее время
     current_time = datetime.now().time()  # Текущее локальное время
 
-    if response == "yes" and current_time.hour >= 23:
+    if response == "yes" and current_time.hour >= 14:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
         bot.delete_message(chat_id=user_id, message_id=message_id)
         # Отправляем сообщение об отказе
@@ -2584,7 +2584,7 @@ def handle_delivery_response_callback(call):
     elif response == "no":
         # Если отказ, удаляем сообщение с кнопками и уведомляем об ожидании следующей доставки
         bot.delete_message(chat_id=user_id, message_id=message_id)
-        bot.send_message(chat_id=user_id, text="Оповестим вас при следующей доставке.")
+        bot.send_message(chat_id=user_id, text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
 
     # Уведомляем Telegram, что callback обработан
     bot.answer_callback_query(call.id)
@@ -2861,6 +2861,21 @@ def keyboard_for_editing():
     keyboard.add(types.InlineKeyboardButton("Изменить номер телефона", callback_data="new_phone"))
     keyboard.add(types.InlineKeyboardButton("Отказаться от доставки", callback_data="delivery_otmena"))
     return keyboard
+
+@bot.callback_query_handler(func=lambda call: call.data == "delivery_otmena")
+def handle_delivery_otmena(call):
+    try:
+        # Удаляем сообщение рассылки
+        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+        # Отправляем уведомление пользователю
+        bot.send_message(chat_id=call.message.chat.id,
+                         text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
+
+        # Отвечаем на Callback, чтобы Telegram понял, что она обработана
+        bot.answer_callback_query(callback_query_id=call.id)
+    except Exception as e:
+        print(f"Ошибка при обработке: {e}")
 
 @bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_DATA_EDIT")
 def handle_data_editing(call):
