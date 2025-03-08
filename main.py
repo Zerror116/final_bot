@@ -786,7 +786,7 @@ def send_order_page(user_id, message_id, orders, page):
     for order in selected_orders:
         post = Posts.get_row_by_id(order.post_id)  # Проверка и получение данных поста через ORM
         if post:
-            status = "✅В корзине" if order.is_fulfilled else "❌Не в корзине"
+            status = "✅В корзине" if order.is_fulfilled else "⏳В обработке"
             keyboard.add(InlineKeyboardButton(
                 text=f"({status})- {post.price} ₽ - {post.description}",
                 callback_data=f"order_{order.id}"
