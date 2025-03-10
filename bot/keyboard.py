@@ -10,8 +10,9 @@ def supreme_leader_main_menu():
     send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     manage_workers = KeyboardButton("👔 Назначить работника")
+    audit_manage = KeyboardButton(" Ревизия")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        send_all_reserved_to_group,orders_in_delivery,manage_workers)
+                        send_all_reserved_to_group,orders_in_delivery,manage_workers,audit_manage)
     return leader_keyboard
 
 def client_main_menu():
