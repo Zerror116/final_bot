@@ -2,8 +2,9 @@ import io
 import re
 import time
 import telebot
-from collections import defaultdict
+import threading
 
+from collections import defaultdict
 from openpyxl.workbook import Workbook
 from sqlalchemy import func
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
@@ -1307,52 +1308,44 @@ def confirm_delivery():
 def send_all_reserved_to_group(message):
     user_id = message.chat.id
     role = get_client_role(user_id)  # Получение роли клиента
-
     # Проверка ролей
     if role not in ["supreme_leader", "admin"]:
         bot.send_message(user_id, f"У вас нет прав доступа к этой функции. Ваша роль: {role}")
         return
-
     try:
         # Получение всех резерваций
         reservations = Reservations.get_row_all()
         if not reservations:
             bot.send_message(user_id, "Нет забронированных товаров для отправки.")
             return
-
         # Фильтруем необработанные резервации
         reservations_to_send = [r for r in reservations if not r.is_fulfilled]
         if not reservations_to_send:
             bot.send_message(user_id, "Все текущие товары уже были обработаны.")
             return
-
         # Группируем заказы по user_id и post_id, суммируя количество
         grouped_orders = defaultdict(lambda: {"quantity": 0, "reservations": []})
         for reservation in reservations_to_send:
             key = (reservation.user_id, reservation.post_id)
             grouped_orders[key]["quantity"] += reservation.quantity
             grouped_orders[key]["reservations"].append(reservation)
-
         # Обрабатываем и отправляем сгруппированные заказы
         for (user_id, post_id), group in grouped_orders.items():
             try:
                 quantity = group["quantity"]
                 reservations = group["reservations"]
-
                 # Получение данных о посте
                 post_data = Posts.get_row(post_id)
                 if not post_data:
                     bot.send_message(
                         user_id, f"⚠️ Пост с ID {post_id} не найден. Пропускаем.")
                     continue
-
                 # Получение данных о клиенте
                 client_data = Clients.get_row(user_id)
                 if not client_data:
                     bot.send_message(
                         user_id, f"⚠️ Клиент с ID {user_id} не найден. Пропускаем.")
                     continue
-
                 # Формируем описание заказа
                 caption = (
                     f"💼 Новый заказ:\n\n"
@@ -1363,7 +1356,6 @@ def send_all_reserved_to_group(message):
                     f"📅 Дата: {post_data.created_at.strftime('%d.%m') if post_data.created_at else 'Дата отсутствует'}\n"
                     f"📦 Количество: {quantity}"
                 )
-
                 # Создаем кнопку
                 markup = InlineKeyboardMarkup()
                 mark_button = InlineKeyboardButton(
@@ -1371,7 +1363,6 @@ def send_all_reserved_to_group(message):
                     callback_data=f"mark_fulfilled_group_{user_id}_{post_id}",
                 )
                 markup.add(mark_button)
-
                 # Отправляем сообщение
                 if post_data.photo:
                     message = bot.send_photo(
@@ -1384,17 +1375,14 @@ def send_all_reserved_to_group(message):
                     message = bot.send_message(
                         chat_id=TARGET_GROUP_ID, text=caption, reply_markup=markup
                     )
-
                 # Сохраняем ID сообщения для последующего удаления
                 with Session(bind=engine) as session:
                     post = session.query(Posts).filter_by(id=post_id).first()
                     if post:
                         post.telegram_message_id = message.message_id  # Сохраняем ID сообщения
                         session.commit()
-
                 # Задержка секунда перед отправкой следующего поста
                 time.sleep(4)
-
             except Exception as e:
                 bot.send_message(
                     user_id, f"⚠️ Ошибка при обработке заказа: {e}")
@@ -1405,17 +1393,16 @@ def send_all_reserved_to_group(message):
         print(f"❌ Глобальная ошибка в send_all_reserved_to_group: {global_error}")
 
 
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
     user_id = call.from_user.id
     role = get_client_role(user_id)
-
     if role not in ["admin", "supreme_leader"]:
         bot.answer_callback_query(
             call.id, "У вас нет прав доступа к этой функции.", show_alert=True
         )
         return
-
     try:
         # Извлекаем данные из callback_data
         _, target_user_id, post_id = call.data.split("_")[2:]
@@ -1423,7 +1410,8 @@ def mark_fulfilled_group(call):
         post_id = int(post_id)
 
         with Session(bind=engine) as session:
-            # Получаем все необработанные резервации пользователя для данного поста
+
+            # Получаем необработанные резервации пользователя для данного поста
             reservations = (
                 session.query(Reservations)
                 .filter_by(user_id=target_user_id, post_id=post_id, is_fulfilled=False)
@@ -1436,55 +1424,80 @@ def mark_fulfilled_group(call):
                 )
                 return
 
-            # Суммируем количество, требуемое для резерваций
+            # Суммируем общее количество товаров для резервации
             total_required_quantity = sum(reservation.quantity for reservation in reservations)
 
-            # Показываем уведомление с общим количеством
+            # Отмечаем пользователю, что его действие выполняется
             bot.answer_callback_query(
                 call.id,
-                f"⚠️ Необходимо положить {total_required_quantity} шт. товара!",
+                f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт.",
                 show_alert=True,
             )
 
-            # Обновляем резервации как выполненные
+            # Обновляем все резервации как выполненные
             for reservation in reservations:
                 reservation.is_fulfilled = True
                 session.merge(reservation)
-
             session.commit()
 
-            # Получаем пост
+            # Проверяем оставшиеся резервации для данного поста
+            remaining_reservations = session.query(Reservations).filter_by(
+                post_id=post_id, is_fulfilled=False
+            ).count()
+
+            # Получаем данные поста
             post = session.query(Posts).filter_by(id=post_id).first()
             if not post:
                 bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
                 return
 
-            # Обновление сообщения с информацией, кто положил
+            # Формируем текст обновления
             user_full_name = call.from_user.first_name or "Администратор"
             updated_text = (
                 f"{call.message.caption or call.message.text}\n\n"
                 f"✅ Этот заказ теперь обработан.\n"
                 f"👤 Кто положил: {user_full_name}"
             )
+
+            # Обновляем сообщение для target_group_id
             if call.message.photo:
-                bot.edit_message_caption(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    caption=updated_text,
+                try:
+                    bot.edit_message_caption(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        caption=updated_text,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text=updated_text,
+                    )
+                except Exception:
+                    pass
+
+            # Если больше нет активных резерваций и товара, добавляем удаление сообщения из канала
+            if remaining_reservations == 0 and post.quantity == 0:
+                def delete_channel_message():
+                    try:
+                        bot.delete_message(chat_id=CHANNEL_ID, message_id=post.message_id)
+                    except Exception:
+                        pass
+
+                # Удаляем сообщение из канала через 5 секунд
+                threading.Timer(5.0, delete_channel_message).start()
+                bot.answer_callback_query(
+                    call.id,
+                    "Сообщение обновлено! Оно удалится из канала через 5 секунд.",
                 )
             else:
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=updated_text,
-                )
+                bot.answer_callback_query(call.id, "Заказ успешно обработан!")
+    except Exception as global_error:
+        bot.answer_callback_query(call.id, f"Ошибка: {global_error}", show_alert=True)
 
-        # Резервация подтверждена
-        bot.answer_callback_query(call.id, "Резервация успешно обработана!")
-
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
-        print(f"Ошибка в обработчике mark_fulfilled_group: {e}")
 
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
