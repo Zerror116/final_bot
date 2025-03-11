@@ -3758,16 +3758,36 @@ def confirm_post(call):
     post_id = int(call.data.split("_")[-1])  # Получаем ID поста
 
     try:
-        # Удаляем сообщение из временного хранилища и удаляем в чате
+        # Получаем данные поста для подтверждения
+        post = Posts.get_row_by_id(post_id)
+        if not post:
+            bot.answer_callback_query(call.id, "⛔ Пост не найден.")
+            return
+
+        # Обновляем дату поста на текущую
+        success, msg = Posts.update_row(
+            post_id=post.id,
+            price=post.price,
+            description=post.description,
+            quantity=post.quantity,
+            is_sent=post.is_sent,  # Если есть поле подтверждения, оно остается без изменений
+            created_at=datetime.now()  # Устанавливаем текущую дату и время
+        )
+
+        if not success:
+            bot.answer_callback_query(call.id, f"⛔ Ошибка обновления поста: {msg}")
+            return
+
+        # Удаляем сообщение из временного хранилища и из чата
         if post_id in temp_post_data:
             message_data = temp_post_data.pop(post_id, None)
-            bot.delete_message(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"]
-            )
-            bot.answer_callback_query(call.id, "✅ Пост подтверждён и удалён.")
-        else:
-            bot.answer_callback_query(call.id, "⛔ Пост либо не найден, либо уже обработан.")
+            if message_data:
+                bot.delete_message(
+                    chat_id=message_data["chat_id"],
+                    message_id=message_data["message_id"]
+                )
+        bot.answer_callback_query(call.id, "✅ Пост подтверждён. Дата обновлена на текущую.")
+
     except Exception as e:
         bot.answer_callback_query(call.id, f"⛔ Ошибка подтверждения поста: {e}")
 
