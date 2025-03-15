@@ -60,7 +60,8 @@ class Posts(AbstractModel):
                 return False, f"Ошибка при удалении поста: {str(e)}"
 
     @staticmethod
-    def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None, is_sent: bool = None,created_at: datetime = None):
+    def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None,
+                   is_sent: bool = None, created_at: datetime = None, chat_id: int = None):
         with Session(bind=engine) as session:
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:
@@ -77,6 +78,8 @@ class Posts(AbstractModel):
                 post.is_sent = is_sent
             if created_at is not None:
                 post.created_at = created_at
+            if chat_id is not None:  # Добавлено обновление chat_id
+                post.chat_id = chat_id
 
             session.commit()
             return True, "Данные успешно обновлены"
