@@ -3,9 +3,7 @@ import re
 import time
 import telebot
 import threading
-import gspread
 
-from oauth2client.service_account import ServiceAccountCredentials
 from collections import defaultdict
 from openpyxl.workbook import Workbook
 from sqlalchemy import func
@@ -39,44 +37,6 @@ temp_post_data = {}
 last_start_time = {}
 delivery_active = False
 
-# Подключение к Google таблице
-def add_to_google_sheet(phone_number, client_name, price_formula):
-    try:
-        # Настраиваем доступ к Google API
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        credentials = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        client = gspread.authorize(credentials)
-
-        # Открываем таблицу
-        spreadsheet = client.open("Мега Скидки")
-        sheet = spreadsheet.get_worksheet(0)  # Работаем с первым листом
-
-        # Читаем колонку `A` (номера телефонов)
-        phone_column = [cell.strip() for cell in sheet.col_values(1)]  # Убираем пробелы
-
-        # Проверяем, есть ли телефон в колонке `A`
-        if phone_number in phone_column:
-            # Номер найден — обновляем существующую запись
-            row_index = phone_column.index(phone_number) + 1  # Индексация строк в Google таблице начинается с 1
-
-            # Получаем текущую формулу из ячейки столбца `C`
-            existing_formula = sheet.cell(row_index, 3).value or ""  # Столбец C
-
-            # Добавляем к формуле новое значение
-            updated_formula = (
-                f"{existing_formula}+{price_formula}" if existing_formula.startswith("=")
-                else f"={price_formula}"
-            )
-
-            # Обновляем формулу
-            sheet.update_cell(row_index, 3, updated_formula)
-        else:
-            # Номер не найден — добавляем новую строку
-            new_row = [phone_number, client_name, f"={price_formula}"]  # Телефон → A, Имя → B, Формула суммы → C
-            sheet.append_row(new_row, value_input_option="USER_ENTERED")  # Добавляем новую строку
-
-    except Exception as e:
-        print(f"Ошибка при работе с Google таблицей: {str(e)}")
 
 # Сохранение бронирования
 def save_reservation(user_id, post_id, quantity=1, is_fulfilled=False):
@@ -201,7 +161,6 @@ def handle_start(message):
     except Exception:
         pass
 
-
 # Обработчик нажатия на кнопку "Правила"
 @bot.callback_query_handler(func=lambda call: call.data == "rules")
 def show_rules(call):
@@ -237,7 +196,6 @@ def show_rules(call):
         )
     except Exception as e:
         print(f"Ошибка при изменении текста сообщения: {e}")
-
 
 # Обработчик для кнопки "Назад", возвращающий в начало
 @bot.callback_query_handler(func=lambda call: call.data == "start")
@@ -850,7 +808,6 @@ def my_orders(message):
     except Exception as ex:
         print(f"Ошибка в обработке команды '🛒 Мои заказы': {ex}")
 
-
 # Создает страницу с заказами
 def send_order_page(user_id, message_id, orders, page):
     orders_per_page = 5  # Количество заказов на одной странице
@@ -1142,7 +1099,7 @@ def show_delivery_orders(message):
         # Если возникла ошибка — информируем пользователя
         bot.send_message(
             chat_id=user_id,
-            text=f"❌ Ошибка при загрузке списка заказов: {str(e)}",
+            text=f"❌ Ошибка при загрузке списка заказов, просьба написать в поддержку: {str(e)}",
             parse_mode="Markdown",
         )
 
@@ -1541,11 +1498,8 @@ def mark_fulfilled_group(call):
             # Суммируем общее количество товаров для резервации
             total_required_quantity = sum(reservation.quantity for reservation in reservations)
 
-            # Получение значения из столбца H через функцию
-            h_value = add_sum_to_google_sheet(phone_number, int(price_formula), total_required_quantity)
-
             # Формируем уведомление с данными о товарах и значением из столбца H
-            response_text = f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт.\nЯчейка: {h_value}"
+            response_text = f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт."
             bot.answer_callback_query(call.id, response_text, show_alert=True)
 
             # Обновляем все резервации как выполненные
@@ -1571,7 +1525,6 @@ def mark_fulfilled_group(call):
                 f"{call.message.caption or call.message.text}\n\n"
                 f"✅ Этот заказ теперь обработан.\n"
                 f"👤 Кто положил: {user_full_name}\n"
-                f"📝 Ячейка: {h_value}"
             )
 
             # Обновляем сообщение
@@ -1613,66 +1566,6 @@ def mark_fulfilled_group(call):
     except Exception as global_error:
         print(f"Ошибка: {global_error}")
         bot.answer_callback_query(call.id, f"Ошибка: {global_error}", show_alert=True)
-
-def add_sum_to_google_sheet(phone_number, price, quantity):
-    try:
-        # Настройка Google Sheets API
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        credentials = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        client = gspread.authorize(credentials)
-
-        # Подключение к таблице (1 запрос)
-        sheet = client.open("Мега Скидки").sheet1  # sheet1 заменяет get_worksheet(0)
-
-        # Поиск строки телефона (1 запрос)
-        try:
-            cell = sheet.find(phone_number)
-
-            if not cell:  # Если номер телефона не найден
-                try:
-                    client_row = Clients.get_row_by_phone(phone_number)  # Здесь гипотетическая оптимизация
-                    client_name = client_row.name if client_row else "Неизвестно"
-                except Exception as e:
-                    print(f"Не удалось получить имя клиента. Ошибка: {e}")
-                    client_name = "Неизвестно"
-
-                # Формируем новую строку сразу
-                total_sum = price * quantity
-                new_row = [phone_number, client_name, f"={total_sum}"]  # Итоговая сумма без "+"" операций
-                sheet.append_row(new_row, value_input_option="USER_ENTERED")  # 1 запрос
-
-                return "Добавь ячейку"
-            else:
-                # Если телефон найден, сразу определяем строку
-                row_index = cell.row
-        except gspread.exceptions.CellNotFound:  # Форма исключения строки
-            row_index = None
-
-        # Работа с найденной строкой телефона
-        if row_index:
-            cell_address = f"C{row_index}"  # Столбец с итоговой суммой
-            h_value = sheet.cell(row_index, 8).value  # Значение из H столбца 1 запрос
-
-            # Получение текущей формулы из C (1 запрос)
-            current_value = sheet.acell(cell_address, value_render_option='FORMULA').value
-
-            # Добавление текущего значения к новой формуле
-            additions = price * quantity
-            if current_value and current_value.startswith("="):
-                updated_formula = f"{current_value}+{additions}"
-            else:
-                updated_formula = f"={additions}"
-
-            # Обновляем значение (1 запрос)
-            sheet.update_acell(cell_address, updated_formula)
-
-            return h_value or "Не указано"
-        else:
-            return "Не удалось найти строку."
-
-    except Exception as error:
-        print(f"Ошибка при работе с Google Таблицей: {error}")
-        return "Ошибка"
 
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
@@ -3345,7 +3238,6 @@ def calculate_for_delivery():
 
             # Проверка: существует ли пост (товар) с данным post_id
             if post_id not in posts_dict:
-                print(f"[WARNING] Пропуск заказа: не найден пост с post_id={post_id}.")
                 continue
 
             # Вычисление стоимости заказа
@@ -3401,9 +3293,7 @@ def calculate_for_delivery():
                     "total_amount": total_amount,
                 })
             else:
-                print(
-                    f"[INFO] Клиент с телефоном {phone} не добавлен в рассылку. Общая сумма заказов={total_amount} ниже порога={threshold}.")
-
+                pass
     return delivery_users
 
 # Отправка рассылки

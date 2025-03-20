@@ -1,6 +1,5 @@
 from db import Reservations, Posts
 
-
 # Вспомогательные функции для вычислений
 def calculate_total_sum(user_id):
     """
@@ -17,7 +16,6 @@ def calculate_total_sum(user_id):
             total_sum += post.price
 
     return total_sum
-
 
 def calculate_processed_sum(user_id):
     """
