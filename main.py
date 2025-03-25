@@ -96,11 +96,10 @@ def handle_start(message):
     }
     greeting = greetings.get(role, "Привет, прошу пройти регистрацию")
 
-    # Создаём инлайн-клавиатуру с кнопками
+
     inline_markup = InlineKeyboardMarkup()
     inline_markup.add(InlineKeyboardButton("В поддержку", url=support_link))
     inline_markup.add(InlineKeyboardButton("На канал", url=channel_link))
-    inline_markup.add(InlineKeyboardButton("Правила", callback_data="rules"))  # Кнопка "Правила"
 
     # Определяем reply-клавиатуру по роли пользователя
     if role == "admin":
@@ -160,54 +159,6 @@ def handle_start(message):
         bot.delete_message(chat_id=user_id, message_id=message.message_id)
     except Exception:
         pass
-
-# Обработчик нажатия на кнопку "Правила"
-@bot.callback_query_handler(func=lambda call: call.data == "rules")
-def show_rules(call):
-    # Указываем текст правил
-    rules_text = ("📃Правила Мега Скидок:\n1.В описании к посту всегда пишется дефект(если он имеется) и количество."
-                  "\n2.Купленный товар возврату и обмену не подлежат."
-                  "\n3.Одежда дешевле 1 500₽, не подошедшая по размеру возврату не подлежат."
-                  "\n4.Администратор не знает что находится в корзине(Смотрите 🛒 Мои заказы)"
-                  "\n5.Просьба доложить товар будет проигнорирована, товары обрабатываются в аблолютно случайном порядке"
-                  "\n6.Бронь уходит первому нажавшему, и держится в течении некоторого времени"
-                  "\n7.До обработки товара вы можете отказаться от товара, как только товар оказался у вас в корзине, отказаться уже нельзя, только полная расформировка"
-                  "\n8.Доставка бесплатная от 2 000₽"
-                  "\n9.Если не набралось данной суммы, можно осуществить платную доставку стоимостью в 350₽"
-                  "\n10.Электрические товары, приобретенные у нас, имеют гарантию 7 дней."
-                  "\n11.В случае, если товар пришел с дефектом, который не был указан, можете обратиться в поддержку."
-                  "\nВо время доставки:"
-                  "\n12.Курьер не может звонить заранее более чем за 5 минут в связи с загруженностью"
-                  "\n13.Товар проверяется исключительно после оплаты"
-                  "\n14.Курьер не знает что находится у вас в корзине(Смотрите 🚗 Заказы в доставке)")
-
-    # Создаём разметку с кнопкой "Назад"
-    markup = InlineKeyboardMarkup()
-    back_button = InlineKeyboardButton("⬅️ Назад", callback_data="start")
-    markup.add(back_button)
-
-    try:
-        # Редактируем текущее сообщение: добавляем текст и кнопку
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=rules_text,
-            reply_markup=markup  # Кнопка для возврата
-        )
-    except Exception as e:
-        print(f"Ошибка при изменении текста сообщения: {e}")
-
-# Обработчик для кнопки "Назад", возвращающий в начало
-@bot.callback_query_handler(func=lambda call: call.data == "start")
-def handle_start_callback(call):
-    # Отправляем сообщение
-    message = bot.send_message(chat_id=call.message.chat.id, text="Вы вернулись в главное меню.")
-    handle_start(call.message)
-    # Ожидаем 1 секунду
-    time.sleep(1)
-
-    # Удаляем отправленное сообщение
-    bot.delete_message(chat_id=call.message.chat.id, message_id=message.message_id)
 
 # Хэндлер регистрации
 @bot.message_handler(func=lambda message: message.text == "Регистрация")
@@ -808,6 +759,7 @@ def my_orders(message):
     except Exception as ex:
         print(f"Ошибка в обработке команды '🛒 Мои заказы': {ex}")
 
+
 # Создает страницу с заказами
 def send_order_page(user_id, message_id, orders, page):
     orders_per_page = 5  # Количество заказов на одной странице
@@ -1099,7 +1051,7 @@ def show_delivery_orders(message):
         # Если возникла ошибка — информируем пользователя
         bot.send_message(
             chat_id=user_id,
-            text=f"❌ Ошибка при загрузке списка заказов, просьба написать в поддержку: {str(e)}",
+            text=f"❌ Ошибка при загрузке списка заказов: {str(e)}",
             parse_mode="Markdown",
         )
 
@@ -1440,6 +1392,8 @@ def send_all_reserved_to_group(message):
         bot.send_message(user_id, f"Произошла ошибка: {global_error}")
         print(f"❌ Глобальная ошибка в send_all_reserved_to_group: {global_error}")
 
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
     user_id = call.from_user.id
@@ -1455,40 +1409,15 @@ def mark_fulfilled_group(call):
         target_user_id = int(target_user_id)
         post_id = int(post_id)
 
-        # Извлекаем номер телефона из текста сообщения
-        message_text = call.message.caption or call.message.text  # Используем caption, если сообщение с фото
-        phone_number = None
-
-        # Поиск строки с номером телефона (ищем строку, начинающуюся с 📞 Телефон:)
-        for line in message_text.split("\n"):
-            if line.startswith("📞 Телефон:"):
-                phone_number = line.replace("📞 Телефон:", "").strip()
-                break
-
-        if not phone_number:
-            bot.answer_callback_query(call.id, "Ошибка: номер телефона не найден в сообщении.", show_alert=True)
-            return
-
-        # Извлекаем сумму из сообщения
-        price_formula = None
-        for line in message_text.split("\n"):
-            if line.startswith("💰 Цена:"):
-                price_value = line.replace("💰 Цена:", "").strip().replace("₽", "")
-                if price_value.isdigit():
-                    price_formula = price_value  # Просто сумма для обновления
-                    break
-
-        if not price_formula:
-            bot.answer_callback_query(call.id, "Ошибка: сумма не найдена в сообщении.", show_alert=True)
-            return
-
         with Session(bind=engine) as session:
-            # Получаем резервации пользователя
+
+            # Получаем необработанные резервации пользователя для данного поста
             reservations = (
                 session.query(Reservations)
                 .filter_by(user_id=target_user_id, post_id=post_id, is_fulfilled=False)
                 .all()
             )
+
             if not reservations:
                 bot.answer_callback_query(
                     call.id, "Резервации уже обработаны.", show_alert=True
@@ -1498,9 +1427,12 @@ def mark_fulfilled_group(call):
             # Суммируем общее количество товаров для резервации
             total_required_quantity = sum(reservation.quantity for reservation in reservations)
 
-            # Формируем уведомление с данными о товарах и значением из столбца H
-            response_text = f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт."
-            bot.answer_callback_query(call.id, response_text, show_alert=True)
+            # Отмечаем пользователю, что его действие выполняется
+            bot.answer_callback_query(
+                call.id,
+                f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт.",
+                show_alert=True,
+            )
 
             # Обновляем все резервации как выполненные
             for reservation in reservations:
@@ -1519,15 +1451,15 @@ def mark_fulfilled_group(call):
                 bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
                 return
 
-            # Формируем новый текст сообщения (добавляем значение ячейки из столбца H)
+            # Формируем текст обновления
             user_full_name = call.from_user.first_name or "Администратор"
             updated_text = (
                 f"{call.message.caption or call.message.text}\n\n"
                 f"✅ Этот заказ теперь обработан.\n"
-                f"👤 Кто положил: {user_full_name}\n"
+                f"👤 Кто положил: {user_full_name}"
             )
 
-            # Обновляем сообщение
+            # Обновляем сообщение для target_group_id
             if call.message.photo:
                 try:
                     bot.edit_message_caption(
@@ -1535,8 +1467,8 @@ def mark_fulfilled_group(call):
                         message_id=call.message.message_id,
                         caption=updated_text,
                     )
-                except Exception as e:
-                    print(f"Ошибка обновления сообщения с фото: {e}")
+                except Exception:
+                    pass
             else:
                 try:
                     bot.edit_message_text(
@@ -1544,10 +1476,10 @@ def mark_fulfilled_group(call):
                         message_id=call.message.message_id,
                         text=updated_text,
                     )
-                except Exception as e:
-                    print(f"Ошибка обновления текстового сообщения: {e}")
+                except Exception:
+                    pass
 
-            # Если больше нет активных резерваций, удаляем сообщение
+            # Если больше нет активных резерваций и товара, добавляем удаление сообщения из канала
             if remaining_reservations == 0 and post.quantity == 0:
                 def delete_channel_message():
                     try:
@@ -1555,17 +1487,17 @@ def mark_fulfilled_group(call):
                     except Exception:
                         pass
 
+                # Удаляем сообщение из канала через 5 секунд
                 threading.Timer(5.0, delete_channel_message).start()
                 bot.answer_callback_query(
                     call.id,
                     "Сообщение обновлено! Оно удалится из канала через 5 секунд.",
                 )
             else:
-                bot.answer_callback_query(call.id, response_text)
-
+                bot.answer_callback_query(call.id, "Заказ успешно обработан!")
     except Exception as global_error:
-        print(f"Ошибка: {global_error}")
         bot.answer_callback_query(call.id, f"Ошибка: {global_error}", show_alert=True)
+
 
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
@@ -3238,6 +3170,7 @@ def calculate_for_delivery():
 
             # Проверка: существует ли пост (товар) с данным post_id
             if post_id not in posts_dict:
+                print(f"[WARNING] Пропуск заказа: не найден пост с post_id={post_id}.")
                 continue
 
             # Вычисление стоимости заказа
@@ -3293,7 +3226,9 @@ def calculate_for_delivery():
                     "total_amount": total_amount,
                 })
             else:
-                pass
+                print(
+                    f"[INFO] Клиент с телефоном {phone} не добавлен в рассылку. Общая сумма заказов={total_amount} ниже порога={threshold}.")
+
     return delivery_users
 
 # Отправка рассылки
@@ -3499,8 +3434,9 @@ def manage_audit_posts(message):
         "unique_dates": [str(date) for date in unique_dates]
     }
 
+
 @bot.message_handler(
-func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
+    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
 def show_posts_by_date(message):
     selected_date = message.text
 
@@ -3572,26 +3508,22 @@ def edit_post_price_for_audit(message):
     user_id = message.chat.id
     post_id = temp_post_data[user_id]["post_id"]
 
-    if not message.text.isdigit():
-        bot.send_message(user_id, "⛔ Ошибка: Цена должна быть числом.")
+    if not message.text.isdigit():  # Проверка на корректность ввода цены
+        bot.send_message(user_id, "⛔ Ошибка: Цена должна быть числом. Попробуйте снова.")
         return
 
     new_price = int(message.text)
 
     try:
+        # Получение поста из базы данных
         post = Posts.get_row_by_id(post_id)
         if not post:
             bot.send_message(user_id, "Пост не найден.")
             return
 
-        # Сохраняем ID сообщения пользователя
-        if user_id not in temp_post_data:
-            temp_post_data[user_id] = {}
-        temp_post_data[user_id]["last_user_message_id"] = message.message_id
-
-        # Обновляем запись
+        # Обновление данных в базе
         success, msg = Posts.update_row(
-            post_id=post.id,
+            post_id=post_id,
             price=new_price,
             description=post.description,
             quantity=post.quantity,
@@ -3599,11 +3531,13 @@ def edit_post_price_for_audit(message):
             created_at=post.created_at
         )
 
+        # Если обновление успешно
         if success:
-            post = Posts.get_row_by_id(post_id)
+            # Обновляем данные и создаём новую клавиатуру
+            post = Posts.get_row_by_id(post_id)  # Получаем актуальные данные
             message_data = temp_post_data.get(post_id)
 
-            # Создаём клавиатуру
+            # Создаём клавиатуру с кнопками
             keyboard = types.InlineKeyboardMarkup()
             keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
             keyboard.add(
@@ -3613,29 +3547,28 @@ def edit_post_price_for_audit(message):
             keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
             keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
 
+            # Редактируем сообщение с обновлёнными данными
             bot.edit_message_caption(
                 chat_id=message_data["chat_id"],
                 message_id=message_data["message_id"],
                 caption=(
                     f"📄 Пост #{post.id}\n\n"
                     f"Описание: {post.description}\n"
-                    f"Цена: {post.price}\n"
+                    f"Цена: {post.price} руб.\n"
                     f"Количество: {post.quantity}\n"
                     f"Дата создания: {post.created_at.strftime('%Y-%m-%d %H:%M')}"
                 ),
                 reply_markup=keyboard
             )
 
-            # Сохраняем ID сообщения с подтверждением
-            bot_message = bot.send_message(user_id, "✅ Цена успешно обновлена!")
-            temp_post_data[user_id]["last_bot_confirmation_id"] = bot_message.message_id
-
+            # Сообщение пользователю об успехе
+            bot.send_message(user_id, "✅ Цена успешно обновлена!")
         else:
-            bot.send_message(user_id, f"⛔ Ошибка обновления цены: {msg}")
-
+            bot.send_message(user_id, f"⛔ Ошибка при обновлении цены: {msg}")
     except Exception as e:
         bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
     finally:
+        # Сбрасываем состояние пользователя
         clear_user_state(user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_description_"))
@@ -3669,17 +3602,13 @@ def edit_post_description_for_audit(message):
     new_description = message.text
 
     try:
+        # Получаем пост
         post = Posts.get_row_by_id(post_id)
         if not post:
             bot.send_message(user_id, "Пост не найден.")
             return
 
-        # Сохраняем ID сообщения пользователя
-        if user_id not in temp_post_data:
-            temp_post_data[user_id] = {}
-        temp_post_data[user_id]["last_user_message_id"] = message.message_id
-
-        # Обновляем запись
+        # Обновление в базе данных
         success, msg = Posts.update_row(
             post_id=post.id,
             price=post.price,
@@ -3690,6 +3619,7 @@ def edit_post_description_for_audit(message):
         )
 
         if success:
+            # Загружаем актуальные данные поста
             post = Posts.get_row_by_id(post_id)
             message_data = temp_post_data.get(post_id)
 
@@ -3702,6 +3632,7 @@ def edit_post_description_for_audit(message):
             keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
             keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
 
+            # Редактируем сообщение
             bot.edit_message_caption(
                 chat_id=message_data["chat_id"],
                 message_id=message_data["message_id"],
@@ -3715,17 +3646,13 @@ def edit_post_description_for_audit(message):
                 reply_markup=keyboard
             )
 
-            # Сохраняем ID сообщения с подтверждением
-            bot_message = bot.send_message(user_id, "✅ Описание успешно обновлено!")
-            temp_post_data[user_id]["last_bot_confirmation_id"] = bot_message.message_id
-
+            bot.send_message(user_id, "✅ Описание успешно обновлено!")
         else:
             bot.send_message(user_id, f"⛔ Ошибка обновления описания: {msg}")
-
     except Exception as e:
         bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
     finally:
-        clear_user_state(user_id)
+        clear_user_state(user_id)  # Очистка состояния
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_quantity_"))
 def handle_edit_quantity_for_audit(call):
@@ -3756,7 +3683,7 @@ def edit_post_quantity_for_audit(message):
     post_id = temp_post_data[user_id]["post_id"]
 
     if not message.text.isdigit():
-        bot_message = bot.send_message(user_id, "⛔ Ошибка: Количество должно быть числом.")
+        bot.send_message(user_id, "⛔ Ошибка: Количество должно быть числом.")
         return
 
     new_quantity = int(message.text)
@@ -3766,11 +3693,6 @@ def edit_post_quantity_for_audit(message):
         if not post:
             bot.send_message(user_id, "Пост не найден.")
             return
-
-        # Сохраняем ID сообщения пользователя
-        if user_id not in temp_post_data:
-            temp_post_data[user_id] = {}
-        temp_post_data[user_id]["last_user_message_id"] = message.message_id
 
         # Обновляем запись
         success, msg = Posts.update_row(
@@ -3786,7 +3708,6 @@ def edit_post_quantity_for_audit(message):
             post = Posts.get_row_by_id(post_id)
             message_data = temp_post_data.get(post_id)
 
-            # Создаём клавиатуру
             keyboard = types.InlineKeyboardMarkup()
             keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
             keyboard.add(
@@ -3796,6 +3717,7 @@ def edit_post_quantity_for_audit(message):
             keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
             keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
 
+            # Редактируем сообщение
             bot.edit_message_caption(
                 chat_id=message_data["chat_id"],
                 message_id=message_data["message_id"],
@@ -3809,14 +3731,9 @@ def edit_post_quantity_for_audit(message):
                 reply_markup=keyboard
             )
 
-            # Сохраняем ID сообщения с подтверждением
-            bot_message = bot.send_message(user_id, "✅ Количество успешно обновлено!")
-            temp_post_data[user_id][
-                "last_bot_confirmation_id"] = bot_message.message_id  # Сохранение ID сообщения с подтверждением
-
+            bot.send_message(user_id, "✅ Количество успешно обновлено!")
         else:
             bot.send_message(user_id, f"⛔ Ошибка обновления количества: {msg}")
-
     except Exception as e:
         bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
     finally:
@@ -3839,49 +3756,18 @@ def delete_post_handler_for_audit(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_confirm_post_"))
 def confirm_post(call):
     post_id = int(call.data.split("_")[-1])  # Получаем ID поста
-    user_id = call.message.chat.id  # ID пользователя
 
     try:
-        post = Posts.get_row_by_id(post_id)
-        if not post:
-            bot.answer_callback_query(call.id, "⛔ Пост не найден.")
-            return
-
-        success, msg = Posts.update_row(
-            post_id=post.id,
-            price=post.price,
-            description=post.description,
-            quantity=post.quantity,
-            is_sent=post.is_sent,
-            created_at=datetime.now(),
-            chat_id=user_id
-        )
-
-        if not success:
-            bot.answer_callback_query(call.id, f"⛔ Ошибка обновления поста: {msg}")
-            return
-
-        # Удаляем сообщение пользователя с новым значением
-        user_message_id = temp_post_data.get(user_id, {}).get("last_user_message_id")
-        if user_message_id:
-            bot.delete_message(chat_id=user_id, message_id=user_message_id)
-
-        # Удаляем сообщение бота с подтверждением
-        bot_confirmation_id = temp_post_data.get(user_id, {}).get("last_bot_confirmation_id")
-        if bot_confirmation_id:
-            bot.delete_message(chat_id=user_id, message_id=bot_confirmation_id)
-
-        # Удаляем сообщение поста
+        # Удаляем сообщение из временного хранилища и удаляем в чате
         if post_id in temp_post_data:
             message_data = temp_post_data.pop(post_id, None)
-            if message_data:
-                bot.delete_message(
-                    chat_id=message_data["chat_id"],
-                    message_id=message_data["message_id"]
-                )
-
-        bot.answer_callback_query(call.id, "✅ Пост подтверждён. Сообщения очищены.")
-
+            bot.delete_message(
+                chat_id=message_data["chat_id"],
+                message_id=message_data["message_id"]
+            )
+            bot.answer_callback_query(call.id, "✅ Пост подтверждён и удалён.")
+        else:
+            bot.answer_callback_query(call.id, "⛔ Пост либо не найден, либо уже обработан.")
     except Exception as e:
         bot.answer_callback_query(call.id, f"⛔ Ошибка подтверждения поста: {e}")
 
