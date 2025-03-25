@@ -1337,8 +1337,6 @@ def send_all_reserved_to_group(message):
                 # Получение данных о посте
                 post_data = Posts.get_row(post_id)
                 if not post_data:
-                    bot.send_message(
-                        user_id, f"⚠️ Пост с ID {post_id} не найден. Пропускаем.")
                     continue
                 # Получение данных о клиенте
                 client_data = Clients.get_row(user_id)
