@@ -96,10 +96,11 @@ def handle_start(message):
     }
     greeting = greetings.get(role, "Привет, прошу пройти регистрацию")
 
-
+    # Создаём инлайн-клавиатуру с кнопками
     inline_markup = InlineKeyboardMarkup()
     inline_markup.add(InlineKeyboardButton("В поддержку", url=support_link))
     inline_markup.add(InlineKeyboardButton("На канал", url=channel_link))
+    inline_markup.add(InlineKeyboardButton("Правила", callback_data="rules"))  # Кнопка "Правила"
 
     # Определяем reply-клавиатуру по роли пользователя
     if role == "admin":
@@ -159,6 +160,69 @@ def handle_start(message):
         bot.delete_message(chat_id=user_id, message_id=message.message_id)
     except Exception:
         pass
+
+
+# Обработчик нажатия на кнопку "Правила"
+import threading
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "rules")
+def show_rules(call):
+    # Указываем текст правил
+    rules_text = ("Правила Мега Скидок:\n1.В описании к посту всегда пишется дефект(если он имеется) и количество."
+                  "\n2.Купленный товар возврату и обмену не подлежат."
+                  "\n3.Одежда дешевле 1 500₽, не подошедшая по размеру возврату не подлежат."
+                  "\n4.Администратор не знает что находится в корзине(Смотрите  Мои заказы)"
+                  "\n5.Просьба доложить товар будет проигнорирована, товары обрабатываются в аблолютно случайном порядке"
+                  "\n6.Бронь уходит первому нажавшему, и держится в течении некоторого времени"
+                  "\n7.До обработки товара вы можете отказаться от товара, как только товар оказался у вас в корзине, отказаться уже нельзя, только полная расформировка"
+                  "\n8.Доставка бесплатная от 2 000₽"
+                  "\n9.Если не набралось данной суммы, можно осуществить платную доставку стоимостью в 350₽"
+                  "\n10.Электрические товары, приобретенные у нас, имеют гарантию 7 дней."
+                  "\n11.В случае, если товар пришел с дефектом, который не был указан, можете обратиться в поддержку."
+                  "\nВо время доставки:"
+                  "\n12.Курьер не может звонить заранее более чем за 5 минут в связи с загруженностью"
+                  "\n13.Товар проверяется исключительно после оплаты"
+                  "\n14.Курьер не знает что находится у вас в корзине(Смотрите  Заказы в доставке)")
+
+    # Создаём разметку с кнопкой "Назад"
+    markup = InlineKeyboardMarkup()
+    back_button = InlineKeyboardButton("⬅️ Назад", callback_data="back_to_start")  # Callback для возврата
+    markup.add(back_button)
+
+    try:
+        # Редактируем текущее сообщение: добавляем текст и кнопку
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=rules_text,
+            reply_markup=markup  # Кнопка для возврата
+        )
+    except Exception as e:
+        print(f"Ошибка при изменении текста сообщения: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_start")
+def back_to_start(call):
+    try:
+        # Удаляем текущее сообщение с правилами
+        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+
+        # Отправляем уведомление о возврате
+        notification_message = bot.send_message(
+            chat_id=call.message.chat.id,
+            text="Вы вернулись в главное меню."
+        )
+
+        # Используем таймер для удаления уведомления через 5 секунд
+        threading.Timer(5.0, bot.delete_message, args=(call.message.chat.id, notification_message.message_id)).start()
+
+        # Отправляем приветственное сообщение, вызывая handle_start
+        handle_start(call.message)
+
+    except Exception as e:
+        print(f"Ошибка при обработке возврата в главное меню: {e}")
+
 
 # Хэндлер регистрации
 @bot.message_handler(func=lambda message: message.text == "Регистрация")
@@ -3754,18 +3818,39 @@ def delete_post_handler_for_audit(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_confirm_post_"))
 def confirm_post(call):
     post_id = int(call.data.split("_")[-1])  # Получаем ID поста
+    user_chat_id = call.from_user.id  # ID пользователя, сделавшего ревизию
 
     try:
-        # Удаляем сообщение из временного хранилища и удаляем в чате
-        if post_id in temp_post_data:
-            message_data = temp_post_data.pop(post_id, None)
-            bot.delete_message(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"]
-            )
-            bot.answer_callback_query(call.id, "✅ Пост подтверждён и удалён.")
+        # Получаем пост из базы данных
+        post = Posts.get_row_by_id(post_id)
+        if not post:
+            bot.answer_callback_query(call.id, "⛔ Пост не найден.")
+            return
+
+        # Обновляем is_sent, дату и chat_id
+        success, msg = Posts.update_row(
+            post_id=post.id,
+            price=post.price,
+            description=post.description,
+            quantity=post.quantity,
+            is_sent=False,  # Устанавливаем is_sent = False
+            created_at=datetime.now(),  # Устанавливаем текущую дату и время
+            chat_id=user_chat_id  # Устанавливаем chat_id пользователя, сделавшего ревизию
+        )
+
+        if success:
+            # Удаляем сообщение из хранилища и чата
+            if post_id in temp_post_data:
+                message_data = temp_post_data.pop(post_id, None)
+                if message_data:
+                    bot.delete_message(
+                        chat_id=message_data["chat_id"],
+                        message_id=message_data["message_id"]
+                    )
+            # Отправляем подтверждение пользователю
+            bot.answer_callback_query(call.id, "✅ Пост подтверждён. Дата обновлена, ревизор сохранён.")
         else:
-            bot.answer_callback_query(call.id, "⛔ Пост либо не найден, либо уже обработан.")
+            bot.answer_callback_query(call.id, f"⛔ Ошибка при подтверждении поста: {msg}")
     except Exception as e:
         bot.answer_callback_query(call.id, f"⛔ Ошибка подтверждения поста: {e}")
 
