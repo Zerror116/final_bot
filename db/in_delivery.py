@@ -20,31 +20,36 @@ from .db import AbstractModel, engine
 class InDelivery(AbstractModel):
     __tablename__ = "in_delivery"
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    post_id = mapped_column(Integer, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
+    user_name = mapped_column(String, nullable=False)
     item_description = mapped_column(String, nullable=False)
     quantity = mapped_column(Integer, nullable=False)
-    total_sum = mapped_column(Integer, nullable=False)
+    price = mapped_column(Integer, nullable=False)
     delivery_address = mapped_column(String, nullable=False)
     data = mapped_column(DateTime, nullable=False, default=datetime.datetime.now())
 
     @staticmethod
-    def insert(user_id, item_description, quantity, total_sum, delivery_address):
+    def insert(post_id, user_id, user_name, item_description, quantity, price, delivery_address):
         """
         Добавляет запись в таблицу in_delivery.
         """
         with Session(bind=engine) as session:
             try:
                 new_entry = InDelivery(
+                    post_id=post_id,
                     user_id=user_id,
+                    user_name=user_name,
                     item_description=item_description,
                     quantity=quantity,
-                    total_sum=total_sum,
+                    price=price,
                     delivery_address=delivery_address
                 )
                 session.add(new_entry)
                 session.commit()
-            except Exception:
-                raise
+            except Exception as e:
+                session.rollback()
+                raise e
 
     @staticmethod
     def get_all_rows():
@@ -52,13 +57,17 @@ class InDelivery(AbstractModel):
         Возвращает все записи из in_delivery.
         """
         with Session(bind=engine) as session:
-            return session.query(InDelivery).all()
+            try:
+                return session.query(InDelivery).all()
+            except Exception as e:
+                session.rollback()
+                raise e
 
     @staticmethod
     def clear_table():
         """
-           Очищает таблицу in_delivery.
-           """
+        Очищает таблицу in_delivery.
+        """
         with Session(bind=engine) as session:
             try:
                 session.query(InDelivery).delete()
@@ -66,4 +75,3 @@ class InDelivery(AbstractModel):
             except Exception as e:
                 session.rollback()
                 raise e
-

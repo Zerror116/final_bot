@@ -84,6 +84,7 @@ class Posts(AbstractModel):
             session.commit()
             return True, "Данные успешно обновлены"
 
+
     @staticmethod
     def get_unsent_posts():
         with Session(bind=engine) as session:
@@ -147,3 +148,34 @@ class Posts(AbstractModel):
             posts = Posts.get_row_all()  # Получаем все посты
             # Фильтруем по user_id и только те посты, которые ещё не отправлены
             return [post for post in posts if post.chat_id == user_id and not post.is_sent]
+
+    @staticmethod
+    def clone_post(post_id, **kwargs):
+        original_post = Posts.get_row_by_id(post_id)
+
+        if not original_post:
+            print(f"❌ Ошибка: Оригинальный пост с ID {post_id} не найден.")
+            return None, "Оригинальный пост не найден."
+
+        try:
+            print(f"Копируем пост ID={post_id} с параметрами: {kwargs}")
+
+            # Создаём новый пост
+            new_post_id = Posts.insert(
+                chat_id=kwargs.get("chat_id", original_post.chat_id),
+                photo=kwargs.get("photo", original_post.photo),
+                price=kwargs.get("price", original_post.price),
+                description=kwargs.get("description", original_post.description),
+                quantity=kwargs.get("quantity", original_post.quantity)
+            )
+
+            if not new_post_id:
+                print(f"❌ Ошибка при создании поста: insert вернул None.")
+                return None, "Ошибка при сохранении нового поста."
+
+            print(f"✅ Новый пост создан с ID: {new_post_id}")
+            return new_post_id, None
+
+        except Exception as e:
+            print(f"❌ Ошибка при создании нового поста: {e}")
+            return None, f"Ошибка: {e}"

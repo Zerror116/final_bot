@@ -2,7 +2,7 @@ import io
 import re
 import time
 import telebot
-import threading
+import locale
 
 from collections import defaultdict
 from openpyxl.workbook import Workbook
@@ -21,6 +21,9 @@ from handlers.reservations_manage import *
 from types import SimpleNamespace
 from handlers.reservations_manage import calculate_total_sum, calculate_processed_sum
 from handlers.classess import *
+from sqlalchemy import select, update, and_, func
+from sqlalchemy.exc import IntegrityError
+
 
 
 # Настройка бота и кэш
@@ -36,6 +39,7 @@ temp_user_data = {}
 temp_post_data = {}
 last_start_time = {}
 delivery_active = False
+locale.setlocale(locale.LC_TIME, "ru_RU")
 
 
 # Сохранение бронирования
@@ -558,7 +562,7 @@ def handle_reservation(call):
 
     if is_user_blacklisted(user_id):
         return "Вы не можете бронировать товары, так как вы были заблокированы"
-    # Проверяем, зарегистрирован ли пользователь
+
     if not is_registered(user_id):
         bot.answer_callback_query(
             callback_query_id=call.id,
@@ -567,100 +571,96 @@ def handle_reservation(call):
         )
         return
 
-    # Получаем данные о посте
-    post = Posts.get_row_by_id(post_id)
-    if not post:  # Если пост не найден или get_row_by_id вернул None
-        bot.send_message(user_id, "Ошибка: Товар не найден.")
-        return
+    with Session(bind=engine) as session:
+        try:
+            # Получаем текущий товар с блокировкой строки
+            post = session.query(Posts).filter(Posts.id == post_id).with_for_update().first()
 
-    # Если метод get_row_by_id возвращает объект, работаем с ним напрямую
-    current_quantity = post.quantity
-    message_id = post.message_id
-    price = post.price
-    description = post.description
+            if not post or post.quantity <= 0:
+                # Проверка очереди
+                user_in_queue = session.query(TempReservations).filter(
+                    and_(
+                        TempReservations.user_id == user_id,
+                        TempReservations.post_id == post_id,
+                        TempReservations.temp_fulfilled == False
+                    )
+                ).first()
 
-    # Проверяем доступное количество товара
-    if current_quantity == 0:
-        # Проверяем, есть ли пользователь уже в очереди
-        with Session(bind=engine) as session:
-            user_in_queue = session.query(TempReservations).filter(
-                TempReservations.user_id == user_id,
-                TempReservations.post_id == post_id,
-                TempReservations.temp_fulfilled == False
-            ).first()
+                if user_in_queue:
+                    bot.answer_callback_query(
+                        callback_query_id=call.id,
+                        text="Вы уже стоите в очереди за этим товаром!",
+                        show_alert=True,
+                    )
+                    return
 
-            if user_in_queue:
+                # Добавляем в очередь
+                temp_reservation = TempReservations(
+                    user_id=user_id,
+                    post_id=post_id,
+                    quantity=1,
+                    temp_fulfilled=False
+                )
+                session.add(temp_reservation)
+                session.commit()
                 bot.answer_callback_query(
                     callback_query_id=call.id,
-                    text="Вы уже стоите в очереди за этим товаром!",
+                    text="Вы добавлены в очередь на этот товар.",
                     show_alert=True,
                 )
                 return
 
-            # Добавляем в очередь, если не стоит
-            TempReservations.insert(
+            # Если товар доступен, уменьшаем его количество
+            post.quantity -= 1
+            session.commit()
+
+            # Сохраняем бронирование
+            reservation = Reservations(
                 user_id=user_id,
-                quantity=1,  # Количество можно передавать динамически
                 post_id=post_id,
-                temp_fulfilled=False,
+                quantity=1,
+                is_fulfilled=False,
+                old_price=post.price
             )
+            session.add(reservation)
+            session.commit()
+
+            # Обновляем сообщение в канале
+            new_caption = (
+                f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
+            )
+            try:
+                bot.edit_message_caption(
+                    chat_id=CHANNEL_ID,
+                    message_id=post.message_id,
+                    caption=new_caption,
+                    reply_markup=call.message.reply_markup,
+                )
+            except Exception as e:
+                bot.send_message(
+                    user_id, f"Не удалось обновить сообщение в канале. Ошибка: {e}"
+                )
+
+            # Уведомление пользователя
+            if post.quantity == 0:
+                bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text="Вы забронировали последний экземпляр товара!",
+                    show_alert=True,
+                )
+            else:
+                bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text="Вы забронировали товар!",
+                    show_alert=True,
+                )
+        except IntegrityError:
+            session.rollback()
             bot.answer_callback_query(
                 callback_query_id=call.id,
-                text="Вы добавлены в очередь на этот товар.",
+                text="Произошла ошибка при бронировании. Попробуйте снова.",
                 show_alert=True,
             )
-        return
-
-    # Если товар доступен для бронирования
-    bot.answer_callback_query(
-        callback_query_id=call.id,
-        text="Ваш товар успешно забронирован.",
-        show_alert=False,
-    )
-
-    # Сохраняем бронирование
-    Reservations.insert(user_id=user_id, quantity=1, post_id=post_id, is_fulfilled=False)
-
-    # Уменьшаем количество товара на 1
-    new_quantity = current_quantity - 1
-    update_status, message = Posts.update_row(
-        post_id=post_id, price=price, description=description, quantity=new_quantity
-    )
-    if not update_status:
-        bot.send_message(user_id, f"Не удалось обновить данные о товаре: {message}")
-        return
-
-    # Формируем новое описание для сообщения в канале
-    new_caption = (
-        f"Цена: {price} ₽\nОписание: {description}\nОстаток: {new_quantity}"
-    )
-
-    # Обновляем сообщение в канале
-    try:
-        bot.edit_message_caption(
-            chat_id=CHANNEL_ID,
-            message_id=message_id,
-            caption=new_caption,
-            reply_markup=call.message.reply_markup,  # Кнопки остаются неизменными
-        )
-    except Exception as e:
-        bot.send_message(
-            user_id, f"Не удалось обновить сообщение в канале. Ошибка: {e}"
-        )
-
-    # Информируем пользователя, если он забронировал последний экземпляр
-    if new_quantity == 0:
-        bot.answer_callback_query(
-            callback_query_id=call.id,
-            text="Вы забронировали последний экземпляр товара!",
-            show_alert=True,
-        )
-    else:
-        bot.answer_callback_query(
-            callback_query_id=call.id,
-            text="Бронь успешно сохранена!",
-            show_alert=False,
-        )
 
 # Получение бронирования пользователя
 def get_user_reservations(user_id):
@@ -1075,13 +1075,13 @@ def show_delivery_orders(message):
             if item.item_description not in aggregated_items:
                 # Если описание ещё не добавлено, записываем его
                 aggregated_items[item.item_description] = {
-                    "quantity": item.quantity,
-                    "total_sum": item.total_sum,
+                    "quantity": item.quantity,  # Количество
+                    "total_sum": item.quantity * item.price,  # Итоговая сумма
                 }
             else:
                 # Если описание уже есть, увеличиваем количество и итоговую сумму
                 aggregated_items[item.item_description]["quantity"] += item.quantity
-                aggregated_items[item.item_description]["total_sum"] += item.total_sum
+                aggregated_items[item.item_description]["total_sum"] += item.quantity * item.price
 
         # Преобразуем словарь обратно в список (для передачи на следующий этап)
         unique_items = [
@@ -1092,7 +1092,6 @@ def show_delivery_orders(message):
             }
             for description, data in aggregated_items.items()
         ]
-
 
         # Если товаров нет, отправляем сообщение об этом
         if not unique_items:
@@ -2553,9 +2552,15 @@ def send_broadcast(message):
     try:
         # Получаем список клиентов для рассылки
         eligible_users = calculate_for_delivery()
+        print(f"Найдено пользователей для рассылки: {eligible_users}")  # Для отладки
+
         if eligible_users:
             for user in eligible_users:
-                send_delivery_offer(bot, user["user_id"], user["name"])
+                try:
+                    send_delivery_offer(bot, user["user_id"], user["name"])
+                    time.sleep(1)  # Задержка между запросами
+                except Exception as e:
+                    print(f"Ошибка отправки пользователю {user['user_id']}: {str(e)}")
         else:
             bot.send_message(chat_id=user_id, text="Подходящих пользователей для рассылки не найдено.")
     except Exception as e:
@@ -2708,7 +2713,7 @@ def archive_delivery_to_excel(message):
     ws.title = "Архив доставок"
 
     # Добавление заголовков таблицы
-    ws.append(["Телефон", "Имя", "Общая сумма", "Адрес доставки", "Список товаров"])
+    ws.append(["Телефон", "Имя", "Сумма", "Адрес доставки", "Че за товар"])
 
     # Получение данных и заполнение строк
     for row in delivery_rows:
@@ -2719,7 +2724,7 @@ def archive_delivery_to_excel(message):
         ws.append([
             client_data.phone if client_data else "Неизвестно",
             client_data.name if client_data else "Неизвестно",
-            row.total_sum,
+            row.price,
             row.delivery_address,
             row.item_description
         ])
@@ -3269,7 +3274,7 @@ def calculate_for_delivery():
 
     # Шаг 4: Выбор клиента с минимальным ID и вывод данных логов
     delivery_users = []
-    threshold = 2000  # Пороговое значение для рассылки
+    threshold = 1999  # Пороговое значение для рассылки
 
     for phone, total_amount in summed_by_phone.items():
         # Найти всех клиентов с этим номером телефона
@@ -3295,12 +3300,16 @@ def calculate_for_delivery():
 
 # Отправка рассылки
 def send_delivery_offer(bot, user_id, user_name):
+    try:
+        bot.send_message(
+            chat_id=user_id,
+            text=f"{user_name}, готовы ли Вы принять доставку завтра с 10:00 до 16:00?",
+            reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
+        )
+        print(f"Сообщение успешно отправлено {user_id}")
+    except Exception as e:
+        print(f"Ошибка при отправке сообщения {user_id}: {e}")
 
-    bot.send_message(
-        chat_id=user_id,
-        text=f"{user_name}, готовы ли Вы принять доставку завтра с 10:00 до 16:00?",
-        reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
-    )
 
 # Обработка ответа пользователя на предложение доставки.
 def handle_delivery_response(bot, user_id, response):
@@ -3319,7 +3328,6 @@ def confirm_delivery(message):
         with Session(bind=engine) as session:
             # Получаем все записи из ForDelivery
             for_delivery_rows = session.query(ForDelivery).all()
-
             if not for_delivery_rows:
                 bot.send_message(
                     message.chat.id,
@@ -3327,88 +3335,54 @@ def confirm_delivery(message):
                 )
                 return
 
-            # Множество для отслеживания обработанных телефонов (чтобы не повторяться)
-            processed_phones = set()
-
             for current_for_delivery in for_delivery_rows:
-                # Шаг 1: Получить актуальный номер телефона из Clients
+                # Получаем данные клиента
                 client = session.query(Clients).filter(
                     Clients.user_id == current_for_delivery.user_id
                 ).first()
-
                 if not client:
-                    # Если пользователя нет в Clients, пропускаем
+                    # Если клиент не найден, пропускаем
                     continue
 
-                phone = client.phone
-
-                # Если этот номер уже обработан, пропускаем
-                if phone in processed_phones:
-                    continue
-
-                # Добавляем номер в множество уже обработанных
-                processed_phones.add(phone)
-
-                # Шаг 2: Найти всех пользователей с этим же телефоном из Clients
-                related_users = session.query(Clients).filter(
-                    Clients.phone == phone
+                # Получаем выполненные заказы клиента из Reservations
+                reservations = session.query(Reservations).filter(
+                    Reservations.user_id == current_for_delivery.user_id,
+                    Reservations.is_fulfilled == True
                 ).all()
 
-                # Собираем user_id всех связанных пользователей
-                related_user_ids = [user.user_id for user in related_users]
+                if not reservations:
+                    continue  # Пропускаем клиентов без выполненных заказов
 
-                # Шаг 3: Сбор всех выполненных заказов из Reservations
-                item_descriptions = []  # Список для описания заказов
-                total_sum = 0  # Общая сумма всех заказов
+                # Обработка каждого выполненного заказа как отдельной строки
+                for reservation in reservations:
+                    # Получаем связанный пост, чтобы извлечь описание товара
+                    post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
+                    if not post:
+                        continue
 
-                reservations_to_delete = []  # Собираем заказы для последующего удаления
+                    # Создаём отдельную запись в InDelivery для каждого товара
+                    new_delivery = InDelivery(
+                        post_id=reservation.post_id,  # ID поста
+                        user_id=current_for_delivery.user_id,  # ID пользователя из ForDelivery
+                        user_name=client.name,  # Имя клиента из Clients
+                        item_description=post.description,  # Описание товара из Posts
+                        quantity=reservation.quantity,  # Количество товара
+                        price=reservation.quantity * post.price,  # Итоговая сумма за товар
+                        delivery_address=current_for_delivery.address,  # Адрес доставки
+                    )
+                    session.add(new_delivery)
 
-                for user_id in related_user_ids:
-                    # Получаем выполненные заказы для текущего user_id
-                    user_reservations = session.query(Reservations).filter(
-                        Reservations.user_id == user_id,
-                        Reservations.is_fulfilled == True
-                    ).all()
-
-                    for reservation in user_reservations:
-                        # Получаем данные о товаре из связанной таблицы Posts
-                        post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
-                        if post:
-                            # Формируем описание "Товар x Количество"
-                            item_descriptions.append(f"{post.description} x{reservation.quantity}")
-                            # Увеличиваем общую сумму
-                            total_sum += post.price * reservation.quantity
-
-                        # Добавляем заказ в список для удаления
-                        reservations_to_delete.append(reservation)
-
-                # Если товаров нет, добавляем заглушку
-                if not item_descriptions:
-                    item_descriptions.append("Нет выполненных заказов")
-
-                # Шаг 4: Создаём запись в InDelivery для основного пользователя
-                new_delivery = InDelivery(
-                    user_id=current_for_delivery.user_id,  # ID пользователя из ForDelivery
-                    item_description="\n".join(item_descriptions),  # Описание всех товаров
-                    quantity=len(item_descriptions),  # Количество строк с описанием
-                    total_sum=total_sum,  # Общая цена
-                    delivery_address=current_for_delivery.address,  # Адрес текущего пользователя
-                )
-                session.add(new_delivery)
-
-                # Шаг 5: Удалить обработанные заказы из Reservations
-                for reservation in reservations_to_delete:
+                    # Удаляем обработанный заказ из Reservations
                     session.delete(reservation)
 
-            # Шаг 6: Удалить все записи из ForDelivery
+            # Удаляем обработанные записи из ForDelivery
             session.query(ForDelivery).delete(synchronize_session=False)
 
-            # Применяем все изменения
+            # Подтверждаем транзакцию
             session.commit()
-
             bot.send_message(
                 message.chat.id,
-                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Записи удалены из ForDelivery."
+                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Каждое наименование товара записано отдельно. Записи удалены из ForDelivery."
             )
     except Exception as e:
         bot.send_message(
@@ -3486,24 +3460,55 @@ def manage_audit_posts(message):
     # Клавиатура для выбора даты
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     for date in unique_dates[:2]:  # Показываем максимум 2 даты
-        keyboard.add(types.KeyboardButton(str(date)))
+        # Форматируем дату в виде: "число месяц"
+        formatted_date = date.strftime("%d %B")
+        keyboard.add(types.KeyboardButton(formatted_date))
 
     keyboard.add(types.KeyboardButton("⬅️ Назад"))
     bot.send_message(message.chat.id, "Выберите дату для ревизии:", reply_markup=keyboard)
 
     # Сохраняем даты в temp_user_data
     temp_user_data[message.chat.id] = {
-        "unique_dates": [str(date) for date in unique_dates]
+        "unique_dates": [date.strftime("%d %B") for date in unique_dates]
     }
 
 
 @bot.message_handler(
-    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
+    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", [])
+)
 def show_posts_by_date(message):
     selected_date = message.text
 
-    # Получаем посты
-    posts = [post for post in Posts.get_row_all() if str(post.created_at.date()) == selected_date]
+    # Пробуем преобразовать дату пользователя в формат YYYY-MM-DD
+    try:
+        current_year = datetime.now().year  # Текущий год
+        selected_date_with_year = f"{selected_date} {current_year}"  # Добавляем год
+        selected_date_parsed = datetime.strptime(selected_date_with_year, "%d %B %Y").date()
+        selected_date = str(selected_date_parsed)  # Преобразуем в строку формата YYYY-MM-DD
+    except ValueError:
+        bot.send_message(message.chat.id, "Неправильный формат даты. Пожалуйста, введите дату в формате '24 марта'.")
+        return
+
+    today_date = datetime.now().date()  # Сегодняшняя дата
+
+    # Получаем и сразу обрабатываем посты с quantity = 0
+    zero_quantity_posts = [post for post in Posts.get_row_all() if post.quantity == 0]
+
+    for post in zero_quantity_posts:
+        post.created_at = datetime.combine(today_date, datetime.min.time())  # Устанавливаем сегодняшнюю дату
+        post.is_sent = True  # Отмечаем как отправленные
+        # Явно обновляем поля через ORM
+        Posts.update_row(
+            post.id,  # Обновляем по ID поста
+            created_at=post.created_at,
+            is_sent=post.is_sent
+        )
+
+    # Получаем посты с выбранной датой и quantity > 0
+    posts = [
+        post for post in Posts.get_row_all()
+        if str(post.created_at.date()) == selected_date and post.quantity > 0
+    ]
 
     if not posts:
         bot.send_message(message.chat.id, f"Нет постов за дату {selected_date}.")
@@ -3511,7 +3516,6 @@ def show_posts_by_date(message):
 
     for post in posts:
         keyboard = types.InlineKeyboardMarkup()
-        # Добавляем кнопки
         keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
         keyboard.add(
             types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
@@ -3520,7 +3524,7 @@ def show_posts_by_date(message):
         keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
         keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
 
-        # Отправляем сообщение и сохраняем его ID
+        # Отправляем сообщение с постом
         bot_message = bot.send_photo(
             chat_id=message.chat.id,
             photo=post.photo,
@@ -3534,10 +3538,9 @@ def show_posts_by_date(message):
             reply_markup=keyboard,
         )
 
-        # Сохраняем message_id и chat_id для последующего обновления
+        # Сохраняем сообщение для последующего обновления
         temp_post_data[post.id] = {"message_id": bot_message.message_id, "chat_id": message.chat.id}
 
-        # Ожидание перед отправкой следующего сообщения
         time.sleep(5)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_price_"))

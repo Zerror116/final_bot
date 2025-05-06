@@ -26,6 +26,7 @@ class Reservations(AbstractModel):
     post_id = mapped_column(Integer, nullable=False)
     is_fulfilled = mapped_column(Boolean, nullable=False)
     return_order = mapped_column(Integer, default=0)
+    old_price = mapped_column(Integer, nullable=False)
 
     @staticmethod
     def insert(user_id: int, quantity: int, post_id: int, is_fulfilled: bool):
