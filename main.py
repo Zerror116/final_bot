@@ -1454,7 +1454,6 @@ def send_all_reserved_to_group(message):
         print(f"❌ Глобальная ошибка в send_all_reserved_to_group: {global_error}")
 
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
     user_id = call.from_user.id
@@ -3492,7 +3491,10 @@ def show_posts_by_date(message):
     today_date = datetime.now().date()  # Сегодняшняя дата
 
     # Получаем и сразу обрабатываем посты с quantity = 0
-    zero_quantity_posts = [post for post in Posts.get_row_all() if post.quantity == 0]
+    zero_quantity_posts = [
+        post for post in Posts.get_row_all()
+        if post.quantity == 0 and str(post.created_at.date()) == selected_date
+    ]
 
     for post in zero_quantity_posts:
         post.created_at = datetime.combine(today_date, datetime.min.time())  # Устанавливаем сегодняшнюю дату
