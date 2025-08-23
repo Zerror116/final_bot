@@ -28,19 +28,14 @@ def calculate_processed_sum(user_id):
 
     processed_sum = 0
     for reservation in reservations:
-        print(f"Бронирование ID {reservation.id}, статус: {reservation.is_fulfilled}")
         if reservation.is_fulfilled:  # Если is_fulfilled — булево значение
             post = Posts.get_row_by_id(reservation.post_id)
             if post:
-                print(
-                    f"Добавляем сумму {post.price} для поста ID {reservation.post_id}"
-                )
                 processed_sum += post.price
             else:
                 print(f"Нет данных в Posts для post_id: {reservation.post_id}")
         else:
             print(f"Бронирование ID {reservation.id} не обработано.")
-    print(f"Общая сумма обработанных заказов: {processed_sum}")
     return processed_sum
 
 
