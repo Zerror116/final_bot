@@ -1013,7 +1013,7 @@ def cancel_reservation(call):
             )
             markup = InlineKeyboardMarkup()
             reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
-            to_bot_button = InlineKeyboardButton("В Бота", url=f"{channel_link}?start=start")
+            to_bot_button = InlineKeyboardButton("В Бота", url=f"{bot_link}?start=start")
             markup.add(reserve_button, to_bot_button)
 
             try:
@@ -2448,7 +2448,7 @@ def send_new_posts_to_channel(message):
                 "🛒 Забронировать", callback_data=f"reserve_{post_id}"
             )
             to_bot_button = InlineKeyboardButton(
-                "В бота", url=f"{channel_link}?start=start"
+                "В бота", url=f"{bot_link}?start=start"
             )
             markup.add(reserve_btn, to_bot_button)
 
