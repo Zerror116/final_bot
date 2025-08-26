@@ -23,7 +23,7 @@ from handlers.reservations_manage import calculate_total_sum, calculate_processe
 from handlers.classess import *
 from sqlalchemy import select, update, and_, func
 from sqlalchemy.exc import IntegrityError
-
+from datetime import datetime
 
 
 # Настройка бота и кэш
@@ -40,6 +40,8 @@ temp_post_data = {}
 last_start_time = {}
 delivery_active = False
 locale.setlocale(locale.LC_TIME, "ru_RU")
+active_audit = {}
+
 
 
 # Сохранение бронирования
@@ -3580,11 +3582,11 @@ def manage_audit_posts(message):
         "unique_dates": [date.strftime("%d %B") for date in unique_dates]
     }
 
-
 @bot.message_handler(
-    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", [])
-)
+    func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
 def show_posts_by_date(message):
+    global active_audit
+
     selected_date = message.text
 
     # Пробуем преобразовать дату пользователя в формат YYYY-MM-DD
@@ -3625,7 +3627,23 @@ def show_posts_by_date(message):
         bot.send_message(message.chat.id, f"Нет постов за дату {selected_date}.")
         return
 
+    # Устанавливаем ревизию как активную для пользователя
+    active_audit[message.chat.id] = True
+
+    # Добавляем кнопку отмены ревизии
+    cancel_keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    cancel_button = types.KeyboardButton("Отменить ревизию")
+    cancel_keyboard.add(cancel_button)
+    bot.send_message(message.chat.id, "Начинаю ревизию... Для отмены нажмите 'Отменить ревизию'.",
+                     reply_markup=cancel_keyboard)
+
+    # Отправляем посты
     for post in posts:
+        # Проверяем, не была ли ревизия отменена
+        if not active_audit.get(message.chat.id):
+            bot.send_message(message.chat.id, "Ревизия отменена.")
+            break
+
         keyboard = types.InlineKeyboardMarkup()
         keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
         keyboard.add(
@@ -3653,6 +3671,23 @@ def show_posts_by_date(message):
         temp_post_data[post.id] = {"message_id": bot_message.message_id, "chat_id": message.chat.id}
 
         time.sleep(5)
+
+    # Отключаем ревизию после обработки всех постов
+    active_audit[message.chat.id] = False
+    bot.send_message(message.chat.id, "Ревизия завершена.", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda message: message.text == "Отменить ревизию")
+def cancel_audit(message):
+    global active_audit
+
+    # Проверяем, активна ли ревизия
+    if not active_audit.get(message.chat.id):
+        bot.send_message(message.chat.id, "Нет активной ревизии для отмены.")
+        return
+
+    # Завершаем ревизию
+    active_audit[message.chat.id] = False
+    bot.send_message(message.chat.id, "Ревизия успешно отменена.", reply_markup=types.ReplyKeyboardRemove())
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_price_"))
 def handle_edit_price_for_audit(call):
