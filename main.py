@@ -1409,12 +1409,23 @@ def send_all_reserved_to_group(message):
         if not reservations_to_send:
             bot.send_message(user_id, "Все текущие товары уже были обработаны.")
             return
+
+        # Сортируем резервации: сначала по дате поста (created_at из Posts), затем по user_id
+        sorted_reservations = sorted(
+            reservations_to_send,
+            key=lambda r: (
+                Posts.get_row(r.post_id).created_at if Posts.get_row(r.post_id) else None,
+                r.user_id
+            )
+        )
+
         # Группируем заказы по user_id и post_id, суммируя количество
         grouped_orders = defaultdict(lambda: {"quantity": 0, "reservations": []})
-        for reservation in reservations_to_send:
+        for reservation in sorted_reservations:
             key = (reservation.user_id, reservation.post_id)
             grouped_orders[key]["quantity"] += reservation.quantity
             grouped_orders[key]["reservations"].append(reservation)
+
         # Обрабатываем и отправляем сгруппированные заказы
         for (user_id, post_id), group in grouped_orders.items():
             try:
@@ -1471,11 +1482,9 @@ def send_all_reserved_to_group(message):
                 bot.send_message(
                     user_id, f"⚠️ Ошибка при обработке заказа: {e}")
                 print(f"⚠️ Ошибка при обработке заказа: {e}")
-
     except Exception as global_error:
         bot.send_message(user_id, f"Произошла ошибка: {global_error}")
         print(f"❌ Глобальная ошибка в send_all_reserved_to_group: {global_error}")
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
