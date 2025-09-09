@@ -1414,7 +1414,8 @@ def send_all_reserved_to_group(message):
         sorted_reservations = sorted(
             reservations_to_send,
             key=lambda r: (
-                (Posts.get_row(r.post_id).created_at if Posts.get_row(r.post_id) else datetime.datetime.min),
+                Posts.get_row(r.post_id).created_at if Posts.get_row(r.post_id) and Posts.get_row(
+                    r.post_id).created_at is not None else float('inf'),
                 r.user_id
             )
         )
