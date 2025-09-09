@@ -2627,7 +2627,7 @@ def handle_delivery_response_callback(call):
     # Проверяем текущее время
     current_time = datetime.now().time()  # Текущее локальное время
 
-    if response == "yes" and current_time.hour >= 20:
+    if response == "yes" and current_time.hour >= 16:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
         bot.delete_message(chat_id=user_id, message_id=message_id)
         # Отправляем сообщение об отказе
@@ -3422,7 +3422,7 @@ def send_delivery_offer(bot, user_id, user_name):
     try:
         bot.send_message(
             chat_id=user_id,
-            text=f"{user_name}, готовы ли Вы принять доставку завтра с 10:00 до 16:00?",
+            text=f"{user_name}, готовы ли Вы принять ближайшую доставку(пн,ср,пт) с 10:00 до 16:00?",
             reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
         )
         print(f"Сообщение успешно отправлено {user_id}")
