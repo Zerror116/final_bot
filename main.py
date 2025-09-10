@@ -1783,7 +1783,7 @@ def request_phone_last_digits(message):
 def handle_delivery_management(message):
     # Создаем клавиатуру с кнопками
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("📤 Отправить рассылку","✅ Подтвердить доставку", "🗄 Архив доставки", "⬅️ Назад")
+    markup.add("📤 Отправить рассылку","👨‍🦯 Засунуть в доставку","✅ Подтвердить доставку", "🗄 Архив доставки", "⬅️ Назад")
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
 
 # Хэедлнр для поиска по последним 4 цифрам номера
@@ -2812,7 +2812,6 @@ def handle_empty_delivery_command(message):
         print(f"[WARNING] Данных для удаления у пользователя {user_id} не найдено.")
         bot.send_message(chat_id=user_id, text="Нет данных для удаления.")
 
-
 # Рассчитывает общую сумму заказов для указанного пользователя.
 def calculate_sum_for_user(user_id):
     with Session(bind=engine) as session:
@@ -2825,6 +2824,79 @@ def calculate_sum_for_user(user_id):
         ).first()
 
         return result.final_sum if result.final_sum else 0
+
+@bot.message_handler(func=lambda message: message.text == "👨‍🦯 Засунуть в доставку")
+def push_in_delivery(message):
+    # Шаг 1. Запрос списка номеров у пользователя
+    msg = bot.send_message(message.chat.id, "Введите номера телефонов, каждый с новой строки:")
+    bot.register_next_step_handler(msg, process_numbers)
+
+
+def process_numbers(message):
+    try:
+        # Шаг 2. Извлечение списка номеров телефонов
+        numbers = message.text.splitlines()
+        phone_numbers = [num.strip() for num in numbers if num.strip()]
+
+        if not phone_numbers:
+            bot.send_message(message.chat.id, "Список номеров пуст. Попробуйте снова.")
+            return
+
+        # Шаг 3. Обработка номеров телефонов
+        successful_deliveries = []
+
+        for phone in phone_numbers:
+            with Session(bind=engine) as session:
+                # Найти клиента по номеру телефона
+                client = session.query(Clients).filter(Clients.phone == phone).first()
+                if not client:
+                    bot.send_message(message.chat.id, f"Клиент с номером {phone} не найден.")
+                    continue
+
+                # Найти выполненные заказы клиента
+                reservations = session.query(Reservations).filter(
+                    Reservations.user_id == client.user_id,
+                    Reservations.is_fulfilled == True
+                ).all()
+
+                if not reservations:
+                    bot.send_message(message.chat.id, f"У клиента {phone} нет выполненных заказов.")
+                    continue
+
+                # Рассчитать `total_sum` как сумму (quantity * price) для каждого заказа
+                total_sum = 0
+                for reservation in reservations:
+                    post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
+                    if post:
+                        total_sum += reservation.quantity * post.price
+
+                # Добавление данных в таблицу ForDelivery
+                if total_sum > 0:
+                    try:
+                        ForDelivery.insert(
+                            user_id=client.user_id,
+                            name=client.name,
+                            phone=phone,
+                            address="",  # Оставляем поле address пустым
+                            total_sum=total_sum  # Рассчитанная сумма
+                        )
+                        successful_deliveries.append(phone)
+                    except Exception as e:
+                        bot.send_message(message.chat.id, f"Ошибка при добавлении данных клиента {phone}: {str(e)}")
+                else:
+                    bot.send_message(message.chat.id, f"У клиента {phone} нет товаров для добавления в доставку.")
+
+        # Шаг 4. Уведомление о результатах
+        if successful_deliveries:
+            bot.send_message(
+                message.chat.id,
+                f"Заказы для следующих номеров успешно добавлены в доставку: {', '.join(successful_deliveries)}"
+            )
+        else:
+            bot.send_message(message.chat.id, "Не удалось добавить заказы в доставку.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Произошла ошибка: {str(e)}")
+
 
 @bot.message_handler(func=lambda message: message.text == "🗄 Архив доставки")
 def archive_delivery_to_excel(message):
