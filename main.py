@@ -14,6 +14,7 @@ from database.config import *
 from db.for_delivery import ForDelivery
 from db.temp_reservations import TempReservations
 from db.in_delivery import InDelivery
+from db.temp_fulfilied import Temp_Fulfilled
 from handlers.black_list import *
 from handlers.clients_manage import *
 from handlers.posts_manage import *
@@ -1121,7 +1122,6 @@ def show_delivery_orders(message):
             bot.send_message(
                 chat_id=user_id,
                 text="📭 У вас нет товаров в доставке.",
-                parse_mode="Markdown",
             )
             return
 
@@ -1138,7 +1138,6 @@ def show_delivery_orders(message):
         bot.send_message(
             chat_id=user_id,
             text=f"❌ Ошибка при загрузке списка заказов: {str(e)}",
-            parse_mode="Markdown",
         )
 
 # Создает страницу с заказами в доставке
@@ -1520,14 +1519,30 @@ def mark_fulfilled_group(call):
             # Суммируем общее количество товаров для резервации
             total_required_quantity = sum(reservation.quantity for reservation in reservations)
 
-            # Отмечаем пользователю, что его действие выполняется
-            bot.answer_callback_query(
-                call.id,
-                f"⚠️ Товаров, которые нужно положить: {total_required_quantity} шт.",
-                show_alert=True,
-            )
+            # Получаем данные поста
+            post = session.query(Posts).filter_by(id=post_id).first()
+            if not post:
+                bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
+                return
 
-            # Обновляем все резервации как выполненные
+            # Получаем информацию о клиенте
+            client = session.query(Clients).filter_by(user_id=target_user_id).first()
+            if not client:
+                bot.answer_callback_query(call.id, "Клиент не найден.", show_alert=True)
+                return
+
+            # Добавление записи в таблицу Temp_Fulfilied
+            new_record = Temp_Fulfilled(
+                post_id=post_id,
+                user_id=target_user_id,
+                user_name=client.name,
+                item_description=post.description,
+                quantity=total_required_quantity,
+                price=post.price * total_required_quantity,  # Цена за все товары
+            )
+            session.add(new_record)
+
+            # Отмечаем все резервации как выполненные
             for reservation in reservations:
                 reservation.is_fulfilled = True
                 session.merge(reservation)
@@ -1537,12 +1552,6 @@ def mark_fulfilled_group(call):
             remaining_reservations = session.query(Reservations).filter_by(
                 post_id=post_id, is_fulfilled=False
             ).count()
-
-            # Получаем данные поста
-            post = session.query(Posts).filter_by(id=post_id).first()
-            if not post:
-                bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
-                return
 
             # Формируем текст обновления
             user_full_name = call.from_user.first_name or "Администратор"
@@ -1590,7 +1599,6 @@ def mark_fulfilled_group(call):
                 bot.answer_callback_query(call.id, "Заказ успешно обработан!")
     except Exception as global_error:
         bot.answer_callback_query(call.id, f"Ошибка: {global_error}", show_alert=True)
-
 
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
@@ -2058,7 +2066,7 @@ def handle_photo(message):
         temp_post_data[message.chat.id]["photo"] = message.photo[-1].file_id
         bot.send_message(message.chat.id, "Теперь введите цену на товар.")
     else:
-        bot.send_message(message.chat.id, "Сначала нажми ➕ Новый пост")
+        bot.send_message(message.chat.id, "Неправильная последовательность действий")
 
 # Описание
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.CREATING_POST)
@@ -2653,32 +2661,26 @@ def handle_address_input(message):
     user_id = message.chat.id
     address = message.text
     print(f"[INFO] Пользователь с ID {user_id} ввел адрес: {address}")
-
     # Проверяем наличие данных о пользователе
     user_data = Clients.get_row_by_user_id(user_id)
     if not user_data:
         print(f"[WARNING] Данные пользователя {user_id} не найдены в базе.")
         bot.send_message(chat_id=user_id, text="Ошибка! Данные пользователя отсутствуют.")
         return
-
     name = user_data.name
     phone = user_data.phone
     print(f"[DEBUG] Получены данные пользователя: Имя={name}, Телефон={phone}")
-
     # Вычисление суммы заказов пользователя
     user_orders_sum = calculate_sum_for_user(user_id)
     print(f"[DEBUG] Сумма заказов пользователя {user_id}: {user_orders_sum}")
-
     # Поиск всех пользователей с таким же телефоном
     from db import Session, engine
     with Session(bind=engine) as session:
         same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
-
     if not same_phone_users:
         print(f"[WARNING] Других пользователей с телефоном {phone} не найдено")
         bot.send_message(chat_id=user_id, text="Ошибка! Не удалось найти других заказов с данным номером телефона.")
         return
-
     # Подсчет общей суммы всех заказов
     total_sum_by_phone = user_orders_sum
     all_user_orders_details = []
@@ -2690,23 +2692,19 @@ def handle_address_input(message):
         })
         if client.user_id != user_id:
             total_sum_by_phone += client_sum
-
     print(f"[DEBUG] Общая сумма заказов для телефона {phone}: {total_sum_by_phone}")
-
     # Генерация текста для подтверждения
     orders_details_text = f"Ваши заказы: {user_orders_sum}\n"
     for detail in all_user_orders_details:
         if detail["name"] != name:
             orders_details_text += f"{detail['name']}: {detail['orders_sum']}\n"
     orders_details_text += f"Общая сумма: {total_sum_by_phone}"
-
     # Отправляем подтверждающее сообщение
     bot.send_message(
         chat_id=user_id,
         text=f"Ваши данные:\nИмя: {name}\nТелефон: {phone}\nАдрес: {address}\n\n{orders_details_text}\n\nПодтверждаете?",
         reply_markup=keyboard_for_confirmation()
     )
-
     # Сохраняем данные во временном хранилище
     temp_user_data[user_id] = {
         "name": name,
@@ -2716,7 +2714,20 @@ def handle_address_input(message):
         "address": address
     }
     print(f"[INFO] Временные данные пользователя {user_id} сохранены")
-
+    # Вставляем данные пользователя в таблицу for_delivery
+    try:
+        ForDelivery.insert(
+            user_id=user_id,
+            name=name,
+            phone=phone,
+            address=address,
+            total_sum=total_sum_by_phone
+        )
+        print(f"[INFO] Данные пользователя {user_id} добавлены в таблицу for_delivery")
+    except Exception as e:
+        print(f"[ERROR] Ошибка при добавлении данных пользователя {user_id} в таблицу for_delivery: {str(e)}")
+        bot.send_message(chat_id=user_id, text="Ошибка при добавлении данных в базу. Попробуйте позже.")
+        return
     # Устанавливаем состояние
     set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
 
@@ -3430,7 +3441,6 @@ def send_delivery_offer(bot, user_id, user_name):
     except Exception as e:
         print(f"Ошибка при отправке сообщения {user_id}: {e}")
 
-
 # Обработка ответа пользователя на предложение доставки.
 def handle_delivery_response(bot, user_id, response):
     if response.lower() == "да":
@@ -3492,6 +3502,12 @@ def confirm_delivery(message):
                     )
                     session.add(new_delivery)
 
+                    # Обновляем статус in_delivery для всех товаров в Temp_Fulfilled
+                    session.query(Temp_Fulfilled).filter(
+                        Temp_Fulfilled.user_id == current_for_delivery.user_id,
+                        Temp_Fulfilled.post_id == reservation.post_id
+                    ).update({"in_delivery": True}, synchronize_session=False)
+
                     # Удаляем обработанный заказ из Reservations
                     session.delete(reservation)
 
@@ -3502,7 +3518,8 @@ def confirm_delivery(message):
             session.commit()
             bot.send_message(
                 message.chat.id,
-                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Каждое наименование товара записано отдельно. Записи удалены из ForDelivery."
+                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Каждое наименование товара записано отдельно. "
+                "Статусы обновлены в Temp_Fulfilled. Записи удалены из ForDelivery."
             )
     except Exception as e:
         bot.send_message(
@@ -4012,6 +4029,363 @@ def confirm_post(call):
             bot.answer_callback_query(call.id, f"⛔ Ошибка при подтверждении поста: {msg}")
     except Exception as e:
         bot.answer_callback_query(call.id, f"⛔ Ошибка подтверждения поста: {e}")
+
+@bot.message_handler(func=lambda message: message.text == "😞 У меня брак")
+def defect(message):
+    user_id = message.chat.id
+
+    with Session(bind=engine) as session:
+        # Получаем записи из Temp_Fulfilled с необходимыми условиями
+        user_items = session.query(Temp_Fulfilled).filter_by(
+            user_id=user_id,
+            in_delivery=True,
+            defect=False,
+            skidka=False
+        ).all()
+
+        if not user_items:
+            bot.send_message(user_id, "У вас нет товаров, которые подходят для возврата по браку.")
+            return
+
+        # Создаем клавиатуру с выбором товара
+        markup = InlineKeyboardMarkup()
+        for item in user_items:
+            button = InlineKeyboardButton(
+                text=f"{item.item_description} (x{item.quantity})",
+                callback_data=f"select_defective_{item.id}"  # ID товара из Temp_Fulfilled
+            )
+            markup.add(button)
+
+        # Отправляем сообщение с выбором товара
+        bot.send_message(
+            user_id,
+            "Выберите товар, который хотите вернуть по браку:",
+            reply_markup=markup
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("select_defective_"))
+def select_defective_order(call):
+    user_id = call.from_user.id
+    item_id = int(call.data.split("_")[2])  # ID записи в Temp_Fulfilled
+
+    # Сохраняем состояние, чтобы отследить следующий шаг (ввод причины)
+    set_user_state(user_id, {"action": "defect_reason", "item_id": item_id})
+
+    # Показываем кнопку для перехода к вводу причины
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📋 Указать причину", callback_data="enter_defect_reason"))
+
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="Нажмите на кнопку ниже, чтобы указать причину возврата.",
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "enter_defect_reason")
+def request_defect_reason(call):
+    user_id = call.from_user.id
+    state = get_user_state(user_id)
+
+    if not state or state.get("action") != "defect_reason":
+        bot.answer_callback_query(call.id, "Ошибка! Попробуйте снова.", show_alert=True)
+        return
+
+    bot.send_message(
+        user_id,
+        "Пожалуйста, опишите проблему с товаром. Фотография не нужна, только текст"
+    )
+    set_user_state(user_id, {"action": "wait_defect_reason", "item_id": state["item_id"]})
+
+
+@bot.message_handler(func=lambda message: get_user_state(message.chat.id).get("action") == "wait_defect_reason")
+def handle_defect_reason(message):
+    user_id = message.chat.id
+    state = get_user_state(user_id)
+
+    if not state or "item_id" not in state:
+        bot.send_message(user_id, "Ошибка! Попробуйте снова.")
+        return
+
+    reason = message.text
+    item_id = state["item_id"]
+
+    with Session(bind=engine) as session:
+        # Получаем запись о товаре
+        item = session.query(Temp_Fulfilled).filter_by(id=item_id).first()
+        if not item:
+            bot.send_message(user_id, "Ошибка! Товар не найден.")
+            return
+
+        # Отправляем сообщение администратору
+        admin_users = session.query(Clients).filter(Clients.role.in_(["admin", "supreme_leader"])).all()
+
+        # Получаем фото товара из таблицы Posts
+        post = session.query(Posts).filter_by(id=item.post_id).first()
+        if not post:
+            bot.send_message(
+                user_id,
+                "Не удалось найти данные о товаре. Попробуйте позже."
+            )
+            return
+
+        # Получаем номер телефона клиента из таблицы Clients
+        client = session.query(Clients).filter_by(user_id=item.user_id).first()
+        if not client:
+            bot.send_message(
+                user_id,
+                "Не удалось найти данные о вашем профиле. Попробуйте позже."
+            )
+            return
+
+        for admin in admin_users:
+            # Считаем, сколько времени прошло с момента покупки
+            time_since_purchase = datetime.now() - item.created_at
+            days_since_purchase = time_since_purchase.days
+
+            # Формируем текст сообщения
+            message_text = (
+                f"⚠️ Заявка на возврат брака:\n\n"
+                f"👤 **Клиент:** {item.user_name}\n"
+                f"📞 **Номер телефона:** {client.phone or 'Не указан'}\n"
+                f"📦 **Товар:** {post.description}\n"
+                f"❌ **Причина:** {reason}\n"
+                f"🕒 **Время с покупки:** {days_since_purchase} дней назад\n"
+                f"💰 **Сумма:** {item.price}₽\n"
+                f"📅 **Дата покупки:** {item.created_at.strftime('%d.%m.%Y')}"
+            )
+
+            # Создаем inline клавиатуру с кнопками
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("✅ Брак", callback_data=f"defect_{item.id}"),
+                InlineKeyboardButton("💸 Скидка", callback_data=f"discount_{item.id}"),
+                InlineKeyboardButton("📞 Связаться", callback_data=f"contact_{item.user_id}")
+            )
+
+            # Если есть фото товара, отправляем фото с текстом
+            if post.photo:
+                bot.send_photo(
+                    admin.user_id,
+                    photo=post.photo,  # Фото из таблицы Posts
+                    caption=message_text,
+                    reply_markup=markup,
+                    parse_mode="Markdown"  # Используем Markdown для форматирования
+                )
+            else:
+                # Если фото отсутствует, отправляем только текст
+                bot.send_message(
+                    admin.user_id,
+                    message_text,
+                    reply_markup=markup,
+                    parse_mode="Markdown"
+                )
+
+    bot.send_message(user_id, "Ваш запрос отправлен администратору. Спасибо!")
+    clear_user_state(user_id)
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("defect_") or call.data.startswith("discount_") or call.data.startswith(
+        "contact_"))
+def handle_inline_buttons(call):
+    user_id = call.from_user.id
+    action, item_id = call.data.split("_")
+    item_id = int(item_id)
+
+    if action == "defect":
+        handle_defect_action(call, item_id)
+    elif action == "discount":
+        request_discount_amount(call, item_id)
+    elif action == "contact":
+        contact_client(call, item_id)
+
+def handle_defect_action(call, item_id):
+    with Session(bind=engine) as session:
+        # Находим запись в Temp_Fulfilled
+        item = session.query(Temp_Fulfilled).filter_by(id=item_id).first()
+        if not item:
+            bot.send_message(call.message.chat.id, "Не удалось найти запись.")
+            return
+
+        # Находим соответствующую запись в Reservations и добавляем сумму в return_order
+        reservation = session.query(Reservations).filter_by(id=item.post_id).first()
+        if reservation:
+            reservation.return_order = (reservation.return_order or 0) + item.price
+            session.commit()
+
+        # Ставим статус "defect = True" в Temp_Fulfilled
+        item.defect = True
+        session.commit()
+
+        # Получаем user_id клиента через Clients
+        client = session.query(Clients).filter_by(user_id=item.user_id).first()
+        if client:
+            bot.send_message(
+                client.user_id,  # ID клиента
+                f"Ваш возврат оформлен!\n\n🔔 Товар: {item.item_description}\n💰 Сумма возврата: {item.price}₽"
+            )
+
+    # Уведомляем администратора
+    bot.send_message(call.message.chat.id, "Возврат оформлен")
+
+def request_discount_amount(call, item_id):
+    # Сохраняем состояние для администратора
+    set_user_state(call.from_user.id, {"action": "discount_request", "item_id": item_id, "admin_id": call.from_user.id})
+
+    bot.send_message(
+        call.message.chat.id,
+        "Введите желаемую сумму скидки для клиента:"
+    )
+
+@bot.message_handler(func=lambda message: get_user_state(message.chat.id).get("action") == "discount_request")
+def handle_discount_amount(message):
+    admin_id = message.chat.id  # ID администратора, который предложил скидку
+    state = get_user_state(admin_id)
+
+    if not state:
+        bot.send_message(admin_id, "Произошла ошибка. Попробуйте ещё раз.")
+        return
+
+    try:
+        discount_amount = int(message.text)
+        if discount_amount <= 0:
+            raise ValueError
+    except ValueError:
+        bot.send_message(admin_id, "Введите корректную сумму скидки (положительное число).")
+        return
+
+    # Получаем ID товара
+    item_id = state["item_id"]
+
+    with Session(bind=engine) as session:
+        # Получаем информацию о товаре
+        item = session.query(Temp_Fulfilled).filter_by(id=item_id).first()
+        if not item:
+            bot.send_message(admin_id, "Ошибка! Товар не найден.")
+            return
+
+        # Получаем данные клиента
+        client = session.query(Clients).filter_by(user_id=item.user_id).first()
+        if not client:
+            bot.send_message(admin_id, "Ошибка! Не удалось найти клиента.")
+            return
+
+        # Сохраняем состояние для клиента
+        set_user_state(
+            client.user_id,
+            {"action": "confirm_discount", "item_id": item_id, "discount_amount": discount_amount, "admin_id": admin_id}
+        )
+
+        # Уведомляем клиента о скидке
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("Да", callback_data=f"confirm_discount_{item_id}"),
+            InlineKeyboardButton("Отказаться", callback_data=f"return_discount_{item_id}")
+        )
+
+        bot.send_message(
+            client.user_id,
+            f"Вам поступило предложение о скидке по вашему товару:\n\n"
+            f"📦 Товар: {item.item_description}\n"
+            f"💰 Размер скидки: {discount_amount}₽\n\n"
+            f"Вы согласны на данную скидку?",
+            reply_markup=markup
+        )
+
+    # Подтверждаем администратору
+    bot.send_message(
+        admin_id,
+        f"Скидка в размере {discount_amount}₽ отправлена клиенту на подтверждение."
+    )
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("confirm_discount_") or call.data.startswith("return_discount_")
+)
+def handle_discount_confirmation(call):
+    user_id = call.from_user.id
+    try:
+        action, item_id = call.data.rsplit("_", 1)  # Разделяем строку с конца
+        item_id = int(item_id)  # Преобразуем item_id в число
+    except ValueError:
+        bot.answer_callback_query(call.id, "Ошибка: некорректные данные.")
+        return
+
+    state = get_user_state(user_id)
+    if not state or state.get("item_id") != item_id:
+        bot.answer_callback_query(call.id, "Ошибка! Товар не найден.")
+        return
+
+    discount_amount = state.get("discount_amount")
+    admin_id = state.get("admin_id")  # Получаем ID администратора
+
+    with Session(bind=engine) as session:
+        # Получаем информацию о товаре
+        item = session.query(Temp_Fulfilled).filter_by(id=item_id).first()
+        if not item:
+            bot.answer_callback_query(call.id, "Ошибка! Запись о товаре не найдена.")
+            return
+
+        if action == "confirm_discount":
+            # Клиент согласен на скидку: Обновляем данные в базе
+            item.skidka_price = discount_amount
+            item.skidka = True
+            session.commit()
+
+            # Уведомляем клиента
+            bot.answer_callback_query(call.id, "Скидка успешно активирована.")
+            bot.send_message(
+                call.message.chat.id,
+                f"Скидка в размере {discount_amount}₽ успешно активирована! Спасибо за ваше решение!"
+            )
+
+            # Уведомляем администратора
+            if admin_id:
+                admin_message = (
+                    f"Клиент согласился на скидку для товара:\n\n"
+                    f"📦 Товар: {item.item_description}\n"
+                    f"💰 Сумма скидки: {discount_amount}₽"
+                )
+                bot.send_message(admin_id, admin_message)
+
+        elif action == "return_discount":
+            # Клиент отказался от скидки: Отмечаем товар как "на возврат" и уведомляем
+            item.defect = True  # Помечаем товар как "на возврат"
+            session.commit()
+
+            # Уведомляем клиента
+            bot.answer_callback_query(call.id, "Хорошо, оформлен возврат.")
+            bot.send_message(
+                call.message.chat.id,
+                "Хорошо, оформлен возврат. При следующей доставке товар будет возвращён."
+            )
+
+            # Уведомляем администратора
+            if admin_id:
+                admin_message = (
+                    f"Клиент отказался от скидки, и товар был отмечен на возврат:\n\n"
+                    f"📦 Товар: {item.item_description}\n"
+                    f"💰 Предлагавшаяся скидка: {discount_amount}₽"
+                )
+                bot.send_message(admin_id, admin_message)
+
+    clear_user_state(user_id)
+
+def contact_client(call, user_id):
+    with Session(bind=engine) as session:
+        # Получаем данные клиента
+        client = session.query(Clients).filter_by(user_id=user_id).first()
+        if not client:
+            bot.send_message(call.message.chat.id, "Не удалось найти данные клиента.")
+            return
+
+        # Отправляем ссылку на чат с клиентом администратору
+        bot.send_message(
+            call.from_user.id,
+            f"[Нажмите, чтобы начать чат с клиентом](tg://user?id={client.user_id})",
+            parse_mode="Markdown"  # Используем Markdown для создания кликабельной ссылки
+        )
+
+
 
 # Запуск бота
 if __name__ == "__main__":

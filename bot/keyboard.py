@@ -13,15 +13,17 @@ def supreme_leader_main_menu():
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     manage_workers = KeyboardButton("👔 Назначить работника")
     audit_manage = KeyboardButton(" Ревизия")
+    i_have_a_defect = KeyboardButton("😞 У меня брак")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        send_all_reserved_to_group,orders_in_delivery,manage_workers,audit_manage)
+                        send_all_reserved_to_group,orders_in_delivery,manage_workers,audit_manage,i_have_a_defect)
     return leader_keyboard
 
 def client_main_menu():
     client_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     my_orders = KeyboardButton("🛒 Мои заказы")
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
-    client_keyboard.add(my_orders, orders_in_delivery)
+    i_have_a_defect = KeyboardButton("😞 У меня брак")
+    client_keyboard.add(my_orders, orders_in_delivery, i_have_a_defect)
     return client_keyboard
 
 def worker_main_menu():
