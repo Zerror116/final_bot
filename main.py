@@ -4173,7 +4173,10 @@ def request_defect_reason(call):
     set_user_state(user_id, {"action": "wait_defect_reason", "item_id": state["item_id"]})
 
 
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id).get("action") == "wait_defect_reason")
+@bot.message_handler(
+    func=lambda message: get_user_state(message.chat.id)
+                         and get_user_state(message.chat.id).get("action") == "wait_defect_reason"
+)
 def handle_defect_reason(message):
     user_id = message.chat.id
     state = get_user_state(user_id)
