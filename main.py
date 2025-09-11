@@ -1500,24 +1500,26 @@ def mark_fulfilled_group(call):
         _, target_user_id, post_id = call.data.split("_")[2:]
         target_user_id = int(target_user_id)
         post_id = int(post_id)
-
         with Session(bind=engine) as session:
-
-            # Получаем необработанные резервации пользователя для данного поста
+            # Получаем актуальные необработанные резервации пользователя для данного поста
             reservations = (
                 session.query(Reservations)
                 .filter_by(user_id=target_user_id, post_id=post_id, is_fulfilled=False)
                 .all()
             )
-
             if not reservations:
                 bot.answer_callback_query(
-                    call.id, "Резервации уже обработаны.", show_alert=True
+                    call.id, "Резервации уже обработаны или отменены пользователем.", show_alert=True
                 )
                 return
 
-            # Суммируем общее количество товаров для резервации
+            # Суммируем актуальное количество резервированных товаров
             total_required_quantity = sum(reservation.quantity for reservation in reservations)
+            if total_required_quantity == 0:
+                bot.answer_callback_query(
+                    call.id, "Все товары из этого заказа были отменены пользователем.", show_alert=True
+                )
+                return
 
             # Получаем данные поста
             post = session.query(Posts).filter_by(id=post_id).first()
@@ -1531,7 +1533,7 @@ def mark_fulfilled_group(call):
                 bot.answer_callback_query(call.id, "Клиент не найден.", show_alert=True)
                 return
 
-            # Добавление записи в таблицу Temp_Fulfilied
+            # Добавление записи в таблицу Temp_Fulfilled
             new_record = Temp_Fulfilled(
                 post_id=post_id,
                 user_id=target_user_id,
@@ -1553,15 +1555,16 @@ def mark_fulfilled_group(call):
                 post_id=post_id, is_fulfilled=False
             ).count()
 
-            # Формируем текст обновления
+            # Обновляем текст сообщения
             user_full_name = call.from_user.first_name or "Администратор"
             updated_text = (
                 f"{call.message.caption or call.message.text}\n\n"
                 f"✅ Этот заказ теперь обработан.\n"
-                f"👤 Кто положил: {user_full_name}"
+                f"👤 Кто положил: {user_full_name}\n"
+                f"📦 Нужно положить: {total_required_quantity}"
             )
 
-            # Обновляем сообщение для target_group_id
+            # Обновляем сообщение в чате
             if call.message.photo:
                 try:
                     bot.edit_message_caption(
@@ -1581,8 +1584,8 @@ def mark_fulfilled_group(call):
                 except Exception:
                     pass
 
-            # Если больше нет активных резерваций и товара, добавляем удаление сообщения из канала
-            if remaining_reservations == 0 and post.quantity == 0:
+            # Если больше нет активных резерваций, удаляем сообщение из канала
+            if remaining_reservations == 0:
                 def delete_channel_message():
                     try:
                         bot.delete_message(chat_id=CHANNEL_ID, message_id=post.message_id)
