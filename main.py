@@ -4315,7 +4315,8 @@ def request_discount_amount(call, item_id):
         "Введите желаемую сумму скидки для клиента:"
     )
 
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id).get("action") == "discount_request")
+@bot.message_handler(
+    func=lambda message: (state := get_user_state(message.chat.id)) and state.get("action") == "discount_request")
 def handle_discount_amount(message):
     admin_id = message.chat.id  # ID администратора, который предложил скидку
     state = get_user_state(admin_id)
