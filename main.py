@@ -2811,7 +2811,6 @@ def handle_delivery_confirmation_response(call):
         address = user_data.get("address", "Не указан")
 
         # Формируем текст сообщения для отправки в канал
-        delivery_channel = -1002909781356  # Замените своим ID
         message_for_channel = (
             f"📦 **Новый заказ на доставку:**\n"
             f"👤 Имя: {name}\n"

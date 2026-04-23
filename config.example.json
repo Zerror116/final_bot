@@ -1,0 +1,9 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "name": "final_bot",
+    "username": "your_user",
+    "password": "your_password"
+  }
+}

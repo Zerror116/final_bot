@@ -3,3 +3,15 @@
 */__pycache__/*
 .idea/*
 bot_database.db
+.env
+.env.*
+!.env.example
+config.json
+config.*.json
+!config.example.json
+credentials.json
+venv/
+*.swp
+*.swo
+sage.chat.id,
+ystemctl restart final_bot
