@@ -31,7 +31,12 @@ from datetime import datetime, timedelta
 from db.bot_session import BotSession
 from services.pricing import calculate_audit_price
 from services.session_store import PersistentBucket
-from services.telegram_safe import send_photo_or_text
+from services.telegram_safe import (
+    is_message_not_modified_error,
+    safe_delete_message,
+    safe_edit_message_text,
+    send_photo_or_text,
+)
 
 
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
@@ -244,8 +249,8 @@ def handle_start(message):
     if user_id in last_bot_message:
         try:
             # Удаляем сообщение с приветствием
-            bot.delete_message(
-                chat_id=user_id, message_id=last_bot_message[user_id]["greeting"]
+            safe_delete_message(
+                bot, user_id, last_bot_message[user_id].get("greeting"), logger=logger
             )
         except Exception as e:
             print(
@@ -253,8 +258,8 @@ def handle_start(message):
             )
         try:
             # Удаляем сообщение с ресурсами
-            bot.delete_message(
-                chat_id=user_id, message_id=last_bot_message[user_id].get("resources")
+            safe_delete_message(
+                bot, user_id, last_bot_message[user_id].get("resources"), logger=logger
             )
         except Exception:
             pass
@@ -281,7 +286,7 @@ def handle_start(message):
 
     # Удаляем сообщение пользователя (команда /start)
     try:
-        bot.delete_message(chat_id=user_id, message_id=message.message_id)
+        safe_delete_message(bot, user_id, message.message_id, logger=logger)
     except Exception:
         pass
 
@@ -313,7 +318,9 @@ def show_rules(call):
 
     try:
         # Редактируем текущее сообщение: добавляем текст и кнопку
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             text=rules_text,
@@ -327,7 +334,7 @@ def show_rules(call):
 def back_to_start(call):
     try:
         # Удаляем текущее сообщение с правилами
-        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+        safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
 
         # Отправляем уведомление о возврате
         notification_message = bot.send_message(
@@ -336,7 +343,12 @@ def back_to_start(call):
         )
 
         # Используем таймер для удаления уведомления через 5 секунд
-        threading.Timer(5.0, bot.delete_message, args=(call.message.chat.id, notification_message.message_id)).start()
+        threading.Timer(
+            5.0,
+            safe_delete_message,
+            args=(bot, call.message.chat.id, notification_message.message_id),
+            kwargs={"logger": logger},
+        ).start()
 
         # Отправляем приветственное сообщение, вызывая handle_start
         handle_start(call.message)
@@ -915,7 +927,7 @@ def my_orders(message):
 
     # Сначала удаляем сообщение пользователя
     try:
-        bot.delete_message(chat_id=user_id, message_id=message.message_id)
+        safe_delete_message(bot, user_id, message.message_id, logger=logger)
     except Exception:
         pass
 
@@ -923,7 +935,7 @@ def my_orders(message):
         # Удаляем предыдущее сообщение бота, если оно есть
         if user_id in user_last_message_id:
             try:
-                bot.delete_message(chat_id=user_id, message_id=user_last_message_id[user_id])
+                safe_delete_message(bot, user_id, user_last_message_id[user_id], logger=logger)
             except Exception:
                 pass
 
@@ -1005,12 +1017,18 @@ def send_order_page(user_id, message_id, orders, page):
     photo_path = "images/my_cart.jpg"
     with open(photo_path, "rb") as photo:
         if message_id:
-            return bot.edit_message_media(
-                chat_id=user_id,
-                message_id=message_id,
-                media=InputMediaPhoto(photo, caption=text),
-                reply_markup=keyboard
-            )
+            try:
+                return bot.edit_message_media(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    media=InputMediaPhoto(photo, caption=text),
+                    reply_markup=keyboard
+                )
+            except Exception as exc:
+                if is_message_not_modified_error(exc):
+                    logger.debug("Orders page was already up to date for user=%s page=%s", user_id, page)
+                    return SimpleNamespace(message_id=message_id)
+                raise
         else:
             return bot.send_photo(
                 chat_id=user_id,
@@ -1034,7 +1052,7 @@ def paginate_orders(call):
         new_message = send_order_page(user_id=user_id, message_id=message_id, orders=orders, page=page)
         user_last_message_id[user_id] = new_message.message_id  # Обновляем последний ID
     except Exception as e:
-        print(f"Ошибка при попытке пагинации заказов: {e}")
+        logger.warning("Order pagination failed for user_id=%s page=%s: %s", user_id, page, e)
     finally:
         bot.answer_callback_query(call.id)  # Подтверждаем успешную обработку
 
@@ -1045,7 +1063,7 @@ def paginate_orders(call):
 def cancel_reservation(call):
     if call.data.startswith("cancel_order_"):
         call.data = call.data.replace("cancel_order_", "cancel_reservation_", 1)
-    print(f"Чета там чета там: {call.data}")  # Логируем callback_data для отладки
+    logger.debug("Cancel reservation callback received: %s", call.data)
     try:
         # Универсальная обработка двух форматов данных
         if call.data.startswith("cancel_reservation_"):
@@ -1187,9 +1205,9 @@ def go_back_to_menu(call):
         try:
             bot.answer_callback_query(call.id)
         except Exception as e:
-            print(f"Failed to answer callback query: {e}")
+            logger.debug("Failed to answer callback query: %s", e)
     else:
-        print("Unsupported object type passed to go_back_to_menu")
+        logger.warning("Unsupported object type passed to go_back_to_menu: %s", type(call).__name__)
         return
 
     # Отправляем сообщение пользователю
@@ -1485,7 +1503,9 @@ def handle_role_change(call):
 
             # Обновляем сообщение с пользовательскими данными и клавиатурой
             try:
-                bot.edit_message_text(
+                safe_edit_message_text(
+                    bot,
+                    logger=logger,
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
                     text=f"Данные пользователя:\nИмя: {user.name}\nТекущая роль: {new_role}",
@@ -2203,7 +2223,7 @@ def manage_posts(message):
 
     # Удаляем запрос пользователя сразу же
     try:
-        bot.delete_message(chat_id=user_id, message_id=message_id)
+        safe_delete_message(bot, user_id, message_id, logger=logger)
     except Exception as e:
         print(f"Не удалось удалить сообщение-запрос пользователя {user_id}: {e}")
 
@@ -2223,7 +2243,7 @@ def manage_posts(message):
     # Удаляем предыдущие сообщения, если они есть
     for msg_id in user_last_message_id[user_id]:
         try:
-            bot.delete_message(chat_id=user_id, message_id=msg_id)
+            safe_delete_message(bot, user_id, msg_id, logger=logger)
         except Exception as e:
             print(f"Не удалось удалить сообщение {msg_id} для пользователя {user_id}: {e}")
 
@@ -2322,7 +2342,9 @@ def edit_post(call):
 
     # Обновляем сообщение или отправляем новое с клавиатурой
     if call.message.text:
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             text="Что вы хотите поменять?",
@@ -2473,11 +2495,7 @@ def delete_post_handler(call):
             # Сообщаем о результате
             bot.answer_callback_query(call.id, "Пост успешно удалён.")
 
-            # Удаляем сообщение бота с постом и кнопками
-            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-
-            # Удаляем сообщение пользователя (с его запросом)
-            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+            safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
         else:
             # Возникает ошибка при удалении поста
             bot.answer_callback_query(call.id, f"Ошибка: {msg}")
@@ -2679,7 +2697,7 @@ def send_broadcast(message):
         auto_fulfill_expired_reservations()
         eligible_users = calculate_for_delivery()
         send_delivery_candidates_summary(eligible_users)
-        print(f"Найдено пользователей для рассылки: {eligible_users}")
+        logger.info("Delivery broadcast candidates: %s", len(eligible_users))
 
         if eligible_users:
             for user in eligible_users:
@@ -2687,7 +2705,7 @@ def send_broadcast(message):
                     send_delivery_offer(bot, user["user_id"], user["name"])
                     time.sleep(1)
                 except Exception as e:
-                    print(f"Ошибка отправки пользователю {user['user_id']}: {str(e)}")
+                    logger.warning("Delivery offer failed for user_id=%s: %s", user["user_id"], e)
             bot.send_message(chat_id=user_id, text=f"Рассылка отправлена. Клиентов: {len(eligible_users)}.")
         else:
             bot.send_message(chat_id=user_id, text="Подходящих клиентов для рассылки не найдено.")
@@ -2720,7 +2738,7 @@ def handle_delivery_response_callback(call):
 
     if response == "delivery_yes" and current_time.hour >= 16:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
-        bot.delete_message(chat_id=user_id, message_id=message_id)
+        safe_delete_message(bot, user_id, message_id, logger=logger)
         # Отправляем сообщение об отказе
         bot.send_message(chat_id=user_id,
                          text="Извините, но лист на доставку уже сформирован. Ожидайте следующую отправку.")
@@ -2731,7 +2749,7 @@ def handle_delivery_response_callback(call):
         set_user_state(user_id, "WAITING_FOR_ADDRESS")
     elif response == "delivery_no":
         # Если отказ, удаляем сообщение с кнопками и уведомляем об ожидании следующей доставки
-        bot.delete_message(chat_id=user_id, message_id=message_id)
+        safe_delete_message(bot, user_id, message_id, logger=logger)
         bot.send_message(chat_id=user_id, text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
 
     # Уведомляем Telegram, что callback обработан
@@ -2742,25 +2760,25 @@ def handle_delivery_response_callback(call):
 def handle_address_input(message):
     user_id = message.chat.id
     address = message.text
-    print(f"[INFO] Пользователь с ID {user_id} ввел адрес: {address}")
+    logger.info("Delivery address received for user_id=%s", user_id)
     # Проверяем наличие данных о пользователе
     user_data = Clients.get_row_by_user_id(user_id)
     if not user_data:
-        print(f"[WARNING] Данные пользователя {user_id} не найдены в базе.")
+        logger.warning("Delivery address received for unknown user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Ошибка! Данные пользователя отсутствуют.")
         return
     name = user_data.name
     phone = user_data.phone
-    print(f"[DEBUG] Получены данные пользователя: Имя={name}, Телефон={phone}")
+    logger.debug("Delivery user data loaded for user_id=%s", user_id)
     # Вычисление суммы заказов пользователя
     user_orders_sum = calculate_sum_for_user(user_id)
-    print(f"[DEBUG] Сумма заказов пользователя {user_id}: {user_orders_sum}")
+    logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     # Поиск всех пользователей с таким же телефоном
     from db import Session, engine
     with Session(bind=engine) as session:
         same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
     if not same_phone_users:
-        print(f"[WARNING] Других пользователей с телефоном {phone} не найдено")
+        logger.warning("No related delivery users found for user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Ошибка! Не удалось найти других заказов с данным номером телефона.")
         return
     # Подсчет общей суммы всех заказов
@@ -2774,7 +2792,7 @@ def handle_address_input(message):
         })
         if client.user_id != user_id:
             total_sum_by_phone += client_sum
-    print(f"[DEBUG] Общая сумма заказов для телефона {phone}: {total_sum_by_phone}")
+    logger.debug("Delivery total sum loaded for user_id=%s", user_id)
     # Генерация текста для подтверждения
     orders_details_text = f"Ваши заказы: {user_orders_sum}\n"
     for detail in all_user_orders_details:
@@ -2795,22 +2813,22 @@ def handle_address_input(message):
         "total_sum_by_phone": total_sum_by_phone,
         "address": address
     }
-    print(f"[INFO] Временные данные пользователя {user_id} сохранены")
+    logger.info("Temporary delivery data saved for user_id=%s", user_id)
     # Устанавливаем состояние
     set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
 
 @bot.message_handler(commands=["empty_delivery"])
 def handle_empty_delivery_command(message):
     user_id = message.chat.id
-    print(f"[INFO] Пользователь с ID {user_id} вызвал команду /empty_delivery")
+    logger.info("Delivery temp cleanup requested for user_id=%s", user_id)
 
     # Проверяем наличие данных
     if user_id in temp_user_data:
         del temp_user_data[user_id]
-        print(f"[INFO] Данные пользователя {user_id} успешно удалены из временного хранилища.")
+        logger.info("Temporary delivery data deleted for user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Ваши данные на доставку были удалены.")
     else:
-        print(f"[WARNING] Данных для удаления у пользователя {user_id} не найдено.")
+        logger.warning("Temporary delivery data not found for user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Нет данных для удаления.")
 
 # Рассчитывает общую сумму заказов для указанного пользователя.
@@ -3055,7 +3073,7 @@ def keyboard_for_editing():
 def handle_delivery_otmena(call):
     try:
         # Удаляем сообщение рассылки
-        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
+        safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
 
         # Отправляем уведомление пользователю
         bot.send_message(chat_id=call.message.chat.id,
@@ -3064,7 +3082,7 @@ def handle_delivery_otmena(call):
         # Отвечаем на Callback, чтобы Telegram понял, что она обработана
         bot.answer_callback_query(callback_query_id=call.id)
     except Exception as e:
-        print(f"Ошибка при обработке: {e}")
+        logger.warning("Delivery cancel callback failed for user_id=%s: %s", call.from_user.id, e)
 
 @bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_DATA_EDIT")
 def handle_data_editing(call):
@@ -3074,20 +3092,24 @@ def handle_data_editing(call):
 
     if action == "new_phone":
         set_user_state(user_id, "WAITING_FOR_NEW_PHONE")
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=user_id,
             message_id=call.message.message_id,
             text="Введите новый номер телефона:"
         )
     elif action == "edit_address":
         set_user_state(user_id, "WAITING_FOR_NEW_ADDRESS")
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=user_id,
             message_id=call.message.message_id,
             text="Введите новый адрес доставки:"
         )
     else:
-        print(f"DEBUG ERROR: Неизвестное значение 'call.data': {action}' для пользователя ID={user_id}")
+        logger.warning("Unknown delivery edit action=%s for user_id=%s", action, user_id)
 
 @bot.message_handler(func=lambda message: get_user_state(message.from_user.id) == "WAITING_FOR_NEW_ADDRESS")
 def handle_new_address(message):
@@ -3161,7 +3183,7 @@ def handle_new_phone(message):
 
 
         except Exception as e:
-            print(f"[ERROR] Ошибка при запросе к базе: {e}")
+            logger.warning("Delivery phone lookup failed for user_id=%s: %s", user_id, e)
             same_phone_users = []
 
     # Подсчитываем общую сумму всех заказов и собираем имена
@@ -3198,7 +3220,6 @@ def handle_new_phone(message):
     set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
 
 def keyboard_for_confirmation():
-    print("[INFO] Генерация клавиатуры для подтверждения действия")
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("Да", callback_data="confirm_yes"))
     keyboard.add(types.InlineKeyboardButton("Нет", callback_data="confirm_no"))
@@ -3246,7 +3267,7 @@ def handle_confirmation(call):
                 client = session.query(Clients).filter(Clients.user_id == user_id).first()
                 if not client:
                     # Если клиент отсутствует в таблице Clients, сообщаем об ошибке
-                    print(f"[ERROR] Клиент с user_id={user_id} не найден в таблице Clients.")
+                    logger.warning("Delivery confirmation client not found for user_id=%s", user_id)
                     bot.send_message(
                         chat_id=user_id,
                         text="Ошибка! Клиент не найден в базе данных. Попробуйте снова.",
@@ -3255,7 +3276,7 @@ def handle_confirmation(call):
 
                 # Старый телефон: извлекаем его из записи в Clients
                 old_phone = client.phone
-                print(f"[DEBUG] Старый телефон из базы Clients: {old_phone}")
+                logger.debug("Delivery confirmation loaded old phone for user_id=%s", user_id)
 
                 # Инициализируем общую сумму и список связанных клиентов
                 total_sum_by_phone = final_sum
@@ -3264,8 +3285,11 @@ def handle_confirmation(call):
                 same_phone_users = session.query(Clients).filter(Clients.phone == old_phone).all()
 
                 if same_phone_users:
-                    print(
-                        f"[DEBUG] Найдены клиенты с телефоном {old_phone}: {[client.name for client in same_phone_users]}")
+                    logger.debug(
+                        "Delivery confirmation related clients found for user_id=%s count=%s",
+                        user_id,
+                        len(same_phone_users),
+                    )
 
                     # Вычисляем общую сумму заказов всех связанных клиентов
                     for other_client in same_phone_users:
@@ -3274,13 +3298,13 @@ def handle_confirmation(call):
                             order_sum = calculate_sum_for_user(other_client.user_id)
                             total_sum_by_phone += order_sum
                 else:
-                    print(f"[DEBUG] Клиенты с телефоном {old_phone} не найдены.")
+                    logger.debug("Delivery confirmation related clients not found for user_id=%s", user_id)
 
                 # Формируем список имен клиентов
                 all_names_str = ", ".join(all_names)
 
             except Exception as e:
-                print(f"[ERROR] Ошибка при работе с базой данных: {e}")
+                logger.warning("Delivery confirmation database error for user_id=%s: %s", user_id, e)
                 bot.send_message(
                     chat_id=user_id,
                     text="Произошла ошибка при обработке данных. Попробуйте снова.",
@@ -3294,7 +3318,7 @@ def handle_confirmation(call):
                 session.commit()
             except Exception as e:
                 session.rollback()
-                print(f"[ERROR] Ошибка записи в ForDelivery: {e}")
+                logger.warning("Delivery confirmation save failed for user_id=%s: %s", user_id, e)
                 bot.send_message(
                     chat_id=user_id,
                     text="Произошла ошибка при сохранении данных. Попробуйте снова.",
@@ -3311,10 +3335,12 @@ def handle_confirmation(call):
         try:
             bot.send_message(chat_id=delivery_channel, text=message_for_channel)
         except Exception as e:
-            print(f"[ERROR] Ошибка отправки доставки в канал: {e}")
+            logger.warning("Delivery channel notification failed for user_id=%s: %s", user_id, e)
 
         # Отправляем подтверждающее сообщение пользователю
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=user_id,
             message_id=call.message.message_id,
             text=(
@@ -3332,7 +3358,9 @@ def handle_confirmation(call):
 
     elif confirmation == "confirm_no":
         # Пользователь отказался подтверждать данные
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=user_id,
             message_id=call.message.message_id,
             text="Вы хотите изменить данные? Выберите вариант ниже:",
@@ -3415,9 +3443,9 @@ def send_delivery_offer(bot, user_id, user_name):
             text=f"{user_name}, {delivery_target_label()}. Готовы принять доставку с 10:00 до 16:00?",
             reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
         )
-        print(f"Сообщение успешно отправлено {user_id}")
+        logger.debug("Delivery offer sent to user_id=%s", user_id)
     except Exception as e:
-        print(f"Ошибка при отправке сообщения {user_id}: {e}")
+        logger.warning("Delivery offer send failed for user_id=%s: %s", user_id, e)
 
 
 def get_related_delivery_user_ids(session, delivery_entry):
@@ -3500,14 +3528,21 @@ def show_delivery_collection_list(chat_id, message_id=None, page=0):
     if total_count == 0:
         text = "Список доставки пуст. Пока никто не согласился на доставку и не добавлен вручную."
         if message_id:
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+            safe_edit_message_text(bot, logger=logger, chat_id=chat_id, message_id=message_id, text=text)
         else:
             bot.send_message(chat_id, text)
         return
 
     text = f"Клиенты для сборки доставки: {total_count}\nВыберите клиента, чтобы посмотреть корзину."
     if message_id:
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
+        safe_edit_message_text(
+            bot,
+            logger=logger,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=keyboard,
+        )
     else:
         bot.send_message(chat_id, text, reply_markup=keyboard)
 
@@ -3645,7 +3680,9 @@ def mark_delivery_collected(call):
     delivery_id = int(call.data.rsplit("_", 1)[1])
     success, message_text, moved_count = move_for_delivery_to_in_delivery(delivery_id)
     if success:
-        bot.edit_message_text(
+        safe_edit_message_text(
+            bot,
+            logger=logger,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             text=f"✅ {message_text} Товарных строк: {moved_count}.",
@@ -3668,7 +3705,7 @@ def confirm_delivery(message):
     and get_user_state(call.from_user.id) != "WAITING_FOR_DATA_EDIT"
 )
 def handle_edit_choice(call):
-    print(f"Получено callback_data: {call.data}")  # Логирование данных
+    logger.debug("Edit choice callback received: %s", call.data)
 
     try:
         data_parts = call.data.split("_")  # Разделяем строку
@@ -3916,7 +3953,9 @@ def select_defective_order(call):
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("📋 Указать причину", callback_data="enter_defect_reason"))
 
-    bot.edit_message_text(
+    safe_edit_message_text(
+        bot,
+        logger=logger,
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="Нажмите на кнопку ниже, чтобы указать причину возврата.",
@@ -4243,7 +4282,7 @@ def run_bot():
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            print(f"Bot polling failed: {exc}. Retrying in {retry_delay} seconds.")
+            logger.warning("Bot polling failed: %s. Retrying in %s seconds.", exc, retry_delay)
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
 

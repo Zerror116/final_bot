@@ -7,6 +7,7 @@ MAIN = ROOT / "main.py"
 sys.path.insert(0, str(ROOT))
 
 from services.pricing import calculate_audit_price
+from services.telegram_safe import is_message_not_modified_error, safe_delete_message
 
 
 def assert_equal(actual, expected, label):
@@ -53,10 +54,41 @@ def test_manual_audit_old_flow_removed():
             raise AssertionError(f"manual audit flow still contains {marker}")
 
 
+class RaisingBot:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def delete_message(self, **kwargs):
+        raise self.exc
+
+
+def test_telegram_safe_helpers():
+    assert_equal(
+        is_message_not_modified_error(Exception("Bad Request: message is not modified")),
+        True,
+        "message-not-modified detection",
+    )
+    assert_equal(
+        safe_delete_message(
+            RaisingBot(Exception("Bad Request: message to delete not found")),
+            1,
+            2,
+        ),
+        False,
+        "safe delete ignores deleted messages",
+    )
+    assert_equal(
+        safe_delete_message(RaisingBot(Exception("unused")), 1, None),
+        False,
+        "safe delete ignores empty message ids",
+    )
+
+
 def main():
     test_audit_prices()
     test_delivery_callbacks_are_namespaced()
     test_manual_audit_old_flow_removed()
+    test_telegram_safe_helpers()
     print("smoke checks ok")
 
 
