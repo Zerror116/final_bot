@@ -1,24 +1,22 @@
 import datetime
-from ast import Bytes
 
 from sqlalchemy import (
     String,
-    ForeignKey,
     BIGINT,
-    Boolean,
     DateTime,
-    or_, Integer,
-    BLOB
+    Index,
+    Integer,
 )
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import mapped_column, Session, Mapped, MappedColumn
-
-from . import Posts
-# from main import user_data
+from sqlalchemy.orm import mapped_column, Session
 from .db import AbstractModel, engine
 
 class InDelivery(AbstractModel):
     __tablename__ = "in_delivery"
+    __table_args__ = (
+        Index("ix_in_delivery_user_id", "user_id"),
+        Index("ix_in_delivery_post_id", "post_id"),
+    )
+
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_id = mapped_column(Integer, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)

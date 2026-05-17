@@ -1,22 +1,15 @@
-import datetime
-from ast import Bytes
+from sqlalchemy import BIGINT, Index, Integer, String
+from sqlalchemy.orm import mapped_column, Session
 
-from sqlalchemy import (
-    String,
-    ForeignKey,
-    BIGINT,
-    Boolean,
-    DateTime,
-    or_, Integer,
-    BLOB
-)
-from sqlalchemy.orm import mapped_column, Session, Mapped, MappedColumn
-
-# from main import user_data
 from .db import AbstractModel, engine
 
 class BlackList(AbstractModel):
     __tablename__ = "black_list"
+    __table_args__ = (
+        Index("ix_black_list_user_id", "user_id"),
+        Index("ix_black_list_phone", "phone"),
+    )
+
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id = mapped_column(BIGINT, nullable=False)
     phone = mapped_column(String, nullable=False)

@@ -1,13 +1,19 @@
 import os
 from datetime import datetime, timedelta
 
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, func
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, func, Index
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
 
 class Posts(AbstractModel):
     __tablename__ = "posts"
+    __table_args__ = (
+        Index("ix_posts_chat_id", "chat_id"),
+        Index("ix_posts_is_sent", "is_sent"),
+        Index("ix_posts_message_id", "message_id"),
+    )
+
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id = mapped_column(BIGINT, nullable=False)
     photo = mapped_column(String, nullable=False)
@@ -30,6 +36,8 @@ class Posts(AbstractModel):
             )
             session.add(posts)
             session.commit()
+            session.refresh(posts)
+            return posts.id
 
     @staticmethod
     def get_row(post_id: int):

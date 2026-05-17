@@ -1,5 +1,5 @@
 import datetime
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, func
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Index, Integer
 from sqlalchemy.exc import SQLAlchemyError
 from .db import AbstractModel
 from sqlalchemy.orm import mapped_column, Session
@@ -7,6 +7,10 @@ from sqlalchemy.orm import mapped_column, Session
 
 class Temp_Fulfilled(AbstractModel):
     __tablename__ = "temp_fulfilled"
+    __table_args__ = (
+        Index("ix_temp_fulfilled_user_post", "user_id", "post_id"),
+        Index("ix_temp_fulfilled_delivery_flags", "user_id", "in_delivery", "defect", "skidka"),
+    )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_id = mapped_column(Integer, nullable=False)

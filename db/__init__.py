@@ -7,10 +7,35 @@ from .temp_fulfilied import Temp_Fulfilled
 from .in_delivery import InDelivery
 from .temp_reservations import TempReservations
 from .db import AbstractModel, engine
-from sqlalchemy.orm import mapped_column, Session
+from sqlalchemy import inspect, text
+from sqlalchemy.orm import Session
 
-# AbstractModel.metadata.drop_all(engine)
+def init_db():
+    AbstractModel.metadata.create_all(engine)
+    ensure_reservations_created_at()
 
-AbstractModel.metadata.create_all(engine)
 
-__all__ = {"Posts", "Clients", "BlackList", "Reservations", "TempReservations", "ForDelivery", "InDelivery","Temp_Fulfilled"}
+def ensure_reservations_created_at():
+    inspector = inspect(engine)
+    if "reservations" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("reservations")}
+    if "created_at" in columns:
+        return
+
+    with engine.begin() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(
+                text(
+                    "ALTER TABLE reservations "
+                    "ADD COLUMN created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"
+                )
+            )
+        else:
+            connection.execute(text("ALTER TABLE reservations ADD COLUMN created_at DATETIME"))
+            connection.execute(
+                text("UPDATE reservations SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+            )
+
+__all__ = {"Posts", "Clients", "BlackList", "Reservations", "TempReservations", "ForDelivery", "InDelivery", "Temp_Fulfilled", "init_db"}

@@ -1,5 +1,5 @@
 from db.clients import Clients
-from db import engine, Session, Posts
+from db import engine, Session
 
 
 # Установка роли клиента

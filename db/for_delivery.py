@@ -1,24 +1,14 @@
-import datetime
-from ast import Bytes
-
-from sqlalchemy import (
-    String,
-    ForeignKey,
-    BIGINT,
-    Boolean,
-    DateTime,
-    or_, Integer,
-    BLOB
-)
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import mapped_column, Session, Mapped, MappedColumn
-
-from . import Posts
-# from main import user_data
+from sqlalchemy import BIGINT, Index, Integer, String
+from sqlalchemy.orm import mapped_column, Session
 from .db import AbstractModel, engine
 
 class ForDelivery(AbstractModel):
     __tablename__ = "for_delivery"
+    __table_args__ = (
+        Index("ix_for_delivery_user_id", "user_id"),
+        Index("ix_for_delivery_phone", "phone"),
+    )
+
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     phone = mapped_column(String, nullable=False)
     name = mapped_column(String, nullable=False)

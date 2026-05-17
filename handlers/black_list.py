@@ -1,4 +1,4 @@
-from db import engine, Session, BlackList
+from db import BlackList
 
 # Проверка на черный список
 def is_user_blacklisted(user_id: int) -> bool:

@@ -9,13 +9,13 @@ def supreme_leader_main_menu():
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_clients = KeyboardButton("⚙️ Клиенты")
-    send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
+    delivery_management = KeyboardButton("🚚 Управление доставкой")
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     manage_workers = KeyboardButton("👔 Назначить работника")
     audit_manage = KeyboardButton(" Ревизия")
     i_have_a_defect = KeyboardButton("😞 У меня брак")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        send_all_reserved_to_group,orders_in_delivery,manage_workers,audit_manage,i_have_a_defect)
+                        delivery_management,orders_in_delivery,manage_workers,audit_manage,i_have_a_defect)
     return leader_keyboard
 
 def client_main_menu():
@@ -49,10 +49,10 @@ def admin_main_menu():
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     manage_clients = KeyboardButton("⚙️ Клиенты")
-    send_all_reserved_to_group = KeyboardButton("📦 Заказы клиентов")
+    delivery_management = KeyboardButton("🚚 Управление доставкой")
     manage_workres = KeyboardButton("👔 Назначить работника")
     admin_keyboard.add( my_orders,manage_posts, send_new_posts_to_channel, manage_clients,
-                 send_all_reserved_to_group,manage_workres)
+                 delivery_management,manage_workres)
     return admin_keyboard
 def unknown_main_menu():
     unknown_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)

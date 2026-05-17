@@ -1,25 +1,29 @@
-import datetime
-from ast import Bytes
-
-
 from sqlalchemy import (
-    String,
-    ForeignKey,
     BIGINT,
     Boolean,
     DateTime,
-    or_, Integer,
-    BLOB
+    Index,
+    Integer,
 )
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import mapped_column, Session, Mapped, MappedColumn
+from sqlalchemy.orm import mapped_column, Session
+from datetime import UTC, datetime
 
-from . import Posts, Clients
-# from main import user_data
+from . import Posts
 from .db import AbstractModel, engine
+
+def utcnow_naive():
+    return datetime.now(UTC).replace(tzinfo=None)
+
 
 class Reservations(AbstractModel):
     __tablename__ = "reservations"
+    __table_args__ = (
+        Index("ix_reservations_user_id", "user_id"),
+        Index("ix_reservations_post_id", "post_id"),
+        Index("ix_reservations_user_fulfilled", "user_id", "is_fulfilled"),
+        Index("ix_reservations_fulfilled_created_at", "is_fulfilled", "created_at"),
+    )
+
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id = mapped_column(BIGINT, nullable=False)
     quantity = mapped_column(Integer, nullable=False)
@@ -27,18 +31,25 @@ class Reservations(AbstractModel):
     is_fulfilled = mapped_column(Boolean, nullable=False)
     return_order = mapped_column(Integer, default=0)
     old_price = mapped_column(Integer, nullable=False)
+    created_at = mapped_column(DateTime, nullable=True, default=utcnow_naive)
 
     @staticmethod
-    def insert(user_id: int, quantity: int, post_id: int, is_fulfilled: bool):
+    def insert(user_id: int, quantity: int, post_id: int, is_fulfilled: bool = False, old_price: int = None):
         with Session(bind=engine) as session:
+            if old_price is None:
+                post = session.query(Posts).filter(Posts.id == post_id).first()
+                old_price = post.price if post else 0
             reservations = Reservations(
-            user_id=user_id,
-            quantity=quantity,
-            post_id=post_id,
-            is_fulfilled=is_fulfilled,
+                user_id=user_id,
+                quantity=quantity,
+                post_id=post_id,
+                is_fulfilled=is_fulfilled,
+                old_price=old_price,
             )
             session.add(reservations)
             session.commit()
+            session.refresh(reservations)
+            return reservations.id
 
     @staticmethod
     def get_row_by_user_id(user_id: int):
@@ -47,16 +58,20 @@ class Reservations(AbstractModel):
             return query
 
     @staticmethod
-    def update_row(post_id: int, price: int, description: str, quantity: int):
+    def update_row(reservation_id: int, updates: dict = None, **kwargs):
         with Session(bind=engine) as session:
-            post = session.query(Posts).filter(Posts.id == post_id).first()
-            if not post:
-                return False, "Пост не найден."
+            reservation = session.query(Reservations).filter(Reservations.id == reservation_id).first()
+            if not reservation:
+                return False, "Бронирование не найдено."
 
-            # Обновляем данные
-            post.price = price
-            post.description = description
-            post.quantity = quantity
+            values = {}
+            if updates:
+                values.update(updates)
+            values.update(kwargs)
+
+            for field, value in values.items():
+                if hasattr(reservation, field):
+                    setattr(reservation, field, value)
             session.commit()
             return True, "Данные успешно обновлены."
 
@@ -105,3 +120,12 @@ class Reservations(AbstractModel):
             except Exception as e:
                 session.rollback()  # В случае ошибки откатываем изменения
                 raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")
+
+    @staticmethod
+    def delete_rows_by_user_id(user_id: int):
+        with Session(bind=engine) as session:
+            deleted_count = session.query(Reservations).filter(
+                Reservations.user_id == user_id
+            ).delete(synchronize_session=False)
+            session.commit()
+            return deleted_count

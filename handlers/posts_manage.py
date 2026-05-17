@@ -1,5 +1,4 @@
-from db import Posts, Clients
-from datetime import datetime, timedelta
+from db import Posts
 
 
 # Сохранение поста
