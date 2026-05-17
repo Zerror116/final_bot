@@ -6,13 +6,13 @@ from sqlalchemy import (
     Integer,
 )
 from sqlalchemy.orm import mapped_column, Session
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from . import Posts
 from .db import AbstractModel, engine
 
 def utcnow_naive():
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Reservations(AbstractModel):
