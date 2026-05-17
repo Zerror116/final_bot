@@ -2051,35 +2051,87 @@ def show_cart_by_last_phone_digits(message, last_4_digits):
         clear_user_state(message.chat.id)
         return
 
-    # Для каждого найденного клиента
-    for client in clients:
-        # Рассчитать общую сумму заказов и обработанных заказов
-        related_clients = Clients.get_rows_by_phone(client.phone)
-        total_orders = sum(calculate_total_sum(related.user_id) for related in related_clients)
-        processed_orders = sum(calculate_processed_sum(related.user_id) for related in related_clients)
-
-        # Отправить сообщение с общей информацией
+    clients = deduplicate_clients_by_full_phone(clients)
+    if len(clients) > 1:
+        markup = types.InlineKeyboardMarkup()
+        for client in clients:
+            button_text = truncate_button_text(
+                f"{client.name} | {format_admin_phone(client.phone)}"
+            )
+            markup.add(types.InlineKeyboardButton(
+                button_text,
+                callback_data=f"view_cart_{client.id}",
+            ))
         bot.send_message(
             message.chat.id,
-            f"Пользователь: {client.name}\n"
-            f"Общая сумма заказов: {total_orders} руб.\n"
-            f"Общая сумма обработанных заказов: {processed_orders} руб."
+            "Найдено несколько клиентов с такими последними цифрами. Выберите нужного:",
+            reply_markup=markup,
         )
-
-        # Получить содержимое корзины
-        reservations = get_user_reservations(client.user_id)
-
-        if not reservations:
-            # Если корзина пуста
-            bot.send_message(
-                message.chat.id, f"Корзина пользователя {client.name} пуста."
-            )
-        else:
-            # Если корзина не пуста, отправляем её содержимое
-            send_cart_content(message.chat.id, reservations, client.user_id)
+    else:
+        show_cart_for_client(message.chat.id, clients[0])
 
     # Очистить состояние пользователя
     clear_user_state(message.chat.id)
+
+
+def deduplicate_clients_by_full_phone(clients):
+    unique_clients = []
+    seen_phones = set()
+    for client in clients:
+        phone_key = Clients.normalize_phone(client.phone) or f"user:{client.user_id}"
+        if phone_key in seen_phones:
+            continue
+        seen_phones.add(phone_key)
+        unique_clients.append(client)
+    return unique_clients
+
+
+def format_admin_phone(phone):
+    return Clients.normalize_phone(phone) or "номер не указан"
+
+
+def truncate_button_text(text, max_length=60):
+    return text if len(text) <= max_length else f"{text[:max_length - 3]}..."
+
+
+def format_cart_date(value):
+    if not value:
+        return "не указана"
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y %H:%M")
+    return str(value)
+
+
+def show_cart_for_client(chat_id, client):
+    related_clients = Clients.get_rows_by_phone(client.phone)
+    total_orders = sum(calculate_total_sum(related.user_id) for related in related_clients)
+    processed_orders = sum(calculate_processed_sum(related.user_id) for related in related_clients)
+
+    bot.send_message(
+        chat_id,
+        f"Пользователь: {client.name}\n"
+        f"Телефон: {format_admin_phone(client.phone)}\n"
+        f"Общая сумма заказов: {total_orders} руб.\n"
+        f"Общая сумма обработанных заказов: {processed_orders} руб."
+    )
+
+    reservations = get_user_reservations(client.user_id)
+    if not reservations:
+        bot.send_message(chat_id, f"Корзина пользователя {client.name} пуста.")
+        return
+
+    send_cart_content(chat_id, reservations, client.user_id)
+
+
+def build_cart_item_caption(post, reservation):
+    return (
+        f"Описание: {post.description}\n"
+        f"Цена товара: {post.price} руб.\n"
+        f"Дата создания: {format_cart_date(post.created_at)}\n"
+        f"Количество: {reservation.quantity}\n"
+        f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
+    )
+
 
 # Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров
 def send_cart_content(chat_id, reservations, user_id):
@@ -2087,23 +2139,24 @@ def send_cart_content(chat_id, reservations, user_id):
         post = Posts.get_row_by_id(reservation.post_id)
 
         if post:
+            caption = build_cart_item_caption(post, reservation)
             # Отправляем фото и информацию о товаре
-            if post.photo:
+            if post.photo and len(caption) <= 1024:
                 bot.send_photo(
                     chat_id,
                     photo=post.photo,
-                    caption=(
-                        f"Описание: {post.description}\n"
-                        f"Количество: {reservation.quantity}\n"
-                        f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
-                    ),
+                    caption=caption,
                 )
+            elif post.photo:
+                bot.send_photo(
+                    chat_id,
+                    photo=post.photo,
+                )
+                bot.send_message(chat_id, caption)
             else:
                 bot.send_message(
                     chat_id,
-                    f"Описание: {post.description}\n"
-                    f"Количество: {reservation.quantity}\n"
-                    f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}",
+                    caption,
                 )
         else:
             bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
@@ -2151,25 +2204,21 @@ def callback_view_cart(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
         bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
-    client_id = int(call.data.split("_")[2])  # Извлекаем ID клиента из callback_data
+    try:
+        client_id = int(call.data.split("_")[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "Некорректный выбор клиента.", show_alert=True)
+        return
 
     # Получаем данные клиента
     client = Clients.get_row_by_id(client_id)
 
     if not client:
-        bot.send_message(call.message.chat.id, "Пользователь не найден.")
+        bot.answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
         return
 
-    # Информируем, чью корзину будем смотреть
-    bot.send_message(call.message.chat.id, f"Корзина пользователя: {client.name}")
-
-    # Получаем содержимое корзины
-    reservations = get_user_reservations(client.user_id)
-
-    if not reservations:
-        bot.send_message(call.message.chat.id, "Корзина пользователя пуста.")
-    else:
-        send_cart_content(call.message.chat.id, reservations, client.user_id)
+    bot.answer_callback_query(call.id)
+    show_cart_for_client(call.message.chat.id, client)
 
 # Удаление клиента по номеру телефона
 @bot.message_handler(func=lambda message: message.text == "🗑 Удалить клиента 📞")
