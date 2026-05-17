@@ -146,7 +146,9 @@ class Clients(AbstractModel):
         phone_digits = Clients.normalize_phone(phone_digits)[-4:]
         """Получение всех пользователей с совпадающими последними цифрами номера."""
         with Session(bind=engine) as session:
-            clients = session.query(Clients).all()
+            clients = session.query(Clients).filter(Clients.phone.like(f"%{phone_digits}")).all()
+            if not clients:
+                clients = session.query(Clients).all()
             return [
                 client for client in clients
                 if Clients.normalize_phone(client.phone).endswith(phone_digits)

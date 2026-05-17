@@ -6,13 +6,46 @@ from .for_delivery import ForDelivery
 from .temp_fulfilied import Temp_Fulfilled
 from .in_delivery import InDelivery
 from .temp_reservations import TempReservations
+from .bot_session import BotSession
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 def init_db():
     AbstractModel.metadata.create_all(engine)
-    ensure_reservations_created_at()
+    run_schema_migrations()
+
+
+def run_schema_migrations():
+    ensure_schema_migrations()
+    run_migration("001_reservations_created_at", ensure_reservations_created_at)
+
+
+def ensure_schema_migrations():
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name VARCHAR(255) PRIMARY KEY, "
+            "applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        ))
+
+
+def run_migration(name, migration_func):
+    with engine.begin() as connection:
+        exists = connection.execute(
+            text("SELECT 1 FROM schema_migrations WHERE name = :name"),
+            {"name": name},
+        ).first()
+    if exists:
+        return
+
+    migration_func()
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO schema_migrations (name) VALUES (:name)"),
+            {"name": name},
+        )
 
 
 def ensure_reservations_created_at():
@@ -38,4 +71,15 @@ def ensure_reservations_created_at():
                 text("UPDATE reservations SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
             )
 
-__all__ = {"Posts", "Clients", "BlackList", "Reservations", "TempReservations", "ForDelivery", "InDelivery", "Temp_Fulfilled", "init_db"}
+__all__ = {
+    "Posts",
+    "Clients",
+    "BlackList",
+    "Reservations",
+    "TempReservations",
+    "ForDelivery",
+    "InDelivery",
+    "Temp_Fulfilled",
+    "BotSession",
+    "init_db",
+}

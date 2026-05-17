@@ -6,10 +6,8 @@ import threading
 import time
 import telebot
 import locale
-from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote
 
-from collections import defaultdict
 from openpyxl.workbook import Workbook
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
 from telebot import types, apihelper
@@ -30,6 +28,10 @@ from handlers.classess import *
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta
+from db.bot_session import BotSession
+from services.pricing import calculate_audit_price
+from services.session_store import PersistentBucket
+from services.telegram_safe import send_photo_or_text
 
 
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
@@ -115,10 +117,10 @@ user_pages = {}
 PAGE_SIZE = 5
 user_last_message_id = {}
 last_bot_message = {}
-user_data = {}
+user_data = PersistentBucket("user_data")
 user_states = {}
-temp_user_data = {}
-temp_post_data = {}
+temp_user_data = PersistentBucket("temp_user_data")
+temp_post_data = PersistentBucket("temp_post_data")
 last_start_time = {}
 delivery_active = False
 configure_locale()
@@ -285,9 +287,6 @@ def handle_start(message):
 
 
 # Обработчик нажатия на кнопку "Правила"
-import threading
-
-
 @bot.callback_query_handler(func=lambda call: call.data == "rules")
 def show_rules(call):
     # Указываем текст правил
@@ -1556,212 +1555,14 @@ def send_all_reserved_to_group(message):
         user_id,
         "Эта стадия больше не нужна: бот автоматически переводит бронь в «Обработано» через 1 час.",
     )
-    return
-    try:
-        # Получение всех резерваций
-        reservations = Reservations.get_row_all()
-        if not reservations:
-            bot.send_message(user_id, "Нет забронированных товаров для отправки.")
-            return
-        # Фильтруем необработанные резервации
-        reservations_to_send = [r for r in reservations if not r.is_fulfilled]
-        if not reservations_to_send:
-            bot.send_message(user_id, "Все текущие товары уже были обработаны.")
-            return
-
-        # Сортируем резервации: сначала по дате поста (created_at из Posts), затем по user_id
-        sorted_reservations = sorted(
-            reservations_to_send,
-            key=lambda r: (
-                Posts.get_row(r.post_id).created_at if Posts.get_row(r.post_id) and Posts.get_row(
-                    r.post_id).created_at else datetime.max,
-                r.user_id
-            )
-        )
-
-        # Группируем заказы по user_id и post_id, суммируя количество
-        grouped_orders = defaultdict(lambda: {"quantity": 0, "reservations": []})
-        for reservation in sorted_reservations:
-            key = (reservation.user_id, reservation.post_id)
-            grouped_orders[key]["quantity"] += reservation.quantity
-            grouped_orders[key]["reservations"].append(reservation)
-
-        # Обрабатываем и отправляем сгруппированные заказы
-        for (user_id, post_id), group in grouped_orders.items():
-            try:
-                quantity = group["quantity"]
-                reservations = group["reservations"]
-                # Получение данных о посте
-                post_data = Posts.get_row(post_id)
-                if not post_data:
-                    continue
-                # Получение данных о клиенте
-                client_data = Clients.get_row(user_id)
-                if not client_data:
-                    bot.send_message(
-                        user_id, f"⚠️ Клиент с ID {user_id} не найден. Пропускаем.")
-                    continue
-                # Формируем описание заказа
-                caption = (
-                    f"💼 Новый заказ:\n\n"
-                    f"👤 Клиент: {client_data.name or 'Имя не указано'}\n"
-                    f"📞 Телефон: {client_data.phone or 'Телефон не указан'}\n"
-                    f"💰 Цена: {post_data.price or 'Не указана'}₽\n"
-                    f"📦 Описание: {post_data.description or 'Описание отсутствует'}\n"
-                    f"📅 Дата: {post_data.created_at.strftime('%d.%m') if post_data.created_at else 'Дата отсутствует'}\n"
-                    f"📦 Количество: {quantity}"
-                )
-                # Создаем кнопку
-                markup = InlineKeyboardMarkup()
-                mark_button = InlineKeyboardButton(
-                    text=f"✅ Положил {quantity} шт.",
-                    callback_data=f"mark_fulfilled_group_{user_id}_{post_id}",
-                )
-                markup.add(mark_button)
-                # Отправляем сообщение
-                if post_data.photo:
-                    message = bot.send_photo(
-                        chat_id=TARGET_GROUP_ID,
-                        photo=post_data.photo,
-                        caption=caption,
-                        reply_markup=markup,
-                    )
-                else:
-                    message = bot.send_message(
-                        chat_id=TARGET_GROUP_ID, text=caption, reply_markup=markup
-                    )
-                # Сохраняем ID сообщения для последующего удаления
-                with Session(bind=engine) as session:
-                    post = session.query(Posts).filter_by(id=post_id).first()
-                    if post:
-                        post.telegram_message_id = message.message_id  # Сохраняем ID сообщения
-                        session.commit()
-                # Задержка секунда перед отправкой следующего поста
-                time.sleep(4)
-            except Exception as e:
-                bot.send_message(
-                    user_id, f"⚠️ Ошибка при обработке заказа: {e}")
-                print(f"⚠️ Ошибка при обработке заказа: {e}")
-    except Exception as global_error:
-        bot.send_message(user_id, f"Произошла ошибка: {global_error}")
-        print(f"❌ Глобальная ошибка в send_all_reserved_to_group: {global_error}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
-    user_id = call.from_user.id
-    role = get_client_role(user_id)
-    if role not in ["admin", "supreme_leader"]:
-        bot.answer_callback_query(
-            call.id, "У вас нет прав доступа к этой функции.", show_alert=True
-        )
-        return
-    try:
-        # Извлекаем данные из callback_data
-        _, target_user_id, post_id = call.data.split("_")[2:]
-        target_user_id = int(target_user_id)
-        post_id = int(post_id)
-        with Session(bind=engine) as session:
-            # Получаем актуальные необработанные резервации пользователя для данного поста
-            reservations = (
-                session.query(Reservations)
-                .filter_by(user_id=target_user_id, post_id=post_id, is_fulfilled=False)
-                .all()
-            )
-            if not reservations:
-                bot.answer_callback_query(
-                    call.id, "Резервации уже обработаны или отменены пользователем.", show_alert=True
-                )
-                return
-
-            # Суммируем актуальное количество резервированных товаров
-            total_required_quantity = sum(reservation.quantity for reservation in reservations)
-            if total_required_quantity == 0:
-                bot.answer_callback_query(
-                    call.id, "Все товары из этого заказа были отменены пользователем.", show_alert=True
-                )
-                return
-
-            # Получаем данные поста
-            post = session.query(Posts).filter_by(id=post_id).first()
-            if not post:
-                bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
-                return
-
-            # Получаем информацию о клиенте
-            client = session.query(Clients).filter_by(user_id=target_user_id).first()
-            if not client:
-                bot.answer_callback_query(call.id, "Клиент не найден.", show_alert=True)
-                return
-
-            # Добавление записи в таблицу Temp_Fulfilled
-            new_record = Temp_Fulfilled(
-                post_id=post_id,
-                user_id=target_user_id,
-                user_name=client.name,
-                item_description=post.description,
-                quantity=total_required_quantity,
-                price=post.price * total_required_quantity,  # Цена за все товары
-            )
-            session.add(new_record)
-
-            # Отмечаем все резервации как выполненные
-            for reservation in reservations:
-                reservation.is_fulfilled = True
-                session.merge(reservation)
-            session.commit()
-
-            # Проверяем оставшиеся резервации для данного поста
-            remaining_reservations = session.query(Reservations).filter_by(
-                post_id=post_id, is_fulfilled=False
-            ).count()
-
-            # Обновляем текст сообщения
-            user_full_name = call.from_user.first_name or "Администратор"
-            updated_text = (
-                f"{call.message.caption or call.message.text}\n\n"
-                f"✅ Этот заказ теперь обработан.\n"
-                f"👤 Кто положил: {user_full_name}\n"
-                f"📦 Нужно положить: {total_required_quantity}"
-            )
-
-            # Обновляем сообщение в чате
-            if call.message.photo:
-                try:
-                    bot.edit_message_caption(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        caption=updated_text,
-                    )
-                except Exception:
-                    pass
-            else:
-                try:
-                    bot.edit_message_text(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        text=updated_text,
-                    )
-                except Exception:
-                    pass
-
-            # Если больше нет активных резерваций, удаляем сообщение из канала
-            if remaining_reservations == 0:
-                def delete_channel_message():
-                    try:
-                        bot.delete_message(chat_id=CHANNEL_ID, message_id=post.message_id)
-                    except Exception:
-                        pass
-
-                # Удаляем сообщение из канала через 5 секунд
-                threading.Timer(5.0, delete_channel_message).start()
-                bot.answer_callback_query(
-                    call.id,
-                    "Сообщение обновлено! Оно удалится из канала через 5 секунд.",
-                )
-            else:
-                bot.answer_callback_query(call.id, "Заказ успешно обработан!")
-    except Exception as global_error:
-        bot.answer_callback_query(call.id, f"Ошибка: {global_error}", show_alert=True)
+    bot.answer_callback_query(
+        call.id,
+        "Ручная обработка заказов отключена: бронь переводится в «Обработано» автоматически через 1 час.",
+        show_alert=True,
+    )
 
 # Хэндлер для очистки корзины
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
@@ -1802,13 +1603,21 @@ def set_user_state(user_id, state):
         clear_user_state(user_id)
     else:
         user_states[user_id] = state
-def get_user_state(chat_id):
-    state = user_states.get(chat_id, None)
+        BotSession.set_state(user_id, state)
 
+
+def get_user_state(chat_id):
+    if chat_id in user_states:
+        return user_states[chat_id]
+
+    state = BotSession.get_state(chat_id)
+    user_states[chat_id] = state
     return state
+
+
 def clear_user_state(user_id):
-    if user_id in user_states:  # user_states, вероятно, это где хранится состояние пользователей
-        del user_states[user_id]
+    user_states[user_id] = None
+    BotSession.clear_state(user_id)
 
 # Обработчик кнопки "⚙️ Клиенты"
 @bot.message_handler(func=lambda message: message.text == "⚙️ Клиенты")
@@ -2140,24 +1949,7 @@ def send_cart_content(chat_id, reservations, user_id):
 
         if post:
             caption = build_cart_item_caption(post, reservation)
-            # Отправляем фото и информацию о товаре
-            if post.photo and len(caption) <= 1024:
-                bot.send_photo(
-                    chat_id,
-                    photo=post.photo,
-                    caption=caption,
-                )
-            elif post.photo:
-                bot.send_photo(
-                    chat_id,
-                    photo=post.photo,
-                )
-                bot.send_message(chat_id, caption)
-            else:
-                bot.send_message(
-                    chat_id,
-                    caption,
-                )
+            send_photo_or_text(bot, chat_id, post.photo, caption)
         else:
             bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
 
@@ -2902,29 +2694,42 @@ def send_broadcast(message):
     except Exception as e:
         bot.send_message(chat_id=user_id, text=f"Ошибка при выполнении рассылки: {str(e)}")
 
+def is_legacy_delivery_callback(call):
+    if call.data not in ["yes", "no"]:
+        return False
+    text = call.message.text or call.message.caption or ""
+    return "Готовы принять доставку" in text
+
+
 # Обрабатывает ответ пользователя на предложение доставки с инлайн-клавиатуры.
-@bot.callback_query_handler(func=lambda call: call.data in ["yes", "no"])
+@bot.callback_query_handler(
+    func=lambda call: call.data in ["delivery_yes", "delivery_no"] or is_legacy_delivery_callback(call)
+)
 def handle_delivery_response_callback(call):
     # Получаем данные пользователя
     user_id = call.from_user.id
     message_id = call.message.message_id  # ID сообщения с кнопками
-    response = call.data  # Получаем "yes" или "no" из callback data
+    response = call.data
+    if response == "yes":
+        response = "delivery_yes"
+    elif response == "no":
+        response = "delivery_no"
 
     # Проверяем текущее время
     current_time = datetime.now().time()  # Текущее локальное время
 
-    if response == "yes" and current_time.hour >= 16:
+    if response == "delivery_yes" and current_time.hour >= 16:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
         bot.delete_message(chat_id=user_id, message_id=message_id)
         # Отправляем сообщение об отказе
         bot.send_message(chat_id=user_id,
                          text="Извините, но лист на доставку уже сформирован. Ожидайте следующую отправку.")
-    elif response == "yes":
+    elif response == "delivery_yes":
         # Если согласие до 14:00, запрашиваем адрес
         bot.send_message(chat_id=user_id, text="Пожалуйста, укажите город, адрес и подъезд")
         # Сохраняем состояние пользователя для дальнейшего ввода адреса
         set_user_state(user_id, "WAITING_FOR_ADDRESS")
-    elif response == "no":
+    elif response == "delivery_no":
         # Если отказ, удаляем сообщение с кнопками и уведомляем об ожидании следующей доставки
         bot.delete_message(chat_id=user_id, message_id=message_id)
         bot.send_message(chat_id=user_id, text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
@@ -3053,12 +2858,9 @@ def send_delivery_candidates_summary(eligible_users):
 
 
 def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum):
+    deduplicate_for_delivery_entries(session)
     normalized_phone = normalize_phone(phone)
-    existing_entries = session.query(ForDelivery).all()
-    delivery_entry = next(
-        (entry for entry in existing_entries if normalize_phone(entry.phone) == normalized_phone),
-        None,
-    )
+    delivery_entry = session.query(ForDelivery).filter(ForDelivery.phone == normalized_phone).first()
 
     if delivery_entry:
         delivery_entry.user_id = user_id
@@ -3080,6 +2882,29 @@ def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum)
     )
     session.add(delivery_entry)
     return delivery_entry
+
+
+def deduplicate_for_delivery_entries(session):
+    entries = session.query(ForDelivery).order_by(ForDelivery.id).all()
+    entries_by_phone = {}
+    for entry in entries:
+        normalized_phone = normalize_phone(entry.phone)
+        if not normalized_phone:
+            continue
+        entry.phone = normalized_phone
+
+        existing = entries_by_phone.get(normalized_phone)
+        if not existing:
+            entries_by_phone[normalized_phone] = entry
+            continue
+
+        if entry.address and not existing.address:
+            existing.address = entry.address
+        if entry.total_sum and entry.total_sum > (existing.total_sum or 0):
+            existing.total_sum = entry.total_sum
+            existing.user_id = entry.user_id
+            existing.name = entry.name
+        session.delete(entry)
 
 @bot.message_handler(func=lambda message: message.text == "👨‍🦯 Засунуть в доставку")
 def push_in_delivery(message):
@@ -3524,8 +3349,8 @@ def keyboard_for_delivery():
         Создает новую inline-клавиатуру с кнопками "Да" и "Нет".
         """
     keyboard = InlineKeyboardMarkup()  # Создаем разметку для клавиатуры
-    yes_button = InlineKeyboardButton(text="Да", callback_data="yes")  # Кнопка "Да"
-    no_button = InlineKeyboardButton(text="Нет", callback_data="no")  # Кнопка "Нет"
+    yes_button = InlineKeyboardButton(text="Да", callback_data="delivery_yes")  # Кнопка "Да"
+    no_button = InlineKeyboardButton(text="Нет", callback_data="delivery_no")  # Кнопка "Нет"
     keyboard.add(yes_button, no_button)  # Добавляем кнопки в клавиатуру
     return keyboard
 
@@ -3534,118 +3359,51 @@ def calculate_for_delivery():
     Вычисляет общую сумму обработанных заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
     Сообщение отправляется одному клиенту с минимальным ID. Логи содержат индивидуальную сумму, суммы других клиентов, и итоговую сумму.
     """
-
-    # Шаг 1: Подготовка данных (загрузка из таблиц)
-    from db import Session, engine
     with Session(bind=engine) as session:
-        all_clients = session.query(Clients).all()
+        rows = session.query(Reservations, Posts, Clients).join(
+            Posts, Posts.id == Reservations.post_id
+        ).join(
+            Clients, Clients.user_id == Reservations.user_id
+        ).filter(
+            Reservations.is_fulfilled == True
+        ).all()
 
-    if not all_clients:
-        print("[WARNING] Данные о клиентах не найдены!")
+    if not rows:
+        logger.info("Delivery broadcast: no fulfilled reservations found.")
         return []
 
-    with Session(bind=engine) as session:
-        # Добавляем фильтр для обработанных заказов
-        all_reservations = session.query(Reservations).filter(Reservations.is_fulfilled == True).all()
-
-    if not all_reservations:
-        print("[WARNING] Данные о заказах не найдены!")
-        return []
-
-    with Session(bind=engine) as session:
-        all_posts = session.query(Posts).all()
-
-    if not all_posts:
-        print("[WARNING] Данные о постах не найдены!")
-        return []
-
-    # Преобразуем списки клиентов и постов в словари для быстрого доступа
-    clients_dict = {client.user_id: client for client in all_clients}
-    clients_by_phone = {}
-    for client in all_clients:
-        phone = normalize_phone(getattr(client, "phone", None))
-        if phone:
-            if phone not in clients_by_phone:
-                clients_by_phone[phone] = []
-            clients_by_phone[phone].append(client)
-
-    posts_dict = {post.id: post for post in all_posts}
-
-    # Шаг 2: Группировка заказов по user_id
-    grouped_totals = {}
-    for reservation in all_reservations:  # Здесь all_reservations содержит только обработанные заказы
-        try:
-            user_id = reservation.user_id
-            post_id = reservation.post_id
-            quantity = reservation.quantity
-            return_order = reservation.return_order
-
-            # Проверка: существует ли пользователь с данным user_id
-            if user_id not in clients_dict:
-                print(f"[WARNING] Пропуск заказа: не найден пользователь с user_id={user_id}.")
-                continue
-
-            # Проверка: существует ли пост (товар) с данным post_id
-            if post_id not in posts_dict:
-                print(f"[WARNING] Пропуск заказа: не найден пост с post_id={post_id}.")
-                continue
-
-            # Вычисление стоимости заказа
-            post = posts_dict[post_id]
-            price = post.price
-            total_amount = (price * quantity) - return_order
-
-            if user_id not in grouped_totals:
-                grouped_totals[user_id] = 0
-            grouped_totals[user_id] += total_amount
-
-        except Exception as e:
-            print(f"[ERROR] Ошибка при обработке заказа: {str(e)}")
+    grouped_by_phone = {}
+    for reservation, post, client in rows:
+        phone = normalize_phone(client.phone)
+        if not phone:
             continue
 
-    # Шаг 3: Группировка заказов по телефону
-    summed_by_phone = {}
-    details_by_phone = {}  # Для хранения данных по отдельной сумме каждого клиента
-    for user_id, total in grouped_totals.items():
-        client = clients_dict[user_id]
-        phone = normalize_phone(getattr(client, "phone", None))
+        group = grouped_by_phone.setdefault(phone, {
+            "total_amount": 0,
+            "clients": {},
+        })
+        group["total_amount"] += calculate_order_amount(reservation, post)
+        group["clients"][client.id] = client
 
-        if phone:
-            if phone not in summed_by_phone:
-                summed_by_phone[phone] = 0
-                details_by_phone[phone] = []
-
-            summed_by_phone[phone] += total
-            details_by_phone[phone].append({
-                "user_id": user_id,
-                "name": client.name,
-                "individual_total": total
-            })
-
-    # Шаг 4: Выбор клиента с минимальным ID и вывод данных логов
     delivery_users = []
-    threshold = DELIVERY_THRESHOLD
+    for phone, group in grouped_by_phone.items():
+        total_amount = group["total_amount"]
+        if total_amount < DELIVERY_THRESHOLD:
+            logger.info(
+                "Delivery broadcast: phone %s skipped, total %s below threshold %s.",
+                phone,
+                total_amount,
+                DELIVERY_THRESHOLD,
+            )
+            continue
 
-    for phone, total_amount in summed_by_phone.items():
-        # Найти всех клиентов с этим номером телефона
-        clients = clients_by_phone.get(phone, [])
-
-        # Найти клиента с минимальным id
-        if clients:
-            clients.sort(key=lambda c: c.id)  # Сортируем по ID
-            selected_client = clients[0]
-
-            # Добавляем выбранного клиента в рассылку, если сумма достигла порога.
-            if total_amount >= threshold:
-                delivery_users.append({
-                    "user_id": getattr(selected_client, "user_id"),
-                    "name": getattr(selected_client, "name"),
-                    "phone": phone,
-                    "total_amount": total_amount,
-                })
-            else:
-                print(
-                    f"[INFO] Клиент с телефоном {phone} не добавлен в рассылку. Общая сумма заказов={total_amount} ниже порога={threshold}.")
+        selected_client = sorted(group["clients"].values(), key=lambda c: c.id)[0]
+        delivery_users.append({
+            "user_id": selected_client.user_id,
+            "name": selected_client.name,
+            "phone": phone,
+            "total_amount": total_amount,
+        })
 
     return delivery_users
 
@@ -3709,6 +3467,8 @@ def get_delivery_entry_cart_items(session, delivery_entry):
 
 
 def build_delivery_collection_keyboard(session, page=0):
+    deduplicate_for_delivery_entries(session)
+    session.flush()
     total_count = session.query(ForDelivery).count()
     rows = session.query(ForDelivery).order_by(
         ForDelivery.name,
@@ -3735,6 +3495,7 @@ def build_delivery_collection_keyboard(session, page=0):
 def show_delivery_collection_list(chat_id, message_id=None, page=0):
     with Session(bind=engine) as session:
         keyboard, total_count = build_delivery_collection_keyboard(session, page)
+        session.commit()
 
     if total_count == 0:
         text = "Список доставки пуст. Пока никто не согласился на доставку и не добавлен вручную."
@@ -3811,10 +3572,7 @@ def show_delivery_collection_client(call):
             f"Кому: {names}"
         )
         try:
-            if item["photo"]:
-                bot.send_photo(call.message.chat.id, item["photo"], caption=caption)
-            else:
-                bot.send_message(call.message.chat.id, caption)
+            send_photo_or_text(bot, call.message.chat.id, item["photo"], caption)
             time.sleep(0.3)
         except Exception as e:
             bot.send_message(call.message.chat.id, f"{caption}\n\nНе удалось отправить фото: {e}")
@@ -3904,83 +3662,6 @@ def confirm_delivery(message):
         return
     bot.send_message(message.chat.id, "Теперь доставка собирается по клиентам. Открываю список для сборки.")
     show_delivery_collection_list(message.chat.id)
-    return
-    try:
-        with Session(bind=engine) as session:
-            # Получаем все записи из ForDelivery
-            for_delivery_rows = session.query(ForDelivery).all()
-            if not for_delivery_rows:
-                bot.send_message(
-                    message.chat.id,
-                    "❌ Список доставки пуст. Нет данных для обработки."
-                )
-                return
-
-            for current_for_delivery in for_delivery_rows:
-                # Получаем данные клиента
-                client = session.query(Clients).filter(
-                    Clients.user_id == current_for_delivery.user_id
-                ).first()
-                if not client:
-                    # Если клиент не найден, пропускаем
-                    continue
-                related_user_ids = get_related_user_ids_by_phone(client.phone)
-
-                # Получаем выполненные заказы клиента из Reservations
-                reservations = session.query(Reservations).filter(
-                    Reservations.user_id.in_(related_user_ids),
-                    Reservations.is_fulfilled == True
-                ).all()
-
-                if not reservations:
-                    continue  # Пропускаем клиентов без выполненных заказов
-
-                # Обработка каждого выполненного заказа как отдельной строки
-                for reservation in reservations:
-                    reservation_client = session.query(Clients).filter(
-                        Clients.user_id == reservation.user_id
-                    ).first() or client
-                    # Получаем связанный пост, чтобы извлечь описание товара
-                    post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
-                    if not post:
-                        continue
-
-                    # Создаём отдельную запись в InDelivery для каждого товара
-                    new_delivery = InDelivery(
-                        post_id=reservation.post_id,  # ID поста
-                        user_id=reservation.user_id,  # ID пользователя
-                        user_name=reservation_client.name,  # Имя клиента из Clients
-                        item_description=post.description,  # Описание товара из Posts
-                        quantity=reservation.quantity,  # Количество товара
-                        price=(reservation.quantity * post.price) - (reservation.return_order or 0),  # Итоговая сумма за товар
-                        delivery_address=current_for_delivery.address,  # Адрес доставки
-                    )
-                    session.add(new_delivery)
-
-                    # Обновляем статус in_delivery для всех товаров в Temp_Fulfilled
-                    session.query(Temp_Fulfilled).filter(
-                        Temp_Fulfilled.user_id == reservation.user_id,
-                        Temp_Fulfilled.post_id == reservation.post_id
-                    ).update({"in_delivery": True}, synchronize_session=False)
-
-                    # Удаляем обработанный заказ из Reservations
-                    session.delete(reservation)
-
-            # Удаляем обработанные записи из ForDelivery
-            session.query(ForDelivery).delete(synchronize_session=False)
-
-            # Подтверждаем транзакцию
-            session.commit()
-            bot.send_message(
-                message.chat.id,
-                "✅ Все заказы успешно обработаны и перемещены в InDelivery. Каждое наименование товара записано отдельно. "
-                "Статусы обновлены в Temp_Fulfilled. Записи удалены из ForDelivery."
-            )
-    except Exception as e:
-        bot.send_message(
-            message.chat.id,
-            f"❌ Ошибка при подтверждении доставки: {str(e)}"
-        )
 
 @bot.callback_query_handler(
     func=lambda call: call.data == "edit_address"
@@ -4067,17 +3748,6 @@ def manage_audit_posts(message):
         "unique_dates": [date.strftime("%d %B") for date in unique_dates],
         "audit_date_map": {date.strftime("%d %B"): date.isoformat() for date in unique_dates},
     }
-
-
-def calculate_audit_price(price: int) -> int:
-    price_value = Decimal(int(price or 0))
-    discount = max(price_value * Decimal("0.10"), Decimal("50"))
-    discounted_price = price_value - discount
-    rounded_price = (discounted_price / Decimal("50")).quantize(
-        Decimal("1"),
-        rounding=ROUND_HALF_UP,
-    ) * Decimal("50")
-    return max(50, int(rounded_price))
 
 
 def apply_auto_audit_for_date(selected_date, audit_user_id):
@@ -4177,335 +3847,28 @@ def cancel_audit(message):
     active_audit[message.chat.id] = False
     bot.send_message(message.chat.id, "Ревизия успешно отменена.", reply_markup=types.ReplyKeyboardRemove())
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_price_"))
-def handle_edit_price_for_audit(call):
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith((
+        "audit_edit_price_",
+        "audit_edit_description_",
+        "audit_edit_quantity_",
+        "audit_delete_post_",
+        "audit_confirm_post_",
+    ))
+)
+def disabled_manual_audit_callback(call):
     answer_manual_audit_disabled(call)
-    return
-    user_id = call.from_user.id
-    post_id = int(call.data.split("_")[3])  # ID поста после audit_edit_price_
 
-    # Сохраняем состояние пользователя
-    set_user_state(user_id, "EDITING_AUDIT_PRICE")
-    temp_post_data[user_id] = {"post_id": post_id}
 
-    # Получаем ID сообщения, чтобы редактировать его
-    message_data = temp_post_data.get(post_id)
-
-    try:
-        if message_data:
-            # Обновляем текст сообщения перед отправкой ввода
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption="✍️ Введите новую цену для этого поста:"
-            )
-        else:
-            bot.send_message(user_id, "Произошла ошибка. Сообщение не найдено.")
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Ошибка редактирования сообщения: {e}")
-
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "EDITING_AUDIT_PRICE")
-def edit_post_price_for_audit(message):
+@bot.message_handler(
+    func=lambda message: get_user_state(message.chat.id) in {
+        "EDITING_AUDIT_PRICE",
+        "EDITING_AUDIT_DESCRIPTION",
+        "EDITING_AUDIT_QUANTITY",
+    }
+)
+def disabled_manual_audit_message(message):
     answer_manual_audit_disabled(message)
-    return
-    user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]
-
-    if not message.text.isdigit():  # Проверка на корректность ввода цены
-        bot.send_message(user_id, "⛔ Ошибка: Цена должна быть числом. Попробуйте снова.")
-        return
-
-    new_price = int(message.text)
-
-    try:
-        # Получение поста из базы данных
-        post = Posts.get_row_by_id(post_id)
-        if not post:
-            bot.send_message(user_id, "Пост не найден.")
-            return
-
-        # Обновление данных в базе
-        success, msg = Posts.update_row(
-            post_id=post_id,
-            price=new_price,
-            description=post.description,
-            quantity=post.quantity,
-            is_sent=False,
-            created_at=post.created_at
-        )
-
-        # Если обновление успешно
-        if success:
-            # Обновляем данные и создаём новую клавиатуру
-            post = Posts.get_row_by_id(post_id)  # Получаем актуальные данные
-            message_data = temp_post_data.get(post_id)
-
-            # Создаём клавиатуру с кнопками
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить количество", callback_data=f"audit_edit_quantity_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
-
-            # Редактируем сообщение с обновлёнными данными
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption=(
-                    f"📄 Пост #{post.id}\n\n"
-                    f"Описание: {post.description}\n"
-                    f"Цена: {post.price} руб.\n"
-                    f"Количество: {post.quantity}\n"
-                    f"Дата создания: {post.created_at.strftime('%Y-%m-%d %H:%M')}"
-                ),
-                reply_markup=keyboard
-            )
-
-            # Сообщение пользователю об успехе
-            bot.send_message(user_id, "✅ Цена успешно обновлена!")
-        else:
-            bot.send_message(user_id, f"⛔ Ошибка при обновлении цены: {msg}")
-    except Exception as e:
-        bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
-    finally:
-        # Сбрасываем состояние пользователя
-        clear_user_state(user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_description_"))
-def handle_edit_description_for_audit(call):
-    answer_manual_audit_disabled(call)
-    return
-    user_id = call.from_user.id
-    post_id = int(call.data.split("_")[3])  # ID поста
-
-    # Устанавливаем состояние пользователя
-    set_user_state(user_id, "EDITING_AUDIT_DESCRIPTION")
-    temp_post_data[user_id] = {"post_id": post_id}
-
-    # Редактируем сообщение
-    message_data = temp_post_data.get(post_id)
-    try:
-        if message_data:
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption="✍️ Введите новое описание для этого поста:"
-            )
-        else:
-            bot.send_message(user_id, "Ошибка: Сообщение не найдено.")
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Ошибка редактирования сообщения: {e}")
-
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "EDITING_AUDIT_DESCRIPTION")
-def edit_post_description_for_audit(message):
-    answer_manual_audit_disabled(message)
-    return
-    user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]
-
-    new_description = message.text
-
-    try:
-        # Получаем пост
-        post = Posts.get_row_by_id(post_id)
-        if not post:
-            bot.send_message(user_id, "Пост не найден.")
-            return
-
-        # Обновление в базе данных
-        success, msg = Posts.update_row(
-            post_id=post.id,
-            price=post.price,
-            description=new_description,
-            quantity=post.quantity,
-            is_sent=False,
-            created_at=post.created_at
-        )
-
-        if success:
-            # Загружаем актуальные данные поста
-            post = Posts.get_row_by_id(post_id)
-            message_data = temp_post_data.get(post_id)
-
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить количество", callback_data=f"audit_edit_quantity_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
-
-            # Редактируем сообщение
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption=(
-                    f"📄 Пост #{post.id}\n\n"
-                    f"Описание: {post.description}\n"
-                    f"Цена: {post.price}\n"
-                    f"Количество: {post.quantity}\n"
-                    f"Дата создания: {post.created_at.strftime('%Y-%m-%d %H:%M')}"
-                ),
-                reply_markup=keyboard
-            )
-
-            bot.send_message(user_id, "✅ Описание успешно обновлено!")
-        else:
-            bot.send_message(user_id, f"⛔ Ошибка обновления описания: {msg}")
-    except Exception as e:
-        bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
-    finally:
-        clear_user_state(user_id)  # Очистка состояния
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audit_edit_quantity_"))
-def handle_edit_quantity_for_audit(call):
-    answer_manual_audit_disabled(call)
-    return
-    user_id = call.from_user.id
-    post_id = int(call.data.split("_")[3])  # ID поста
-
-    # Устанавливаем состояние пользователя
-    set_user_state(user_id, "EDITING_AUDIT_QUANTITY")
-    temp_post_data[user_id] = {"post_id": post_id}
-
-    # Редактируем сообщение
-    message_data = temp_post_data.get(post_id)
-    try:
-        if message_data:
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption="✍️ Введите новое количество для этого поста:"
-            )
-        else:
-            bot.send_message(user_id, "Ошибка: Сообщение не найдено.")
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Ошибка редактирования сообщения: {e}")
-
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "EDITING_AUDIT_QUANTITY")
-def edit_post_quantity_for_audit(message):
-    answer_manual_audit_disabled(message)
-    return
-    user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]
-
-    if not message.text.isdigit():
-        bot.send_message(user_id, "⛔ Ошибка: Количество должно быть числом.")
-        return
-
-    new_quantity = int(message.text)
-
-    try:
-        post = Posts.get_row_by_id(post_id)
-        if not post:
-            bot.send_message(user_id, "Пост не найден.")
-            return
-
-        # Обновляем запись
-        success, msg = Posts.update_row(
-            post_id=post.id,
-            price=post.price,
-            description=post.description,
-            quantity=new_quantity,
-            is_sent=False,
-            created_at=post.created_at
-        )
-
-        if success:
-            post = Posts.get_row_by_id(post_id)
-            message_data = temp_post_data.get(post_id)
-
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.add(types.InlineKeyboardButton(text="Изменить цену", callback_data=f"audit_edit_price_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить описание", callback_data=f"audit_edit_description_{post.id}"))
-            keyboard.add(
-                types.InlineKeyboardButton(text="Изменить количество", callback_data=f"audit_edit_quantity_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Удалить", callback_data=f"audit_delete_post_{post.id}"))
-            keyboard.add(types.InlineKeyboardButton(text="Подтвердить", callback_data=f"audit_confirm_post_{post.id}"))
-
-            # Редактируем сообщение
-            bot.edit_message_caption(
-                chat_id=message_data["chat_id"],
-                message_id=message_data["message_id"],
-                caption=(
-                    f"📄 Пост #{post.id}\n\n"
-                    f"Описание: {post.description}\n"
-                    f"Цена: {post.price}\n"
-                    f"Количество: {post.quantity}\n"
-                    f"Дата создания: {post.created_at.strftime('%Y-%m-%d %H:%M')}"
-                ),
-                reply_markup=keyboard
-            )
-
-            bot.send_message(user_id, "✅ Количество успешно обновлено!")
-        else:
-            bot.send_message(user_id, f"⛔ Ошибка обновления количества: {msg}")
-    except Exception as e:
-        bot.send_message(user_id, f"⛔ Произошла ошибка: {e}")
-    finally:
-        clear_user_state(user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audit_delete_post_"))
-def delete_post_handler_for_audit(call):
-    answer_manual_audit_disabled(call)
-    return
-    post_id = int(call.data.split("_")[3])  # ID поста
-
-    try:
-        # Удаляем запись из базы данных
-        Posts.delete_row(post_id=post_id)
-
-        # Удаляем сообщение из чата
-        bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-        bot.answer_callback_query(call.id, "✅ Пост успешно удалён.")
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"⛔ Ошибка удаления поста: {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audit_confirm_post_"))
-def confirm_post(call):
-    answer_manual_audit_disabled(call)
-    return
-    post_id = int(call.data.split("_")[-1])  # Получаем ID поста
-    user_chat_id = call.from_user.id  # ID пользователя, сделавшего ревизию
-
-    try:
-        # Получаем пост из базы данных
-        post = Posts.get_row_by_id(post_id)
-        if not post:
-            bot.answer_callback_query(call.id, "⛔ Пост не найден.")
-            return
-
-        # Обновляем is_sent, дату и chat_id
-        success, msg = Posts.update_row(
-            post_id=post.id,
-            price=post.price,
-            description=post.description,
-            quantity=post.quantity,
-            is_sent=False,  # Устанавливаем is_sent = False
-            created_at=datetime.now(),  # Устанавливаем текущую дату и время
-            chat_id=user_chat_id  # Устанавливаем chat_id пользователя, сделавшего ревизию
-        )
-
-        if success:
-            # Удаляем сообщение из хранилища и чата
-            if post_id in temp_post_data:
-                message_data = temp_post_data.pop(post_id, None)
-                if message_data:
-                    bot.delete_message(
-                        chat_id=message_data["chat_id"],
-                        message_id=message_data["message_id"]
-                    )
-            # Отправляем подтверждение пользователю
-            bot.answer_callback_query(call.id, "✅ Пост подтверждён. Дата обновлена, ревизор сохранён.")
-        else:
-            bot.answer_callback_query(call.id, f"⛔ Ошибка при подтверждении поста: {msg}")
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"⛔ Ошибка подтверждения поста: {e}")
 
 @bot.message_handler(func=lambda message: message.text == "😞 У меня брак")
 def defect(message):

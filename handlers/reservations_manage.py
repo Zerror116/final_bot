@@ -1,41 +1,43 @@
+from sqlalchemy import func
+
 from db import Reservations, Posts
+from db.db import engine
+from sqlalchemy.orm import Session
 
 # Вспомогательные функции для вычислений
 def calculate_total_sum(user_id):
     """
     Рассчитывает общую сумму заказов пользователя.
     """
-    reservations = Reservations.get_row_by_user_id(user_id)
-    if not reservations:
-        return 0
-
-    total_sum = 0
-    for reservation in reservations:
-        post = Posts.get_row_by_id(reservation.post_id)
-        if post:
-            total_sum += (post.price * reservation.quantity) - (reservation.return_order or 0)
-
-    return total_sum
+    with Session(bind=engine) as session:
+        total = session.query(
+            func.sum(
+                (Posts.price * Reservations.quantity)
+                - func.coalesce(Reservations.return_order, 0)
+            )
+        ).join(
+            Posts, Posts.id == Reservations.post_id
+        ).filter(
+            Reservations.user_id == user_id
+        ).scalar()
+    return int(total or 0)
 
 def calculate_processed_sum(user_id):
     """
     Рассчитывает сумму обработанных заказов пользователя.
     """
-    reservations = Reservations.get_row_by_user_id(user_id)
-    if not reservations:
-        print(f"Нет бронирований пользователя с ID: {user_id}")
-        return 0
-
-    processed_sum = 0
-    for reservation in reservations:
-        if reservation.is_fulfilled:  # Если is_fulfilled — булево значение
-            post = Posts.get_row_by_id(reservation.post_id)
-            if post:
-                processed_sum += (post.price * reservation.quantity) - (reservation.return_order or 0)
-            else:
-                print(f"Нет данных в Posts для post_id: {reservation.post_id}")
-        else:
-            print(f"Бронирование ID {reservation.id} не обработано.")
-    return processed_sum
+    with Session(bind=engine) as session:
+        total = session.query(
+            func.sum(
+                (Posts.price * Reservations.quantity)
+                - func.coalesce(Reservations.return_order, 0)
+            )
+        ).join(
+            Posts, Posts.id == Reservations.post_id
+        ).filter(
+            Reservations.user_id == user_id,
+            Reservations.is_fulfilled == True,
+        ).scalar()
+    return int(total or 0)
 
 
