@@ -8,7 +8,7 @@ import telebot
 import locale
 from urllib.parse import quote
 
-from openpyxl.workbook import Workbook
+from openpyxl import Workbook
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
 from telebot import types, apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputFile, InputMediaAnimation
