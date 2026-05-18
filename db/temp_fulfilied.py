@@ -10,9 +10,11 @@ class Temp_Fulfilled(AbstractModel):
     __table_args__ = (
         Index("ix_temp_fulfilled_user_post", "user_id", "post_id"),
         Index("ix_temp_fulfilled_delivery_flags", "user_id", "in_delivery", "defect", "skidka"),
+        Index("ix_temp_fulfilled_reservation_id", "reservation_id"),
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reservation_id = mapped_column(Integer, nullable=True)
     post_id = mapped_column(Integer, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
     user_name = mapped_column(String, nullable=False)
@@ -23,14 +25,15 @@ class Temp_Fulfilled(AbstractModel):
     defect = mapped_column(Boolean, nullable=False, default=0)
     skidka = mapped_column(Boolean, nullable=False, default=0)
     skidka_price = mapped_column(Integer, nullable=False, default=0)
-    created_at = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    created_at = mapped_column(DateTime, default=datetime.datetime.now)
 
     @staticmethod
     def insert(session: Session, post_id: int, user_id: int, user_name: str,
-               item_description: str, quantity: int, price: int) -> bool:
+               item_description: str, quantity: int, price: int, reservation_id: int = None) -> bool:
         """Добавляет запись в таблицу Temp_Fulfilied."""
         try:
             new_record = Temp_Fulfilled(
+                reservation_id=reservation_id,
                 post_id=post_id,
                 user_id=user_id,
                 user_name=user_name,
@@ -106,7 +109,7 @@ class Temp_Fulfilled(AbstractModel):
     def cleanup_old_records(session: Session) -> int:
         """Удаляет записи, которые старше 7 дней."""
         try:
-            limit_date = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+            limit_date = datetime.datetime.now() - datetime.timedelta(days=7)
             old_records = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.created_at < limit_date).all()
 
             deleted_count = len(old_records)

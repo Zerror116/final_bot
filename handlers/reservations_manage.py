@@ -15,6 +15,8 @@ def calculate_total_sum(user_id):
                 (Posts.price * Reservations.quantity)
                 - func.coalesce(Reservations.return_order, 0)
             )
+        ).select_from(
+            Reservations
         ).join(
             Posts, Posts.id == Reservations.post_id
         ).filter(
@@ -32,6 +34,8 @@ def calculate_processed_sum(user_id):
                 (Posts.price * Reservations.quantity)
                 - func.coalesce(Reservations.return_order, 0)
             )
+        ).select_from(
+            Reservations
         ).join(
             Posts, Posts.id == Reservations.post_id
         ).filter(
@@ -39,5 +43,4 @@ def calculate_processed_sum(user_id):
             Reservations.is_fulfilled == True,
         ).scalar()
     return int(total or 0)
-
 

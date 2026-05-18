@@ -18,6 +18,7 @@ class InDelivery(AbstractModel):
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reservation_id = mapped_column(Integer, nullable=True)
     post_id = mapped_column(Integer, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
     user_name = mapped_column(String, nullable=False)
@@ -28,13 +29,14 @@ class InDelivery(AbstractModel):
     data = mapped_column(DateTime, nullable=False, default=datetime.datetime.now())
 
     @staticmethod
-    def insert(post_id, user_id, user_name, item_description, quantity, price, delivery_address):
+    def insert(post_id, user_id, user_name, item_description, quantity, price, delivery_address, reservation_id=None):
         """
         Добавляет запись в таблицу in_delivery.
         """
         with Session(bind=engine) as session:
             try:
                 new_entry = InDelivery(
+                    reservation_id=reservation_id,
                     post_id=post_id,
                     user_id=user_id,
                     user_name=user_name,
