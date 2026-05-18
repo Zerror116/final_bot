@@ -227,10 +227,23 @@ def test_delivery_move_and_archive_are_loss_safe():
         "Перенос остановлен: у части броней удалены карточки товаров",
         "archive_delivery_clear_yes",
         "InDelivery.clear_table()",
-        "clear_processed is disabled",
     ]:
         if marker not in text:
             raise AssertionError(f"delivery loss-safety marker missing {marker}")
+
+
+def test_cart_clear_processed_is_available():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "Расформировать обработанные",
+        "def clear_processed(user_id):",
+        "Reservations.is_fulfilled == True",
+        "deleted_count = session.query(Reservations).filter(",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"cart clear processed marker missing {marker}")
+    if "Обработанные товары удаляются только через" in text:
+        raise AssertionError("cart clear processed warning must not be shown")
 
 
 def test_sold_out_channel_delete_keeps_reserved_group():
@@ -296,6 +309,7 @@ def main():
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()
+    test_cart_clear_processed_is_available()
     test_sold_out_channel_delete_keeps_reserved_group()
     test_telegram_safe_helpers()
     print("smoke checks ok")

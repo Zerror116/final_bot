@@ -2347,10 +2347,9 @@ def send_cart_content(chat_id, reservations, user_id):
         else:
             bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
 
-    bot.send_message(
-        chat_id,
-        "Обработанные товары удаляются только через «🧺 Собрать доставку», чтобы сохранить срез доставки.",
-    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
+    bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
 
 # Callback для кнопки "Расформировать обработанные"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
@@ -2360,19 +2359,27 @@ def handle_clear_processed(call):
         return
     user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
 
-    safe_answer_callback_query(
-        call.id,
-        "Удаление обработанных товаров теперь выполняется только через сборку доставки.",
-        show_alert=True,
-    )
+    cleared_items = clear_processed(user_id)
+
+    if cleared_items > 0:
+        safe_answer_callback_query(call.id, f"Удалено обработанных товаров: {cleared_items}.", show_alert=True)
+        bot.send_message(
+            call.message.chat.id,
+            f"Обработанные товары удалены из корзины. Количество: {cleared_items}.",
+        )
+    else:
+        safe_answer_callback_query(call.id, "В корзине нет обработанных товаров для удаления.", show_alert=True)
 
 # Удаляет обработанные товары из корзины пользователя
 def clear_processed(user_id):
-    logger.warning(
-        "clear_processed is disabled for user_id=%s; use delivery collection cutoff flow instead",
-        user_id,
-    )
-    return 0
+    related_user_ids = get_related_user_ids_by_full_phone(user_id) or [user_id]
+    with Session(bind=engine) as session:
+        deleted_count = session.query(Reservations).filter(
+            Reservations.user_id.in_(related_user_ids),
+            Reservations.is_fulfilled == True,
+        ).delete(synchronize_session=False)
+        session.commit()
+        return deleted_count
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
