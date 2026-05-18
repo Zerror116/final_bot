@@ -214,6 +214,21 @@ def test_channel_post_auto_publish_markers():
             raise AssertionError(f"channel post auto publish marker missing {marker}")
 
 
+def test_post_management_only_shows_unpublished_posts():
+    posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
+    main_text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "def get_unsent_posts():",
+        "Posts.is_sent == False",
+        "Posts.message_id == None",
+        "return Posts.get_unsent_posts()",
+    ]:
+        if marker not in posts_text:
+            raise AssertionError(f"unpublished post query marker missing {marker}")
+    if "post.message_id = None" not in main_text:
+        raise AssertionError("audit repost flow must clear old channel message_id")
+
+
 def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
     text = MAIN.read_text(encoding="utf-8")
     block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
@@ -324,6 +339,7 @@ def main():
     test_callback_answers_are_safe()
     test_phoenix_broadcast_markers()
     test_channel_post_auto_publish_markers()
+    test_post_management_only_shows_unpublished_posts()
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()

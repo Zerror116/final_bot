@@ -4516,6 +4516,7 @@ def apply_auto_audit_for_date(selected_date, audit_user_id):
             new_price = calculate_audit_price(old_price)
             post.price = new_price
             post.is_sent = False
+            post.message_id = None
             post.created_at = now
             post.chat_id = audit_user_id
             summary["processed_count"] += 1

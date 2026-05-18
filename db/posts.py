@@ -96,7 +96,10 @@ class Posts(AbstractModel):
     @staticmethod
     def get_unsent_posts():
         with Session(bind=engine) as session:
-            return session.query(Posts).filter(Posts.is_sent == False).all()
+            return session.query(Posts).filter(
+                Posts.is_sent == False,
+                Posts.message_id == None,
+            ).order_by(Posts.id).all()
 
     @staticmethod
     def mark_as_sent(post_id, message_id):
@@ -145,7 +148,7 @@ class Posts(AbstractModel):
 
     @staticmethod
     def get_all_posts():
-            """Возвращает все посты, которые ещё не были отправлены на канал."""
+            """Возвращает посты, которые ещё не были отправлены в канал."""
             return Posts.get_unsent_posts()
 
     @staticmethod
@@ -155,6 +158,7 @@ class Posts(AbstractModel):
                 return session.query(Posts).filter(
                     Posts.chat_id == user_id,
                     Posts.is_sent == False,
+                    Posts.message_id == None,
                 ).all()
 
     @staticmethod
