@@ -206,6 +206,7 @@ def test_channel_post_auto_publish_markers():
         "def publish_unsent_posts_to_channel(",
         "Отправка постов в канал уже выполняется",
         "def should_auto_publish_channel_posts(value):",
+        "value.weekday() != 6",
         "value.minute == 0",
         "def start_channel_post_auto_publish_worker():",
         "start_channel_post_auto_publish_worker()",

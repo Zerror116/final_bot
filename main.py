@@ -3039,7 +3039,8 @@ def send_phoenix_channel_footer():
 
 def should_auto_publish_channel_posts(value):
     return (
-        value.hour in AUTO_CHANNEL_POST_HOURS
+        value.weekday() != 6
+        and value.hour in AUTO_CHANNEL_POST_HOURS
         and value.minute == 0
     )
 
