@@ -47,6 +47,19 @@ RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
 DELIVERY_COLLECTION_PAGE_SIZE = 8
 LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
+PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
+PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
+PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
+PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS", "10"))
+PHOENIX_QR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "phoenix_qr.jpg")
+PHOENIX_BROADCAST_TEXT = (
+    "Доброго времени суток, уважаемые клиенты Мега Скидки\n"
+    "Сегодня происходит выкладка товара как в Телеграме, так и в Фениксе\n"
+    "Т.к никто не знает судьбу телеграмма, просим в основном полагаться на Феникс\n"
+    "В ближайшее время полностью перейдем в Феникс, так же будут разыгрываться призы среди пользователей Феникса\n"
+    "Сайт: https://garphoenix.com/join/INV-R9JQ-F8UW?tenant=default (скопируйте и вставьте в браузер, т.к телеграмм может не пропустить на сайт)\n"
+    "Или можете перейти через QR-код"
+)
 
 
 logging.basicConfig(
@@ -273,6 +286,7 @@ configure_locale()
 active_audit = {}
 reservation_auto_fulfill_started = False
 reservation_auto_fulfill_stop_event = threading.Event()
+phoenix_broadcast_lock = threading.Lock()
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -320,6 +334,18 @@ def require_role(message, roles):
         return True
 
     bot.send_message(message.chat.id, "У вас недостаточно прав для этой команды.")
+    return False
+
+
+def is_creator(user_id):
+    return int(user_id) == ADMIN_USER_ID
+
+
+def require_creator(message):
+    if is_creator(message.from_user.id):
+        return True
+
+    bot.send_message(message.chat.id, "Эта команда доступна только создателю.")
     return False
 
 
@@ -3079,6 +3105,96 @@ def send_broadcast(message):
             bot.send_message(chat_id=user_id, text="Подходящих клиентов для рассылки не найдено.")
     except Exception as e:
         bot.send_message(chat_id=user_id, text=f"Ошибка при выполнении рассылки: {str(e)}")
+
+
+def get_phoenix_broadcast_recipients():
+    with Session(bind=engine) as session:
+        client_ids = session.query(Clients.user_id).filter(Clients.user_id != None).all()
+        session_ids = session.query(BotSession.user_id).filter(BotSession.user_id != None).all()
+
+    recipients = {
+        int(row[0])
+        for row in [*client_ids, *session_ids]
+        if row[0] and int(row[0]) > 0
+    }
+    return sorted(recipients)
+
+
+def send_phoenix_message(user_id):
+    with open(PHOENIX_QR_PATH, "rb") as photo:
+        bot.send_photo(
+            chat_id=user_id,
+            photo=photo,
+            caption=PHOENIX_BROADCAST_TEXT,
+        )
+
+
+def run_phoenix_broadcast(creator_user_id):
+    sent_count = 0
+    failed_count = 0
+    recipients = []
+
+    try:
+        recipients = get_phoenix_broadcast_recipients()
+        bot.send_message(
+            creator_user_id,
+            f"Начинаю рассылку о Фениксе. Получателей: {len(recipients)}. "
+            f"Задержка: {PHOENIX_BROADCAST_DELAY_SECONDS} сек.",
+        )
+
+        if not os.path.exists(PHOENIX_QR_PATH):
+            bot.send_message(creator_user_id, "QR-код не найден. Рассылка остановлена.")
+            return
+
+        for index, recipient_id in enumerate(recipients, start=1):
+            try:
+                send_phoenix_message(recipient_id)
+                sent_count += 1
+            except Exception as exc:
+                failed_count += 1
+                logger.warning("Phoenix broadcast failed for user_id=%s: %s", recipient_id, exc)
+
+            if index % PHOENIX_BROADCAST_BATCH_SIZE == 0 or index == len(recipients):
+                bot.send_message(
+                    creator_user_id,
+                    f"Рассылка о Фениксе: обработано {index}/{len(recipients)}, "
+                    f"отправлено {sent_count}, ошибок {failed_count}.",
+                )
+
+            if index < len(recipients):
+                time.sleep(PHOENIX_BROADCAST_DELAY_SECONDS)
+                if PHOENIX_BROADCAST_BATCH_SIZE > 0 and index % PHOENIX_BROADCAST_BATCH_SIZE == 0:
+                    time.sleep(PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS)
+
+    except Exception as exc:
+        logger.exception("Phoenix broadcast crashed: %s", exc)
+        bot.send_message(creator_user_id, f"Рассылка о Фениксе остановлена из-за ошибки: {exc}")
+    finally:
+        phoenix_broadcast_lock.release()
+        if recipients:
+            bot.send_message(
+                creator_user_id,
+                f"Рассылка о Фениксе завершена. Отправлено: {sent_count}, ошибок: {failed_count}.",
+            )
+
+
+@bot.message_handler(func=lambda message: message.text == PHOENIX_BROADCAST_BUTTON)
+def start_phoenix_broadcast(message):
+    if not require_creator(message):
+        return
+
+    if not phoenix_broadcast_lock.acquire(blocking=False):
+        bot.send_message(message.chat.id, "Рассылка о Фениксе уже выполняется.")
+        return
+
+    thread = threading.Thread(
+        target=run_phoenix_broadcast,
+        args=(message.chat.id,),
+        name="phoenix-broadcast",
+        daemon=True,
+    )
+    thread.start()
+
 
 def is_legacy_delivery_callback(call):
     if call.data not in ["yes", "no"]:

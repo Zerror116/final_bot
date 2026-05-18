@@ -172,6 +172,31 @@ def test_callback_answers_are_safe():
         raise AssertionError("callback answers must use safe_answer_callback_query")
 
 
+def test_phoenix_broadcast_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
+    qr_path = ROOT / "images" / "phoenix_qr.jpg"
+
+    if not qr_path.exists():
+        raise AssertionError("Phoenix QR image is missing")
+
+    for marker in [
+        'PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"',
+        "def require_creator",
+        "def get_phoenix_broadcast_recipients",
+        "def run_phoenix_broadcast",
+        "time.sleep(PHOENIX_BROADCAST_DELAY_SECONDS)",
+        "PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS",
+        "bot.send_photo(",
+        "https://garphoenix.com/join/INV-R9JQ-F8UW?tenant=default",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"Phoenix broadcast marker missing {marker}")
+
+    if "Рассылка о Фениксе" not in keyboard_text:
+        raise AssertionError("Phoenix broadcast button missing from creator menu")
+
+
 def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
     text = MAIN.read_text(encoding="utf-8")
     block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
@@ -267,6 +292,7 @@ def main():
     test_reservation_auto_fulfill_uses_local_time()
     test_channel_post_updates_are_centralized()
     test_callback_answers_are_safe()
+    test_phoenix_broadcast_markers()
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()
