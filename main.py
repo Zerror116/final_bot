@@ -275,6 +275,18 @@ reservation_auto_fulfill_started = False
 reservation_auto_fulfill_stop_event = threading.Event()
 
 
+def safe_answer_callback_query(*args, **kwargs):
+    try:
+        return bot.answer_callback_query(*args, **kwargs)
+    except Exception as exc:
+        error_text = str(exc).lower()
+        if "query is too old" in error_text or "query id is invalid" in error_text:
+            logger.debug("Telegram callback answer skipped: %s", exc)
+        else:
+            logger.warning("Telegram callback answer failed: %s", exc)
+        return None
+
+
 def normalize_phone(phone):
     digits = re.sub(r"\D", "", str(phone or ""))
     if len(digits) == 10:
@@ -723,7 +735,7 @@ def handle_reservation(call):
     if is_user_blacklisted(user_id):
         return "Вы не можете бронировать товары, так как вы были заблокированы"
     if not is_registered(user_id):
-        bot.answer_callback_query(
+        safe_answer_callback_query(
             callback_query_id=call.id,
             text="Вы не зарегистрированы! Для регистрации перейдите в бота",
             show_alert=True,
@@ -734,7 +746,7 @@ def handle_reservation(call):
             # Получаем текущий товар с блокировкой строки
             post = session.query(Posts).filter(Posts.id == post_id).with_for_update().first()
             if not post:
-                bot.answer_callback_query(
+                safe_answer_callback_query(
                     callback_query_id=call.id,
                     text="Товар больше недоступен.",
                     show_alert=True,
@@ -751,7 +763,7 @@ def handle_reservation(call):
                     )
                 ).first()
                 if user_in_queue:
-                    bot.answer_callback_query(
+                    safe_answer_callback_query(
                         callback_query_id=call.id,
                         text="Вы уже стоите в очереди за этим товаром!",
                         show_alert=True,
@@ -766,7 +778,7 @@ def handle_reservation(call):
                 )
                 session.add(temp_reservation)
                 session.commit()
-                bot.answer_callback_query(
+                safe_answer_callback_query(
                     callback_query_id=call.id,
                     text="Вы добавлены в очередь на этот товар.",
                     show_alert=True,
@@ -823,20 +835,20 @@ def handle_reservation(call):
 
             # Уведомление пользователя
             if post.quantity == 0:
-                bot.answer_callback_query(
+                safe_answer_callback_query(
                     callback_query_id=call.id,
                     text="Вы забронировали последний экземпляр товара!",
                     show_alert=True,
                 )
             else:
-                bot.answer_callback_query(
+                safe_answer_callback_query(
                     callback_query_id=call.id,
                     text="Вы забронировали товар!",
                     show_alert=True,
                 )
         except IntegrityError:
             session.rollback()
-            bot.answer_callback_query(
+            safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Произошла ошибка при бронировании. Попробуйте снова.",
                 show_alert=True,
@@ -844,7 +856,7 @@ def handle_reservation(call):
         except Exception as exc:
             session.rollback()
             logger.exception("Reservation failed for user_id=%s post_id=%s: %s", user_id, post_id, exc)
-            bot.answer_callback_query(
+            safe_answer_callback_query(
                 callback_query_id=call.id,
                 text="Произошла ошибка при бронировании. Попробуйте снова.",
                 show_alert=True,
@@ -1198,18 +1210,18 @@ def order_details(call):
         # Получаем информацию о заказе через ORM
         order = Reservations.get_row_by_id(reservation_id)
         if not order:
-            bot.answer_callback_query(call.id, "Заказ не найден.", show_alert=True)
+            safe_answer_callback_query(call.id, "Заказ не найден.", show_alert=True)
             return
 
         related_user_ids = get_related_user_ids_by_full_phone(call.from_user.id)
         if order.user_id not in related_user_ids:
-            bot.answer_callback_query(call.id, "Заказ не найден или не принадлежит вам.", show_alert=True)
+            safe_answer_callback_query(call.id, "Заказ не найден или не принадлежит вам.", show_alert=True)
             return
 
         # Получаем пост, связанный с этим заказом
         post = Posts.get_row_by_id(order.post_id)
         if not post:
-            bot.answer_callback_query(call.id, "Товар не найден.", show_alert=True)
+            safe_answer_callback_query(call.id, "Товар не найден.", show_alert=True)
             return
 
         status = "✔️ Обработан" if order.is_fulfilled else "⌛ В обработке"
@@ -1238,14 +1250,14 @@ def order_details(call):
         )
     except Exception as e:
         print(f"Ошибка отображения деталей заказа: {e}")
-        bot.answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
+        safe_answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
 
 # Отображает список заказов
 @bot.callback_query_handler(func=lambda call: call.data == "my_orders")
 def show_my_orders(call):
     message = call.message
     my_orders(message)  # Вызываем my_orders, передаём исходное сообщение
-    bot.answer_callback_query(call.id)  # Подтверждаем обработку нажатия
+    safe_answer_callback_query(call.id)  # Подтверждаем обработку нажатия
 
 # Обработчик функции Мои заказы
 @bot.message_handler(func=lambda message: message.text == "🛒 Мои заказы")
@@ -1381,7 +1393,7 @@ def paginate_orders(call):
     except Exception as e:
         logger.warning("Order pagination failed for user_id=%s page=%s: %s", user_id, page, e)
     finally:
-        bot.answer_callback_query(call.id)  # Подтверждаем успешную обработку
+        safe_answer_callback_query(call.id)  # Подтверждаем успешную обработку
 
 # Обработка отмены заказа
 @bot.callback_query_handler(
@@ -1414,23 +1426,23 @@ def cancel_reservation(call):
         # Основная логика
         current_user = Clients.get_row_by_user_id(user_id)
         if not current_user:
-            bot.answer_callback_query(call.id, "Вы не зарегистрированы.", show_alert=True)
+            safe_answer_callback_query(call.id, "Вы не зарегистрированы.", show_alert=True)
             return
 
         related_user_ids = get_related_user_ids_by_full_phone(user_id)
 
         order = Reservations.get_row_by_id(reservation_id)
         if not order or order.user_id not in related_user_ids:
-            bot.answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
+            safe_answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
             return
 
         if order.is_fulfilled:
-            bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
+            safe_answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
             return
 
         post = Posts.get_row_by_id(order.post_id)
         if not post:
-            bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
+            safe_answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
             return
 
         order_client = Clients.get_row_by_user_id(order.user_id)
@@ -1438,7 +1450,7 @@ def cancel_reservation(call):
 
         success = Reservations.cancel_order_by_id(reservation_id)
         if not success:
-            bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
+            safe_answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
             return
 
         with Session(bind=engine) as session:
@@ -1475,7 +1487,7 @@ def cancel_reservation(call):
                     text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
                 )
 
-                bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
+                safe_answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
                                           show_alert=False)
                 my_orders(call.message)
                 return
@@ -1484,16 +1496,16 @@ def cancel_reservation(call):
 
         update_channel_post_message(Posts.get_row_by_id(order.post_id))
 
-        bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.",
+        safe_answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.",
                                   show_alert=False)
         my_orders(call.message)
 
     except ValueError as ve:
         print(f"Некорректные callback-данные: {ve}")
-        bot.answer_callback_query(call.id, "Некорректные данные для отмены.", show_alert=True)
+        safe_answer_callback_query(call.id, "Некорректные данные для отмены.", show_alert=True)
     except Exception as e:
         print(f"Ошибка при попытке отказаться от заказа: {e}")
-        bot.answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
+        safe_answer_callback_query(call.id, "Произошла ошибка при обработке отмены.", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("enqueue_"))
 def handle_enqueue(call):
@@ -1504,7 +1516,7 @@ def handle_enqueue(call):
     with Session(bind=engine) as session:
         post = session.query(Posts).filter(Posts.id == post_id).first()
         if not post:
-            bot.answer_callback_query(call.id, "Товар больше недоступен.", show_alert=True)
+            safe_answer_callback_query(call.id, "Товар больше недоступен.", show_alert=True)
             return
 
         existing_entry = session.query(TempReservations).filter(
@@ -1514,7 +1526,7 @@ def handle_enqueue(call):
         ).first()
 
         if existing_entry:
-            bot.answer_callback_query(call.id, "Вы уже стоите в очереди за этим товаром.", show_alert=True)
+            safe_answer_callback_query(call.id, "Вы уже стоите в очереди за этим товаром.", show_alert=True)
             return
 
         session.add(TempReservations(
@@ -1525,7 +1537,7 @@ def handle_enqueue(call):
         ))
         session.commit()
 
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
     bot.send_message(user_id, "Вы добавлены в очередь. Как только товар станет доступен, вы будете уведомлены.")
 
 # Возврат в меню заказов
@@ -1539,7 +1551,7 @@ def go_back_to_menu(call):
         chat_id = call.message.chat.id
         # Сразу подтверждаем callback_query
         try:
-            bot.answer_callback_query(call.id)
+            safe_answer_callback_query(call.id)
         except Exception as e:
             logger.debug("Failed to answer callback query: %s", e)
     else:
@@ -1711,17 +1723,17 @@ def show_role_controls(chat_id, client):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("role_select_"))
 def handle_role_user_selection(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
 
     client_id = int(call.data.split("_")[2])
     client = Clients.get_row_by_id(client_id)
     if not client:
-        bot.answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
+        safe_answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
         return
 
     show_role_controls(call.message.chat.id, client)
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 # Обработка ввода имени и последних 4 цифр номера для поиска
 def process_user_input(message):
@@ -1790,7 +1802,7 @@ def process_user_input(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("promote_") or call.data.startswith("demote_"))
 def handle_role_change(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     try:
         # Получаем данные из callback (action, user_id)
@@ -1799,19 +1811,19 @@ def handle_role_change(call):
         # Получаем пользователя через Clients
         user = Clients.get_row_by_user_id(int(user_id))  # Используем существующий метод get_row_by_user_id
         if not user:
-            bot.answer_callback_query(call.id, "Пользователь не найден.")
+            safe_answer_callback_query(call.id, "Пользователь не найден.")
             return
 
         current_role = user.role
 
         # Проверка корректности текущей роли
         if current_role not in ROLES:
-            bot.answer_callback_query(call.id, "Некорректная роль пользователя.")
+            safe_answer_callback_query(call.id, "Некорректная роль пользователя.")
             return
 
         # Проверка, не относится ли пользователь к защищённым ролям
         if current_role in SPECIAL_ROLES:
-            bot.answer_callback_query(call.id, "Эту роль нельзя менять.")
+            safe_answer_callback_query(call.id, "Эту роль нельзя менять.")
             return
 
         # Вычисление новой роли
@@ -1821,7 +1833,7 @@ def handle_role_change(call):
         elif action == "demote" and current_index > 0:
             new_role = ROLES[current_index - 1]
         else:
-            bot.answer_callback_query(call.id, "Дальнейшее изменение роли невозможно.")
+            safe_answer_callback_query(call.id, "Дальнейшее изменение роли невозможно.")
             return
 
         # Используем метод для обновления роли пользователя
@@ -1847,15 +1859,15 @@ def handle_role_change(call):
                 )
             except Exception as e:
                 print(f"Ошибка обновления сообщения: {e}")
-                bot.answer_callback_query(call.id, "Ошибка отображения новых данных, но роль изменена.")
+                safe_answer_callback_query(call.id, "Ошибка отображения новых данных, но роль изменена.")
                 return
 
             # Уведомляем пользователя об успешном изменении роли
-            bot.answer_callback_query(call.id, f"Роль изменена на {new_role}.")
+            safe_answer_callback_query(call.id, f"Роль изменена на {new_role}.")
         else:
-            bot.answer_callback_query(call.id, "Ошибка при обновлении данных.")
+            safe_answer_callback_query(call.id, "Ошибка при обновлении данных.")
     except Exception as e:
-        bot.answer_callback_query(call.id, "Ошибка при обработке запроса.")
+        safe_answer_callback_query(call.id, "Ошибка при обработке запроса.")
         print(f"Ошибка: {e}")
 
 # Поиск пользователя по имени и последним 4 цифрам номера
@@ -1894,7 +1906,7 @@ def paginate_delivery_orders(call):
     except Exception as e:
         print(f"Ошибка при попытке пагинации заказов в доставке: {e}")
     finally:
-        bot.answer_callback_query(call.id)  # Подтверждаем успешную обработку
+        safe_answer_callback_query(call.id)  # Подтверждаем успешную обработку
 
 # Перессылка забронированного товара в группу Брони Мега Скидки
 @bot.message_handler(func=lambda message: message.text == "📦 Заказы клиентов")
@@ -1913,7 +1925,7 @@ def send_all_reserved_to_group(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mark_fulfilled_group_"))
 def mark_fulfilled_group(call):
-    bot.answer_callback_query(
+    safe_answer_callback_query(
         call.id,
         "Ручная обработка заказов отключена: бронь отправляется в группу сразу и обрабатывается автоматически через 1 час.",
         show_alert=True,
@@ -1923,7 +1935,7 @@ def mark_fulfilled_group(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_cart_"))
 def handle_clear_cart(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     # Получаем ID клиента из callback данных
     client_id = int(call.data.split("_")[2])
@@ -2016,17 +2028,17 @@ def ask_defective_confirmation(chat_id, client):
 )
 def handle_defective_client_choice(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
 
     client_id = int(call.data.split("_")[2])
     client = Clients.get_row_by_id(client_id)
     if not client:
-        bot.answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
+        safe_answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
         return
 
     ask_defective_confirmation(call.message.chat.id, client)
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "awaiting_last_digits_defective")
@@ -2079,7 +2091,7 @@ def search_user_for_defective(message):
 @bot.callback_query_handler(func=lambda call: get_user_state(call.message.chat.id) == "awaiting_defective_action")
 def handle_defective_action(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     if call.data == "confirm_defective":
         set_user_state(call.message.chat.id, "awaiting_defective_sum")
@@ -2120,10 +2132,10 @@ def handle_defective_sum_entry(message):
 @bot.callback_query_handler(func=lambda call: get_user_state(call.message.chat.id) == "select_reservation_for_defective")
 def handle_reservation_selection(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     # Отвечаем на callback_query сразу
-    bot.answer_callback_query(call.id, text="Ваш выбор обрабатывается...")
+    safe_answer_callback_query(call.id, text="Ваш выбор обрабатывается...")
 
     reservation_id = int(call.data.split("_")[1])  # Получаем ID заказа из callback_data
     defective_sum = temp_user_data[call.message.chat.id]["defective_sum"]
@@ -2318,11 +2330,11 @@ def send_cart_content(chat_id, reservations, user_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
 def handle_clear_processed(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
 
-    bot.answer_callback_query(
+    safe_answer_callback_query(
         call.id,
         "Удаление обработанных товаров теперь выполняется только через сборку доставки.",
         show_alert=True,
@@ -2340,22 +2352,22 @@ def clear_processed(user_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
 def callback_view_cart(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     try:
         client_id = int(call.data.split("_")[2])
     except (IndexError, ValueError):
-        bot.answer_callback_query(call.id, "Некорректный выбор клиента.", show_alert=True)
+        safe_answer_callback_query(call.id, "Некорректный выбор клиента.", show_alert=True)
         return
 
     # Получаем данные клиента
     client = Clients.get_row_by_id(client_id)
 
     if not client:
-        bot.answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
+        safe_answer_callback_query(call.id, "Пользователь не найден.", show_alert=True)
         return
 
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
     show_cart_for_client(call.message.chat.id, client)
 
 # Удаление клиента по номеру телефона
@@ -2429,7 +2441,7 @@ def process_delete_client_phone(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("set_worker_") or call.data.startswith("set_client_"))
 def handle_set_role(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     client_id = int(call.data.split("_")[2])
     new_role = "worker" if "set_worker" in call.data else "client"
@@ -2437,19 +2449,19 @@ def handle_set_role(call):
     client = Clients.get_row_by_id(client_id)
 
     if not client:
-        bot.answer_callback_query(call.id, f"Клиент с ID {client_id} не найден.")
+        safe_answer_callback_query(call.id, f"Клиент с ID {client_id} не найден.")
         return
 
     update_result = Clients.update_row_for_work(client.user_id, {"role": new_role})
 
     if update_result:
-        bot.answer_callback_query(call.id, f"Роль успешно изменена на {new_role}.")
+        safe_answer_callback_query(call.id, f"Роль успешно изменена на {new_role}.")
         bot.send_message(
             call.message.chat.id,
             f"Роль пользователя с ID {client_id} обновлена на {new_role}.",
         )
     else:
-        bot.answer_callback_query(call.id, "Не удалось обновить роль, попробуйте позже.")
+        safe_answer_callback_query(call.id, "Не удалось обновить роль, попробуйте позже.")
 
 # Проверка на админа
 def is_admin(user_id):
@@ -2651,7 +2663,7 @@ def edit_post(call):
     # Проверяем права на редактирование
     role = get_client_role(user_id)
     if role not in ["admin", "worker", "supreme_leader", "audit"]:
-        bot.answer_callback_query(
+        safe_answer_callback_query(
             callback_query_id=call.id,
             text="У вас нет прав доступа к этой функции.",
             show_alert=True,
@@ -2829,7 +2841,7 @@ def delete_post_handler(call):
         with Session(bind=engine) as session:
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:
-                bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
+                safe_answer_callback_query(call.id, "Пост не найден.", show_alert=True)
                 return
 
             has_related_rows = any([
@@ -2842,7 +2854,7 @@ def delete_post_handler(call):
                 post.quantity = 0
                 session.commit()
                 disable_channel_post_reservation(post)
-                bot.answer_callback_query(
+                safe_answer_callback_query(
                     call.id,
                     "Пост связан с заказами, поэтому карточка оставлена в базе, а бронь в канале отключена.",
                     show_alert=True,
@@ -2859,15 +2871,15 @@ def delete_post_handler(call):
         result, msg = Posts.delete_row(post_id=post_id)
         if result:
             # Сообщаем о результате
-            bot.answer_callback_query(call.id, "Пост успешно удалён.")
+            safe_answer_callback_query(call.id, "Пост успешно удалён.")
 
             safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
         else:
             # Возникает ошибка при удалении поста
-            bot.answer_callback_query(call.id, f"Ошибка: {msg}")
+            safe_answer_callback_query(call.id, f"Ошибка: {msg}")
     except Exception as e:
         # Обработка исключений, если что-то пошло не так
-        bot.answer_callback_query(call.id, f"Ошибка: {e}")
+        safe_answer_callback_query(call.id, f"Ошибка: {e}")
 
 # Кнопка назад
 @bot.message_handler(func=lambda message: message.text == "⬅️ Назад")
@@ -3132,7 +3144,7 @@ def handle_delivery_response_callback(call):
         bot.send_message(chat_id=user_id, text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
 
     # Уведомляем Telegram, что callback обработан
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 # Обрабатывает ввод адреса пользователя.
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "WAITING_FOR_ADDRESS")
@@ -3485,7 +3497,7 @@ def archive_delivery_to_excel(message):
 @bot.callback_query_handler(func=lambda call: call.data in ["archive_delivery_clear_yes", "archive_delivery_clear_no"])
 def handle_archive_delivery_clear_confirmation(call):
     if not has_role(call.from_user.id, DELIVERY_ROLES):
-        bot.answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
     if call.data == "archive_delivery_clear_no":
@@ -3496,7 +3508,7 @@ def handle_archive_delivery_clear_confirmation(call):
             message_id=call.message.message_id,
             text="Записи in_delivery оставлены без изменений.",
         )
-        bot.answer_callback_query(call.id)
+        safe_answer_callback_query(call.id)
         return
 
     InDelivery.clear_table()
@@ -3507,7 +3519,7 @@ def handle_archive_delivery_clear_confirmation(call):
         message_id=call.message.message_id,
         text="Все записи из in_delivery удалены после подтверждения.",
     )
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 def keyboard_for_editing():
     keyboard = types.InlineKeyboardMarkup()
@@ -3527,7 +3539,7 @@ def handle_delivery_otmena(call):
                          text="Вы отказались от доставки. Оповестим вас при следующей доставке.")
 
         # Отвечаем на Callback, чтобы Telegram понял, что она обработана
-        bot.answer_callback_query(callback_query_id=call.id)
+        safe_answer_callback_query(callback_query_id=call.id)
     except Exception as e:
         logger.warning("Delivery cancel callback failed for user_id=%s: %s", call.from_user.id, e)
 
@@ -3833,7 +3845,7 @@ def handle_confirmation(call):
         set_user_state(user_id, "WAITING_FOR_DATA_EDIT")
 
     # Завершаем callback
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 # Клавиатура для доставки да или нет
 def keyboard_for_delivery():
@@ -4027,12 +4039,12 @@ def collect_delivery(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("collect_delivery_page_"))
 def paginate_delivery_collection(call):
     if not has_role(call.from_user.id, DELIVERY_ROLES):
-        bot.answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
     page = int(call.data.rsplit("_", 1)[1])
     show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 
 @bot.callback_query_handler(
@@ -4041,14 +4053,14 @@ def paginate_delivery_collection(call):
 )
 def show_delivery_collection_client(call):
     if not has_role(call.from_user.id, DELIVERY_ROLES):
-        bot.answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
     delivery_id = int(call.data.rsplit("_", 1)[1])
     with Session(bind=engine) as session:
         delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
         if not delivery_entry:
-            bot.answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
+            safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
             return
 
         items = get_delivery_entry_cart_items(session, delivery_entry)
@@ -4064,7 +4076,7 @@ def show_delivery_collection_client(call):
     bot.send_message(call.message.chat.id, header)
     if not items:
         bot.send_message(call.message.chat.id, "У клиента нет обработанных товаров в корзине.")
-        bot.answer_callback_query(call.id)
+        safe_answer_callback_query(call.id)
         return
 
     for item in items:
@@ -4086,7 +4098,7 @@ def show_delivery_collection_client(call):
     keyboard.add(InlineKeyboardButton("✅ Собрано", callback_data=f"delivery_collected_{delivery_id}"))
     keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data="collect_delivery_page_0"))
     bot.send_message(call.message.chat.id, "Когда корзина собрана, нажмите «Собрано».", reply_markup=keyboard)
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 
 def move_for_delivery_to_in_delivery(delivery_id):
@@ -4172,7 +4184,7 @@ def move_for_delivery_to_in_delivery(delivery_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delivery_collected_"))
 def mark_delivery_collected(call):
     if not has_role(call.from_user.id, DELIVERY_ROLES):
-        bot.answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
     delivery_id = int(call.data.rsplit("_", 1)[1])
@@ -4186,10 +4198,10 @@ def mark_delivery_collected(call):
             text=f"✅ {message_text} Товарных строк: {moved_count}.",
         )
     else:
-        bot.answer_callback_query(call.id, message_text, show_alert=True)
+        safe_answer_callback_query(call.id, message_text, show_alert=True)
         return
 
-    bot.answer_callback_query(call.id)
+    safe_answer_callback_query(call.id)
 
 @bot.message_handler(func=lambda message: message.text == "✅ Подтвердить доставку")
 def confirm_delivery(message):
@@ -4327,7 +4339,7 @@ def apply_auto_audit_for_date(selected_date, audit_user_id):
 def answer_manual_audit_disabled(target):
     message = "Ручная ревизия отключена, используйте автоматическую."
     if hasattr(target, "data") and hasattr(target, "id"):
-        bot.answer_callback_query(target.id, message, show_alert=True)
+        safe_answer_callback_query(target.id, message, show_alert=True)
     else:
         bot.send_message(target.chat.id, message)
         clear_user_state(target.chat.id)
@@ -4466,7 +4478,7 @@ def request_defect_reason(call):
     state = get_user_state(user_id)
 
     if not isinstance(state, dict) or state.get("action") != "defect_reason":
-        bot.answer_callback_query(call.id, "Ошибка! Попробуйте снова.", show_alert=True)
+        safe_answer_callback_query(call.id, "Ошибка! Попробуйте снова.", show_alert=True)
         return
 
     bot.send_message(
@@ -4570,7 +4582,7 @@ def handle_defect_reason(message):
         "contact_"))
 def handle_inline_buttons(call):
     if not has_role(call.from_user.id, ADMIN_ROLES):
-        bot.answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
         return
     user_id = call.from_user.id
     action, item_id = call.data.split("_")
@@ -4686,12 +4698,12 @@ def handle_discount_confirmation(call):
         action, item_id = call.data.rsplit("_", 1)  # Разделяем строку с конца
         item_id = int(item_id)  # Преобразуем item_id в число
     except ValueError:
-        bot.answer_callback_query(call.id, "Ошибка: некорректные данные.")
+        safe_answer_callback_query(call.id, "Ошибка: некорректные данные.")
         return
 
     state = get_user_state(user_id)
     if not isinstance(state, dict) or state.get("item_id") != item_id:
-        bot.answer_callback_query(call.id, "Ошибка! Товар не найден.")
+        safe_answer_callback_query(call.id, "Ошибка! Товар не найден.")
         return
 
     discount_amount = state.get("discount_amount")
@@ -4701,7 +4713,7 @@ def handle_discount_confirmation(call):
         # Получаем информацию о товаре
         item = session.query(Temp_Fulfilled).filter_by(id=item_id).first()
         if not item:
-            bot.answer_callback_query(call.id, "Ошибка! Запись о товаре не найдена.")
+            safe_answer_callback_query(call.id, "Ошибка! Запись о товаре не найдена.")
             return
 
         if action == "confirm_discount":
@@ -4711,7 +4723,7 @@ def handle_discount_confirmation(call):
             session.commit()
 
             # Уведомляем клиента
-            bot.answer_callback_query(call.id, "Скидка успешно активирована.")
+            safe_answer_callback_query(call.id, "Скидка успешно активирована.")
             bot.send_message(
                 call.message.chat.id,
                 f"Скидка в размере {discount_amount}₽ успешно активирована! Спасибо за ваше решение!"
@@ -4732,7 +4744,7 @@ def handle_discount_confirmation(call):
             session.commit()
 
             # Уведомляем клиента
-            bot.answer_callback_query(call.id, "Хорошо, оформлен возврат.")
+            safe_answer_callback_query(call.id, "Хорошо, оформлен возврат.")
             bot.send_message(
                 call.message.chat.id,
                 "Хорошо, оформлен возврат. При следующей доставке товар будет возвращён."

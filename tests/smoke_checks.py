@@ -160,6 +160,18 @@ def test_channel_post_updates_are_centralized():
             raise AssertionError(f"channel post update helper missing {marker}")
 
 
+def test_callback_answers_are_safe():
+    text = MAIN.read_text(encoding="utf-8")
+    if "def safe_answer_callback_query" not in text:
+        raise AssertionError("safe callback answer helper is missing")
+    unsafe_calls = [
+        line for line in text.splitlines()
+        if "bot.answer_callback_query" in line and "return bot.answer_callback_query" not in line
+    ]
+    if unsafe_calls:
+        raise AssertionError("callback answers must use safe_answer_callback_query")
+
+
 def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
     text = MAIN.read_text(encoding="utf-8")
     block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
@@ -254,6 +266,7 @@ def main():
     test_reserved_group_flow_markers()
     test_reservation_auto_fulfill_uses_local_time()
     test_channel_post_updates_are_centralized()
+    test_callback_answers_are_safe()
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()
