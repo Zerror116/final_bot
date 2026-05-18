@@ -59,6 +59,20 @@ def test_reservation_sum_queries_have_explicit_from():
     marker = ").select_from(\n            Reservations\n        ).join("
     if text.count(marker) < 2:
         raise AssertionError("reservation sum queries must select_from Reservations before join")
+    if "func.coalesce(Reservations.old_price, Posts.price)" not in text:
+        raise AssertionError("reservation sums must use reservation old_price")
+
+
+def test_order_amount_uses_reserved_price():
+    text = MAIN.read_text(encoding="utf-8")
+    required = [
+        "def calculate_order_amount(order, post):",
+        "unit_price = order.old_price if order.old_price is not None else post.price",
+        "(func.coalesce(Reservations.old_price, Posts.price) * Reservations.quantity)",
+    ]
+    for marker in required:
+        if marker not in text:
+            raise AssertionError(f"reserved price calculation missing {marker}")
 
 
 def test_delivery_cutoff_markers():
@@ -74,6 +88,14 @@ def test_delivery_cutoff_markers():
     for marker in required:
         if marker not in main_text:
             raise AssertionError(f"delivery cutoff implementation missing {marker}")
+
+    yes_block = main_text.split('elif response == "delivery_yes":', 1)[1].split('elif response == "delivery_no":', 1)[0]
+    for marker in [
+        '"delivery_cutoff_at": serialize_datetime(delivery_cutoff_at)',
+        "set_user_state(user_id, \"WAITING_FOR_ADDRESS\")",
+    ]:
+        if marker not in yes_block:
+            raise AssertionError(f"delivery yes cutoff block missing {marker}")
 
     for marker in [
         '"002_delivery_cutoff_metadata"',
@@ -138,6 +160,42 @@ def test_channel_post_updates_are_centralized():
             raise AssertionError(f"channel post update helper missing {marker}")
 
 
+def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
+    text = MAIN.read_text(encoding="utf-8")
+    block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
+    if "if not post:" not in block or "Товар больше недоступен." not in block:
+        raise AssertionError("missing posts must not create temp queue entries")
+    reservation_tail = block.split("post.quantity -= 1", 1)[1]
+    if not (reservation_tail.index("session.add(reservation)") < reservation_tail.index("session.commit()")):
+        raise AssertionError("stock decrement and reservation insert must commit together")
+
+
+def test_post_delete_and_zero_quantity_are_safe():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "def disable_channel_post_reservation",
+        "has_related_rows = any([",
+        "Пост связан с заказами",
+        "quantity <= 0",
+        "build_channel_post_markup(post)",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"safe post deletion/quantity marker missing {marker}")
+
+
+def test_delivery_move_and_archive_are_loss_safe():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "missing_reservations = [",
+        "Перенос остановлен: у части броней удалены карточки товаров",
+        "archive_delivery_clear_yes",
+        "InDelivery.clear_table()",
+        "clear_processed is disabled",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"delivery loss-safety marker missing {marker}")
+
+
 def test_sold_out_channel_delete_keeps_reserved_group():
     text = MAIN.read_text(encoding="utf-8")
     required = [
@@ -191,10 +249,14 @@ def main():
     test_delivery_callbacks_are_namespaced()
     test_manual_audit_old_flow_removed()
     test_reservation_sum_queries_have_explicit_from()
+    test_order_amount_uses_reserved_price()
     test_delivery_cutoff_markers()
     test_reserved_group_flow_markers()
     test_reservation_auto_fulfill_uses_local_time()
     test_channel_post_updates_are_centralized()
+    test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
+    test_post_delete_and_zero_quantity_are_safe()
+    test_delivery_move_and_archive_are_loss_safe()
     test_sold_out_channel_delete_keeps_reserved_group()
     test_telegram_safe_helpers()
     print("smoke checks ok")

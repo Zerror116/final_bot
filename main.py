@@ -64,6 +64,12 @@ def build_channel_post_caption(post):
     return f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
 
 
+def build_bot_only_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("В бота", url=f"{bot_link}?start=start"))
+    return markup
+
+
 def build_channel_post_markup(post):
     markup = InlineKeyboardMarkup()
     if post.quantity > 0:
@@ -72,8 +78,17 @@ def build_channel_post_markup(post):
             InlineKeyboardButton("В бота", url=f"{bot_link}?start=start"),
         )
     else:
-        markup.add(InlineKeyboardButton("В бота", url=f"{bot_link}?start=start"))
+        return build_bot_only_markup()
     return markup
+
+
+def build_unavailable_channel_post_caption(post, reason="Товар снят с продажи"):
+    return (
+        f"{reason}\n\n"
+        f"Цена: {post.price} ₽\n"
+        f"Описание: {post.description}\n"
+        "Остаток: 0"
+    )
 
 
 def update_channel_post_message(post):
@@ -112,6 +127,40 @@ def update_channel_post_message(post):
         return False
 
 
+def disable_channel_post_reservation(post, reason="Товар снят с продажи"):
+    if not post or not post.message_id:
+        return False
+
+    caption = build_unavailable_channel_post_caption(post, reason)
+    markup = build_bot_only_markup()
+    try:
+        bot.edit_message_caption(
+            chat_id=CHANNEL_ID,
+            message_id=post.message_id,
+            caption=caption,
+            reply_markup=markup,
+        )
+        return True
+    except Exception as exc:
+        if is_message_not_modified_error(exc):
+            return True
+        logger.warning("Channel post disable caption failed for post_id=%s: %s", post.id, exc)
+
+    try:
+        bot.edit_message_text(
+            chat_id=CHANNEL_ID,
+            message_id=post.message_id,
+            text=caption,
+            reply_markup=markup,
+        )
+        return True
+    except Exception as exc:
+        if is_message_not_modified_error(exc):
+            return True
+        logger.warning("Channel post disable text failed for post_id=%s: %s", post.id, exc)
+        return False
+
+
 def delete_channel_post_if_fully_processed(post_id):
     with Session(bind=engine) as session:
         post = session.query(Posts).filter(Posts.id == post_id).first()
@@ -139,7 +188,7 @@ def delete_channel_post_if_fully_processed(post_id):
                     message_id,
                     exc,
                 )
-                return False
+                return disable_channel_post_reservation(post, reason="Товар закончился")
 
         post.message_id = None
         session.commit()
@@ -233,6 +282,15 @@ def normalize_phone(phone):
     if len(digits) == 11 and digits.startswith("7"):
         return f"8{digits[1:]}"
     return digits
+
+
+def phone_variants(phone):
+    normalized = normalize_phone(phone)
+    variants = {str(phone or "").strip(), normalized}
+    if len(normalized) == 11 and normalized.startswith("8"):
+        variants.add(f"7{normalized[1:]}")
+        variants.add(f"+7{normalized[1:]}")
+    return {variant for variant in variants if variant}
 
 
 def get_phone_tail(phone, length=4):
@@ -675,7 +733,15 @@ def handle_reservation(call):
         try:
             # Получаем текущий товар с блокировкой строки
             post = session.query(Posts).filter(Posts.id == post_id).with_for_update().first()
-            if not post or post.quantity <= 0:
+            if not post:
+                bot.answer_callback_query(
+                    callback_query_id=call.id,
+                    text="Товар больше недоступен.",
+                    show_alert=True,
+                )
+                return
+
+            if post.quantity <= 0:
                 # Проверка очереди
                 user_in_queue = session.query(TempReservations).filter(
                     and_(
@@ -706,10 +772,9 @@ def handle_reservation(call):
                     show_alert=True,
                 )
                 return
-            # Если товар доступен, уменьшаем его количество
+
+            # Остаток и бронь фиксируются одной транзакцией.
             post.quantity -= 1
-            session.commit()
-            # Сохраняем бронирование
             reservation = Reservations(
                 user_id=user_id,
                 post_id=post_id,
@@ -719,14 +784,15 @@ def handle_reservation(call):
                 created_at=now_local(),
             )
             session.add(reservation)
+            session.flush()
+            reservation_id = reservation.id
             session.commit()
-            session.refresh(reservation)
 
             update_channel_post_message(post)
 
             client = session.query(Clients).filter(Clients.user_id == user_id).first()
             if client and send_reserved_group_message(session, reservation, post, client):
-                session.commit()
+                logger.debug("Reserved group message sent for reservation_id=%s", reservation_id)
 
             # Отправляем личное сообщение с фото товара, описанием и кнопкой отмены
             cancel_button = InlineKeyboardMarkup()
@@ -775,6 +841,14 @@ def handle_reservation(call):
                 text="Произошла ошибка при бронировании. Попробуйте снова.",
                 show_alert=True,
             )
+        except Exception as exc:
+            session.rollback()
+            logger.exception("Reservation failed for user_id=%s post_id=%s: %s", user_id, post_id, exc)
+            bot.answer_callback_query(
+                callback_query_id=call.id,
+                text="Произошла ошибка при бронировании. Попробуйте снова.",
+                show_alert=True,
+            )
 
 # Получение бронирования пользователя
 def get_user_reservations(user_id):
@@ -815,7 +889,12 @@ def get_related_user_ids_by_full_phone(user_id):
 
 
 def calculate_order_amount(order, post):
-    return (post.price * order.quantity) - (order.return_order or 0)
+    unit_price = order.old_price if order.old_price is not None else post.price
+    return (unit_price * order.quantity) - (order.return_order or 0)
+
+
+def reservation_unit_price(order, post):
+    return order.old_price if order.old_price is not None else post.price
 
 
 def format_datetime(value):
@@ -845,12 +924,13 @@ def get_delivery_cutoff_at(delivery_entry):
 
 def build_reserved_group_caption(reservation, post, client):
     status = "✅ Обработан" if reservation.is_fulfilled else "⏳ В обработке"
+    price = reservation_unit_price(reservation, post) if post else "Не указана"
     lines = [
         "💼 Новый заказ:",
         "",
         f"👤 Клиент: {client.name if client and client.name else 'Имя не указано'}",
         f"📞 Телефон: {client.phone if client and client.phone else 'Телефон не указан'}",
-        f"💰 Цена: {post.price if post else 'Не указана'}₽",
+        f"💰 Цена: {price}₽",
         f"📦 Описание: {post.description if post else 'Описание отсутствует'}",
         f"📅 Дата поста: {post.created_at.strftime('%d.%m') if post and post.created_at else 'Дата отсутствует'}",
         f"📦 Количество: {reservation.quantity}",
@@ -1086,11 +1166,12 @@ def show_reservations(message):
 
             status = "✅ Положено" if reservation.is_fulfilled else "⏳ Ожидает выполнения"
             amount = calculate_order_amount(reservation, post)
+            unit_price = reservation_unit_price(reservation, post)
 
             # Формируем описание
             caption = (
                 f"{idx}. Описание: {post.description}\n"
-                f"💰 Цена: {post.price}₽ x {reservation.quantity} = {amount}₽\n"
+                f"💰 Цена: {unit_price}₽ x {reservation.quantity} = {amount}₽\n"
                 f"Статус: {status}"
             )
 
@@ -1133,8 +1214,9 @@ def order_details(call):
 
         status = "✔️ Обработан" if order.is_fulfilled else "⌛ В обработке"
         amount = calculate_order_amount(order, post)
+        unit_price = reservation_unit_price(order, post)
         caption = (
-            f"Цена: {post.price} ₽ x {order.quantity} = {amount} ₽\n"
+            f"Цена: {unit_price} ₽ x {order.quantity} = {amount} ₽\n"
             f"Описание: {post.description}\n"
             f"Статус: {status}"
         )
@@ -1420,6 +1502,11 @@ def handle_enqueue(call):
 
     # Проверяем, существует ли запись уже в TempReservations
     with Session(bind=engine) as session:
+        post = session.query(Posts).filter(Posts.id == post_id).first()
+        if not post:
+            bot.answer_callback_query(call.id, "Товар больше недоступен.", show_alert=True)
+            return
+
         existing_entry = session.query(TempReservations).filter(
             TempReservations.user_id == user_id,
             TempReservations.post_id == post_id,
@@ -1427,10 +1514,18 @@ def handle_enqueue(call):
         ).first()
 
         if existing_entry:
+            bot.answer_callback_query(call.id, "Вы уже стоите в очереди за этим товаром.", show_alert=True)
             return
 
-    # Добавляем в таблицу TempReservations
-    TempReservations.insert(user_id=user_id, quantity=1, post_id=post_id, temp_fulfilled=False)
+        session.add(TempReservations(
+            user_id=user_id,
+            quantity=1,
+            post_id=post_id,
+            temp_fulfilled=False,
+        ))
+        session.commit()
+
+    bot.answer_callback_query(call.id)
     bot.send_message(user_id, "Вы добавлены в очередь. Как только товар станет доступен, вы будете уведомлены.")
 
 # Возврат в меню заказов
@@ -1460,12 +1555,11 @@ def show_delivery_orders(message):
     user_id = message.chat.id  # Получаем ID текущего пользователя
 
     try:
-        # Получаем все записи из таблицы для текущего пользователя
-        all_items = InDelivery.get_all_rows()
-
-        # Фильтруем записи для конкретного user_id
         related_user_ids = get_related_user_ids_by_full_phone(user_id)
-        user_items = [item for item in all_items if item.user_id in related_user_ids]
+        with Session(bind=engine) as session:
+            user_items = session.query(InDelivery).filter(
+                InDelivery.user_id.in_(related_user_ids)
+            ).all()
 
         # Проверяем сами данные
 
@@ -1547,13 +1641,13 @@ def send_delivery_order_page(user_id, message_id, orders, page):
     selected_orders = orders[start:end]  # Текущая страница товаров
 
     # Формируем сообщение для текущей страницы
-    text = f"🚚 *Ваши товары в доставке* (страница {page + 1} из {total_pages}):\n\n"
+    text = f"🚚 Ваши товары в доставке (страница {page + 1} из {total_pages}):\n\n"
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     # Добавляем товары на страницу
     for idx, order in enumerate(selected_orders, start=start + 1):
         text += (
-            f"*{idx})* {order['item_description']}\n"
+            f"{idx}) {order['item_description']}\n"
             f"Количество: {order['quantity']}\n"
             f"Сумма: {order['total_sum']} руб.\n"
             f"➖➖➖➖➖➖➖➖➖➖\n"
@@ -1572,7 +1666,7 @@ def send_delivery_order_page(user_id, message_id, orders, page):
             bot.edit_message_media(
                 chat_id=user_id,
                 message_id=message_id,
-                media=InputMediaAnimation(gif, caption=text, parse_mode="Markdown"),
+                media=InputMediaAnimation(gif, caption=text),
                 reply_markup=keyboard,
             )
         else:  # Иначе отправляем новое сообщение
@@ -1581,7 +1675,6 @@ def send_delivery_order_page(user_id, message_id, orders, page):
                 animation=gif,
                 caption=text,
                 reply_markup=keyboard,
-                parse_mode="Markdown",
             )
 
 # Хэндлер для команды "👔 Назначить работника"
@@ -2195,9 +2288,10 @@ def show_cart_for_client(chat_id, client):
 
 
 def build_cart_item_caption(post, reservation):
+    unit_price = reservation_unit_price(reservation, post)
     return (
         f"Описание: {post.description}\n"
-        f"Цена товара: {post.price} руб.\n"
+        f"Цена товара: {unit_price} руб.\n"
         f"Дата создания: {format_cart_date(post.created_at)}\n"
         f"Количество: {reservation.quantity}\n"
         f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
@@ -2215,10 +2309,10 @@ def send_cart_content(chat_id, reservations, user_id):
         else:
             bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
 
-    # Добавляем кнопку "Расформировать обработанные"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
-    bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
+    bot.send_message(
+        chat_id,
+        "Обработанные товары удаляются только через «🧺 Собрать доставку», чтобы сохранить срез доставки.",
+    )
 
 # Callback для кнопки "Расформировать обработанные"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
@@ -2228,29 +2322,19 @@ def handle_clear_processed(call):
         return
     user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
 
-    # Удаляем только обработанные товары пользователя
-    cleared_items = clear_processed(user_id)
-
-    if cleared_items > 0:
-        bot.send_message(call.message.chat.id,
-                         f"Все обработанные товары (количество: {cleared_items}) были удалены из корзины.")
-    else:
-        bot.send_message(call.message.chat.id, "У пользователя нет обработанных товаров для удаления.")
+    bot.answer_callback_query(
+        call.id,
+        "Удаление обработанных товаров теперь выполняется только через сборку доставки.",
+        show_alert=True,
+    )
 
 # Удаляет обработанные товары из корзины пользователя
 def clear_processed(user_id):
-    # Получаем содержимое корзины пользователя
-    reservations = Reservations.get_row_by_user_id(user_id)
-
-    # Фильтруем только выполненные (обработанные) товары
-    processed_items = [item for item in reservations if item.is_fulfilled]
-
-    # Удаляем обработанные товары из БД
-    for item in processed_items:
-        Reservations.delete_row(item.id)
-
-    # Возвращаем количество удаленных товаров
-    return len(processed_items)
+    logger.warning(
+        "clear_processed is disabled for user_id=%s; use delivery collection cutoff flow instead",
+        user_id,
+    )
+    return 0
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
@@ -2445,7 +2529,11 @@ def handle_post_details(message):
                 chat_id, "Ошибка: Количество должно быть числом. Попробуйте снова."
             )
             return
-        temp_post_data[chat_id]["quantity"] = int(message.text)
+        quantity = int(message.text)
+        if quantity <= 0:
+            bot.send_message(chat_id, "Ошибка: Количество должно быть больше нуля. Попробуйте снова.")
+            return
+        temp_post_data[chat_id]["quantity"] = quantity
 
         # Сохраняем пост
         data = temp_post_data[chat_id]
@@ -2534,21 +2622,19 @@ def manage_posts(message):
                 msg = bot.send_photo(
                     chat_id=user_id,
                     photo=photo,
-                    caption=f"**Пост #{post_id}:**\n"
-                            f"📍 *Описание:* {description}\n"
-                            f"💰 *Цена:* {price} ₽\n"
-                            f"📦 *Количество:* {quantity}",
-                    parse_mode="Markdown",
+                    caption=f"Пост #{post_id}:\n"
+                            f"📍 Описание: {description}\n"
+                            f"💰 Цена: {price} ₽\n"
+                            f"📦 Количество: {quantity}",
                     reply_markup=markup,
                 )
             else:
                 msg = bot.send_message(
                     chat_id=user_id,
-                    text=f"**Пост #{post_id}:**\n"
-                         f"📍 *Описание:* {description}\n"
-                         f"💰 *Цена:* {price} ₽\n"
-                         f"📦 *Количество:* {quantity}",
-                    parse_mode="Markdown",
+                    text=f"Пост #{post_id}:\n"
+                         f"📍 Описание: {description}\n"
+                         f"💰 Цена: {price} ₽\n"
+                         f"📦 Количество: {quantity}",
                     reply_markup=markup,
                 )
             # Сохраняем ID отправленных сообщений
@@ -2662,6 +2748,9 @@ def edit_post_price(message):
             quantity=post.quantity
         )
         if success:
+            updated_post = Posts.get_row_by_id(post_id)
+            if updated_post and updated_post.is_sent:
+                update_channel_post_message(updated_post)
             bot.send_message(user_id, "Цена успешно обновлена!")
         else:
             bot.send_message(user_id, f"Ошибка обновления цены: {msg}")
@@ -2688,6 +2777,9 @@ def edit_post_description(message):
             quantity=post.quantity
         )
         if success:
+            updated_post = Posts.get_row_by_id(post_id)
+            if updated_post and updated_post.is_sent:
+                update_channel_post_message(updated_post)
             bot.send_message(user_id, "Описание успешно обновлено!")
         else:
             bot.send_message(user_id, f"Ошибка обновления описания: {msg}")
@@ -2719,6 +2811,9 @@ def edit_post_quantity(message):
             quantity=new_quantity
         )
         if success:
+            updated_post = Posts.get_row_by_id(post_id)
+            if updated_post and updated_post.is_sent:
+                update_channel_post_message(updated_post)
             bot.send_message(user_id, "Количество успешно обновлено!")
         else:
             bot.send_message(user_id, f"Ошибка обновления количества: {msg}")
@@ -2731,6 +2826,35 @@ def edit_post_quantity(message):
 def delete_post_handler(call):
     post_id = int(call.data.split("_")[2])  # Извлечение ID поста
     try:
+        with Session(bind=engine) as session:
+            post = session.query(Posts).filter(Posts.id == post_id).first()
+            if not post:
+                bot.answer_callback_query(call.id, "Пост не найден.", show_alert=True)
+                return
+
+            has_related_rows = any([
+                session.query(Reservations.id).filter(Reservations.post_id == post_id).first(),
+                session.query(TempReservations.id).filter(TempReservations.post_id == post_id).first(),
+                session.query(Temp_Fulfilled.id).filter(Temp_Fulfilled.post_id == post_id).first(),
+                session.query(InDelivery.id).filter(InDelivery.post_id == post_id).first(),
+            ])
+            if has_related_rows:
+                post.quantity = 0
+                session.commit()
+                disable_channel_post_reservation(post)
+                bot.answer_callback_query(
+                    call.id,
+                    "Пост связан с заказами, поэтому карточка оставлена в базе, а бронь в канале отключена.",
+                    show_alert=True,
+                )
+                safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
+                return
+
+        if post and post.message_id:
+            deleted_from_channel = safe_delete_message(bot, CHANNEL_ID, post.message_id, logger=logger)
+            if not deleted_from_channel:
+                disable_channel_post_reservation(post)
+
         # Удалить пост из базы данных (если успешно)
         result, msg = Posts.delete_row(post_id=post_id)
         if result:
@@ -2795,26 +2919,16 @@ def send_new_posts_to_channel(message):
         for post in posts:
             post_id = post.id
             photo = post.photo
-            price = post.price
-            description = post.description
-            quantity = post.quantity
 
             # Используем user_id из Posts, чтобы найти имя создателя поста в Clients
             creator_user_id = post.chat_id
             creator_name = Clients.get_name_by_user_id(creator_user_id) or "Неизвестный автор"
 
             # Формируем описание поста для канала
-            caption = f"Цена: {price} ₽\nОписание: {description}\nОстаток: {quantity}"
+            caption = build_channel_post_caption(post)
 
             # Добавляем кнопки
-            markup = InlineKeyboardMarkup()
-            reserve_btn = InlineKeyboardButton(
-                "🛒 Забронировать", callback_data=f"reserve_{post_id}"
-            )
-            to_bot_button = InlineKeyboardButton(
-                "В бота", url=f"{bot_link}?start=start"
-            )
-            markup.add(reserve_btn, to_bot_button)
+            markup = build_channel_post_markup(post)
 
 
 
@@ -2985,7 +3099,30 @@ def handle_delivery_response_callback(call):
         bot.send_message(chat_id=user_id,
                          text="Извините, но лист на доставку уже сформирован. Ожидайте следующую отправку.")
     elif response == "delivery_yes":
-        # Если согласие до 14:00, запрашиваем адрес
+        current_state = get_user_state(user_id)
+        existing_temp = temp_user_data.get(user_id, {})
+        if not isinstance(existing_temp, dict):
+            existing_temp = {}
+
+        active_delivery_states = {
+            "WAITING_FOR_ADDRESS",
+            "WAITING_FOR_CONFIRMATION",
+            "WAITING_FOR_DATA_EDIT",
+            "WAITING_FOR_NEW_ADDRESS",
+            "WAITING_FOR_NEW_PHONE",
+        }
+        existing_cutoff = parse_datetime(existing_temp.get("delivery_cutoff_at"))
+        delivery_cutoff_at = (
+            existing_cutoff
+            if current_state in active_delivery_states and existing_cutoff
+            else now_local()
+        )
+        temp_user_data[user_id] = {
+            **existing_temp,
+            "delivery_cutoff_at": serialize_datetime(delivery_cutoff_at),
+        }
+
+        # Если согласие до 16:00, запрашиваем адрес
         bot.send_message(chat_id=user_id, text="Пожалуйста, укажите город, адрес и подъезд")
         # Сохраняем состояние пользователя для дальнейшего ввода адреса
         set_user_state(user_id, "WAITING_FOR_ADDRESS")
@@ -3012,14 +3149,19 @@ def handle_address_input(message):
     name = user_data.name
     phone = user_data.phone
     logger.debug("Delivery user data loaded for user_id=%s", user_id)
-    delivery_cutoff_at = now_local()
+    existing_temp = temp_user_data.get(user_id, {})
+    if not isinstance(existing_temp, dict):
+        existing_temp = {}
+    delivery_cutoff_at = parse_datetime(existing_temp.get("delivery_cutoff_at")) or now_local()
     # Вычисление суммы заказов пользователя
     user_orders_sum = calculate_sum_for_user(user_id, cutoff_at=delivery_cutoff_at)
     logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     # Поиск всех пользователей с таким же телефоном
     from db import Session, engine
     with Session(bind=engine) as session:
-        same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
+        same_phone_users = session.query(Clients).filter(
+            Clients.phone.in_(phone_variants(phone))
+        ).all()
     if not same_phone_users:
         logger.warning("No related delivery users found for user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Ошибка! Не удалось найти других заказов с данным номером телефона.")
@@ -3050,6 +3192,7 @@ def handle_address_input(message):
     )
     # Сохраняем данные во временном хранилище
     temp_user_data[user_id] = {
+        **existing_temp,
         "name": name,
         "phone": phone,
         "final_sum": user_orders_sum,
@@ -3080,7 +3223,8 @@ def calculate_sum_for_user(user_id, cutoff_at=None):
     with Session(bind=engine) as session:
         query = session.query(
             func.sum(
-                (Posts.price * Reservations.quantity) - func.coalesce(Reservations.return_order, 0)
+                (func.coalesce(Reservations.old_price, Posts.price) * Reservations.quantity)
+                - func.coalesce(Reservations.return_order, 0)
             ).label("final_sum")
         ).select_from(
             Reservations
@@ -3214,10 +3358,9 @@ def process_numbers(message):
         for phone in phone_numbers:
             with Session(bind=engine) as session:
                 # Найти клиента по номеру телефона
-                clients = [
-                    client_row for client_row in session.query(Clients).all()
-                    if normalize_phone(client_row.phone) == phone
-                ]
+                clients = session.query(Clients).filter(
+                    Clients.phone.in_(phone_variants(phone))
+                ).order_by(Clients.id).all()
                 client = clients[0] if clients else None
                 if not client:
                     bot.send_message(message.chat.id, f"Клиент с номером {phone} не найден.")
@@ -3240,7 +3383,7 @@ def process_numbers(message):
                 for reservation in reservations:
                     post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
                     if post:
-                        total_sum += (reservation.quantity * post.price) - (reservation.return_order or 0)
+                        total_sum += calculate_order_amount(reservation, post)
 
                 # Добавление данных в таблицу ForDelivery
                 if total_sum > 0:
@@ -3325,13 +3468,46 @@ def archive_delivery_to_excel(message):
     bot.send_document(chat_id=delivery_archive, document=document)
 
     # Уведомление пользователя об отправке
-    bot.send_message(message.chat.id, "Архив доставок отправлен в канал!")
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(
+        InlineKeyboardButton("🧹 Очистить in_delivery", callback_data="archive_delivery_clear_yes")
+    )
+    keyboard.add(
+        InlineKeyboardButton("Оставить записи", callback_data="archive_delivery_clear_no")
+    )
+    bot.send_message(
+        message.chat.id,
+        "Архив доставок отправлен в канал. Очистить таблицу in_delivery?",
+        reply_markup=keyboard,
+    )
 
-    # Очистка таблицы in_delivery
+
+@bot.callback_query_handler(func=lambda call: call.data in ["archive_delivery_clear_yes", "archive_delivery_clear_no"])
+def handle_archive_delivery_clear_confirmation(call):
+    if not has_role(call.from_user.id, DELIVERY_ROLES):
+        bot.answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+
+    if call.data == "archive_delivery_clear_no":
+        safe_edit_message_text(
+            bot,
+            logger=logger,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="Записи in_delivery оставлены без изменений.",
+        )
+        bot.answer_callback_query(call.id)
+        return
+
     InDelivery.clear_table()
-
-    # Уведомление об успешной очистке
-    bot.send_message(message.chat.id, "Все записи из таблицы in_delivery удалены.")
+    safe_edit_message_text(
+        bot,
+        logger=logger,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="Все записи из in_delivery удалены после подтверждения.",
+    )
+    bot.answer_callback_query(call.id)
 
 def keyboard_for_editing():
     keyboard = types.InlineKeyboardMarkup()
@@ -3400,7 +3576,9 @@ def handle_new_address(message):
     # Получаем всех клиентов с таким же номером телефона
     from db import Session, engine
     with Session(bind=engine) as session:
-        same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
+        same_phone_users = session.query(Clients).filter(
+            Clients.phone.in_(phone_variants(phone))
+        ).all()
 
     # Считаем общую сумму заказов и собираем имена всех клиентов
     total_sum_by_phone = final_sum
@@ -3452,7 +3630,9 @@ def handle_new_phone(message):
     with Session(bind=engine) as session:
         try:
             # Найти всех клиентов с текущим (старым) номером телефона
-            same_phone_users = session.query(Clients).filter(Clients.phone == current_phone).all()
+            same_phone_users = session.query(Clients).filter(
+                Clients.phone.in_(phone_variants(current_phone))
+            ).all()
 
 
         except Exception as e:
@@ -3556,7 +3736,9 @@ def handle_confirmation(call):
                 total_sum_by_phone = final_sum
                 all_names = [name]
 
-                same_phone_users = session.query(Clients).filter(Clients.phone == old_phone).all()
+                same_phone_users = session.query(Clients).filter(
+                    Clients.phone.in_(phone_variants(old_phone))
+                ).all()
 
                 if same_phone_users:
                     logger.debug(
@@ -3737,11 +3919,10 @@ def get_related_delivery_user_ids(session, delivery_entry):
     if not source_phone:
         return [delivery_entry.user_id]
 
-    related_clients = session.query(Clients).all()
-    related_user_ids = [
-        row.user_id for row in related_clients
-        if normalize_phone(row.phone) == source_phone
-    ]
+    related_clients = session.query(Clients).filter(
+        Clients.phone.in_(phone_variants(source_phone))
+    ).all()
+    related_user_ids = [row.user_id for row in related_clients]
     return related_user_ids or [delivery_entry.user_id]
 
 
@@ -3761,17 +3942,19 @@ def get_delivery_entry_cart_items(session, delivery_entry):
 
     grouped_items = {}
     for reservation, post, client in rows:
-        if post.id not in grouped_items:
-            grouped_items[post.id] = {
+        unit_price = reservation_unit_price(reservation, post)
+        item_key = (post.id, unit_price)
+        if item_key not in grouped_items:
+            grouped_items[item_key] = {
                 "post_id": post.id,
                 "photo": post.photo,
                 "description": post.description,
-                "unit_price": post.price,
+                "unit_price": unit_price,
                 "quantity": 0,
                 "total_price": 0,
                 "names": set(),
             }
-        item = grouped_items[post.id]
+        item = grouped_items[item_key]
         item["quantity"] += reservation.quantity
         item["total_price"] += calculate_order_amount(reservation, post)
         if client and client.name:
@@ -3923,15 +4106,34 @@ def move_for_delivery_to_in_delivery(delivery_id):
         if not reservations:
             return False, "У клиента нет обработанных товаров в срезе этой доставки.", 0
 
+        post_ids = {reservation.post_id for reservation in reservations}
+        posts_by_id = {
+            post.id: post
+            for post in session.query(Posts).filter(Posts.id.in_(post_ids)).all()
+        }
+        missing_reservations = [
+            reservation.id for reservation in reservations
+            if reservation.post_id not in posts_by_id
+        ]
+        if missing_reservations:
+            return (
+                False,
+                "Перенос остановлен: у части броней удалены карточки товаров. "
+                f"Проблемных строк: {len(missing_reservations)}.",
+                0,
+            )
+
+        clients_by_user_id = {
+            client.user_id: client
+            for client in session.query(Clients).filter(
+                Clients.user_id.in_({reservation.user_id for reservation in reservations})
+            ).all()
+        }
+
         moved_count = 0
         for reservation in reservations:
-            post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
-            if not post:
-                continue
-
-            reservation_client = session.query(Clients).filter(
-                Clients.user_id == reservation.user_id
-            ).first()
+            post = posts_by_id[reservation.post_id]
+            reservation_client = clients_by_user_id.get(reservation.user_id)
 
             session.add(InDelivery(
                 reservation_id=reservation.id,
@@ -3961,9 +4163,6 @@ def move_for_delivery_to_in_delivery(delivery_id):
 
             session.delete(reservation)
             moved_count += 1
-
-        if moved_count == 0:
-            return False, "Не удалось перенести товары: посты не найдены.", 0
 
         session.delete(delivery_entry)
         session.commit()
@@ -4330,13 +4529,13 @@ def handle_defect_reason(message):
             # Формируем текст сообщения
             message_text = (
                 f"⚠️ Заявка на возврат брака:\n\n"
-                f"👤 **Клиент:** {item.user_name}\n"
-                f"📞 **Номер телефона:** {client.phone or 'Не указан'}\n"
-                f"📦 **Товар:** {post.description}\n"
-                f"❌ **Причина:** {reason}\n"
-                f"🕒 **Время с покупки:** {days_since_purchase} дней назад\n"
-                f"💰 **Сумма:** {item.price}₽\n"
-                f"📅 **Дата покупки:** {item.created_at.strftime('%d.%m.%Y')}"
+                f"👤 Клиент: {item.user_name}\n"
+                f"📞 Номер телефона: {client.phone or 'Не указан'}\n"
+                f"📦 Товар: {post.description}\n"
+                f"❌ Причина: {reason}\n"
+                f"🕒 Время с покупки: {days_since_purchase} дней назад\n"
+                f"💰 Сумма: {item.price}₽\n"
+                f"📅 Дата покупки: {item.created_at.strftime('%d.%m.%Y')}"
             )
 
             # Создаем inline клавиатуру с кнопками
@@ -4354,7 +4553,6 @@ def handle_defect_reason(message):
                     photo=post.photo,  # Фото из таблицы Posts
                     caption=message_text,
                     reply_markup=markup,
-                    parse_mode="Markdown"  # Используем Markdown для форматирования
                 )
             else:
                 # Если фото отсутствует, отправляем только текст
@@ -4362,7 +4560,6 @@ def handle_defect_reason(message):
                     admin.user_id,
                     message_text,
                     reply_markup=markup,
-                    parse_mode="Markdown"
                 )
 
     bot.send_message(user_id, "Ваш запрос отправлен администратору. Спасибо!")
