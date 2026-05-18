@@ -233,6 +233,35 @@ def test_post_management_only_shows_unpublished_posts():
         raise AssertionError("audit repost flow must clear old channel message_id")
 
 
+def test_post_dates_use_samara_and_shift_sunday():
+    posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
+    main_text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        'SAMARA_TZ = ZoneInfo("Europe/Samara")',
+        "def normalize_post_created_at(value=None):",
+        "def default_post_created_at():",
+        "datetime.now(SAMARA_TZ).replace(tzinfo=None)",
+        "if value.weekday() == 6:",
+        "value = value + timedelta(days=1)",
+        "default=default_post_created_at",
+        "created_at=normalize_post_created_at(created_at)",
+        "def next_created_at(value=None):",
+    ]:
+        if marker not in posts_text:
+            raise AssertionError(f"Samara post date marker missing {marker}")
+
+    for marker in [
+        "def now_local():",
+        "return now_samara().replace(tzinfo=None)",
+        "now = Posts.next_created_at()",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"Samara bot time marker missing {marker}")
+
+    if "datetime.utcnow" in posts_text:
+        raise AssertionError("post logic must not use UTC time")
+
+
 def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
     text = MAIN.read_text(encoding="utf-8")
     block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
@@ -344,6 +373,7 @@ def main():
     test_phoenix_broadcast_markers()
     test_channel_post_auto_publish_markers()
     test_post_management_only_shows_unpublished_posts()
+    test_post_dates_use_samara_and_shift_sunday()
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()

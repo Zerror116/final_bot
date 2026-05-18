@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 
 def now_local():
-    return datetime.now()
+    return now_samara().replace(tzinfo=None)
 
 
 def now_samara():
@@ -3092,7 +3092,7 @@ def send_new_posts_to_channel(message):
 def handle_statistic(message):
     from datetime import datetime, timedelta
 
-    today = datetime.now()
+    today = now_local()
     monday = today - timedelta(days=today.weekday())
     last_monday = monday - timedelta(days=7)
     last_sunday = monday - timedelta(days=1)
@@ -3311,7 +3311,7 @@ def handle_delivery_response_callback(call):
         response = "delivery_no"
 
     # Проверяем текущее время
-    current_time = datetime.now().time()  # Текущее локальное время
+    current_time = now_local().time()  # Текущее самарское время
 
     if response == "delivery_yes" and current_time.hour >= 16:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
@@ -3682,7 +3682,7 @@ def archive_delivery_to_excel(message):
     output.seek(0)  # Перемещение курсора в начало файла
 
     # Указание имени файла через InputFile
-    file_name = f"Архив_доставок_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    file_name = f"Архив_доставок_{now_local().strftime('%Y-%m-%d')}.xlsx"
     document =  InputFile(output, file_name=file_name)
 
     # Отправка файла в канал delivery_archive
@@ -4507,7 +4507,7 @@ def manage_audit_posts(message):
 
 
 def apply_auto_audit_for_date(selected_date, audit_user_id):
-    now = datetime.now()
+    now = Posts.next_created_at()
     today_start = datetime.combine(now.date(), datetime.min.time())
     summary = {
         "processed_count": 0,
@@ -4745,7 +4745,7 @@ def handle_defect_reason(message):
 
         for admin in admin_users:
             # Считаем, сколько времени прошло с момента покупки
-            time_since_purchase = datetime.now() - item.created_at
+            time_since_purchase = now_local() - item.created_at
             days_since_purchase = time_since_purchase.days
 
             # Формируем текст сообщения

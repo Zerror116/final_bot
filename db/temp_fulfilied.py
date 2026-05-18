@@ -1,8 +1,16 @@
 import datetime
+from zoneinfo import ZoneInfo
 from sqlalchemy import String, BIGINT, Boolean, DateTime, Index, Integer
 from sqlalchemy.exc import SQLAlchemyError
 from .db import AbstractModel
 from sqlalchemy.orm import mapped_column, Session
+
+
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def local_now_naive():
+    return datetime.datetime.now(SAMARA_TZ).replace(tzinfo=None)
 
 
 class Temp_Fulfilled(AbstractModel):
@@ -25,7 +33,7 @@ class Temp_Fulfilled(AbstractModel):
     defect = mapped_column(Boolean, nullable=False, default=0)
     skidka = mapped_column(Boolean, nullable=False, default=0)
     skidka_price = mapped_column(Integer, nullable=False, default=0)
-    created_at = mapped_column(DateTime, default=datetime.datetime.now)
+    created_at = mapped_column(DateTime, default=local_now_naive)
 
     @staticmethod
     def insert(session: Session, post_id: int, user_id: int, user_name: str,
@@ -109,7 +117,7 @@ class Temp_Fulfilled(AbstractModel):
     def cleanup_old_records(session: Session) -> int:
         """Удаляет записи, которые старше 7 дней."""
         try:
-            limit_date = datetime.datetime.now() - datetime.timedelta(days=7)
+            limit_date = local_now_naive() - datetime.timedelta(days=7)
             old_records = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.created_at < limit_date).all()
 
             deleted_count = len(old_records)

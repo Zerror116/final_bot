@@ -7,12 +7,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import mapped_column, Session
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from . import Posts
 from .db import AbstractModel, engine
 
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
 def local_now_naive():
-    return datetime.now()
+    return datetime.now(SAMARA_TZ).replace(tzinfo=None)
 
 
 class Reservations(AbstractModel):

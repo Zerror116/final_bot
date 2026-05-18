@@ -1,4 +1,5 @@
 import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     String,
@@ -9,6 +10,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import mapped_column, Session
 from .db import AbstractModel, engine
+
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def local_now_naive():
+    return datetime.datetime.now(SAMARA_TZ).replace(tzinfo=None)
+
 
 class InDelivery(AbstractModel):
     __tablename__ = "in_delivery"
@@ -26,7 +34,7 @@ class InDelivery(AbstractModel):
     quantity = mapped_column(Integer, nullable=False)
     price = mapped_column(Integer, nullable=False)
     delivery_address = mapped_column(String, nullable=False)
-    data = mapped_column(DateTime, nullable=False, default=datetime.datetime.now())
+    data = mapped_column(DateTime, nullable=False, default=local_now_naive)
 
     @staticmethod
     def insert(post_id, user_id, user_name, item_description, quantity, price, delivery_address, reservation_id=None):

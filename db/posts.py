@@ -1,10 +1,33 @@
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, func, Index
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
+
+
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def samara_now_naive():
+    return datetime.now(SAMARA_TZ).replace(tzinfo=None)
+
+
+def normalize_post_created_at(value=None):
+    value = value or samara_now_naive()
+    if value.tzinfo is not None:
+        value = value.astimezone(SAMARA_TZ).replace(tzinfo=None)
+
+    if value.weekday() == 6:
+        value = value + timedelta(days=1)
+    return value
+
+
+def default_post_created_at():
+    return normalize_post_created_at()
+
 
 class Posts(AbstractModel):
     __tablename__ = "posts"
@@ -22,17 +45,22 @@ class Posts(AbstractModel):
     message_id = mapped_column(BIGINT, nullable=True)
     quantity = mapped_column(Integer, nullable=False)
     is_sent = mapped_column(Boolean, nullable=False, default=0)
-    created_at = mapped_column(DateTime, nullable=False, default=func.now())
+    created_at = mapped_column(DateTime, nullable=False, default=default_post_created_at)
 
     @staticmethod
-    def insert(chat_id: int, photo: str, price: str, description: str, quantity: int):
+    def next_created_at(value=None):
+        return normalize_post_created_at(value)
+
+    @staticmethod
+    def insert(chat_id: int, photo: str, price: str, description: str, quantity: int, created_at: datetime = None):
         with Session(bind=engine) as session:
             posts = Posts(
                 chat_id=chat_id,
                 photo=photo,
                 price=price,
                 description=description,
-                quantity=quantity
+                quantity=quantity,
+                created_at=normalize_post_created_at(created_at),
             )
             session.add(posts)
             session.commit()
@@ -85,7 +113,7 @@ class Posts(AbstractModel):
             if is_sent is not None:
                 post.is_sent = is_sent
             if created_at is not None:
-                post.created_at = created_at
+                post.created_at = normalize_post_created_at(created_at)
             if chat_id is not None:  # Добавлено обновление chat_id
                 post.chat_id = chat_id
 
@@ -128,7 +156,7 @@ class Posts(AbstractModel):
     @staticmethod
     def get_posts_in_last_week(chat_id: int):
         """Получение постов за последние 7 дней."""
-        now = datetime.utcnow()  # Текущее время
+        now = samara_now_naive()  # Текущее время по Самаре
         last_week = now - timedelta(days=7)  # Временной интервал: последние 7 дней
 
         with Session(bind=engine) as session:
