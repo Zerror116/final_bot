@@ -3003,12 +3003,13 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
 
             time.sleep(4)
 
-        phoenix_footer_sent = send_phoenix_channel_footer()
+        if source == "auto":
+            send_phoenix_channel_footer()
+
         if notify_chat_id:
-            footer_text = " Сообщение о Фениксе отправлено в канал." if phoenix_footer_sent else ""
             bot.send_message(
                 notify_chat_id,
-                f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.{footer_text}",
+                f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.",
             )
         logger.info("Channel post publish completed: sent=%s source=%s", sent_count, source)
         return sent_count
