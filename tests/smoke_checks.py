@@ -138,6 +138,24 @@ def test_channel_post_updates_are_centralized():
             raise AssertionError(f"channel post update helper missing {marker}")
 
 
+def test_sold_out_channel_delete_keeps_reserved_group():
+    text = MAIN.read_text(encoding="utf-8")
+    required = [
+        "def delete_channel_post_if_fully_processed",
+        "bot.delete_message(chat_id=CHANNEL_ID",
+        "Reservations.is_fulfilled == False",
+        "fulfilled_post_ids.add(reservation.post_id)",
+        "delete_channel_post_if_fully_processed(post_id)",
+    ]
+    for marker in required:
+        if marker not in text:
+            raise AssertionError(f"sold-out channel deletion missing {marker}")
+
+    helper = text.split("def delete_channel_post_if_fully_processed", 1)[1].split("def build_telegram_proxy_url", 1)[0]
+    if "TARGET_GROUP_ID" in helper:
+        raise AssertionError("sold-out channel deletion must not touch reserved group messages")
+
+
 class RaisingBot:
     def __init__(self, exc):
         self.exc = exc
@@ -177,6 +195,7 @@ def main():
     test_reserved_group_flow_markers()
     test_reservation_auto_fulfill_uses_local_time()
     test_channel_post_updates_are_centralized()
+    test_sold_out_channel_delete_keeps_reserved_group()
     test_telegram_safe_helpers()
     print("smoke checks ok")
 

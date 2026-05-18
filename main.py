@@ -112,6 +112,41 @@ def update_channel_post_message(post):
         return False
 
 
+def delete_channel_post_if_fully_processed(post_id):
+    with Session(bind=engine) as session:
+        post = session.query(Posts).filter(Posts.id == post_id).first()
+        if not post or not post.message_id:
+            return False
+
+        if post.quantity > 0:
+            return False
+
+        pending_reservation = session.query(Reservations.id).filter(
+            Reservations.post_id == post_id,
+            Reservations.is_fulfilled == False,
+        ).first()
+        if pending_reservation:
+            return False
+
+        message_id = post.message_id
+        try:
+            bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
+        except Exception as exc:
+            if "message to delete not found" not in str(exc).lower():
+                logger.warning(
+                    "Sold-out channel post delete failed for post_id=%s message_id=%s: %s",
+                    post_id,
+                    message_id,
+                    exc,
+                )
+                return False
+
+        post.message_id = None
+        session.commit()
+        logger.info("Deleted sold-out channel post for post_id=%s message_id=%s", post_id, message_id)
+        return True
+
+
 def build_telegram_proxy_url():
     proxy_url = os.environ.get("TELEGRAM_PROXY_URL")
     if proxy_url:
@@ -981,16 +1016,20 @@ def auto_fulfill_expired_reservations(now=None, older_than_seconds=RESERVATION_A
 
         fulfilled_count = 0
         fulfilled_ids = []
+        fulfilled_post_ids = set()
         for reservation in expired_reservations:
             if ensure_temp_fulfilled_for_reservation(session, reservation):
                 fulfilled_count += 1
                 fulfilled_ids.append(reservation.id)
+                fulfilled_post_ids.add(reservation.post_id)
 
         if fulfilled_count:
             session.commit()
 
         for reservation_id in fulfilled_ids:
             update_reserved_group_message_by_id(reservation_id)
+        for post_id in fulfilled_post_ids:
+            delete_channel_post_if_fully_processed(post_id)
 
         return fulfilled_count
 
