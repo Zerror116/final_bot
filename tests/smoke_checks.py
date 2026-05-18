@@ -197,6 +197,23 @@ def test_phoenix_broadcast_markers():
         raise AssertionError("Phoenix broadcast button missing from creator menu")
 
 
+def test_channel_post_auto_publish_markers():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        'AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}',
+        'SAMARA_TZ = ZoneInfo("Europe/Samara")',
+        "channel_post_publish_lock = threading.Lock()",
+        "def publish_unsent_posts_to_channel(",
+        "Отправка постов в канал уже выполняется",
+        "def should_auto_publish_channel_posts(value):",
+        "value.minute == 0",
+        "def start_channel_post_auto_publish_worker():",
+        "start_channel_post_auto_publish_worker()",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"channel post auto publish marker missing {marker}")
+
+
 def test_reservation_creation_is_atomic_and_missing_posts_do_not_queue():
     text = MAIN.read_text(encoding="utf-8")
     block = text.split("def handle_reservation(call):", 1)[1].split("# Получение бронирования пользователя", 1)[0]
@@ -306,6 +323,7 @@ def main():
     test_channel_post_updates_are_centralized()
     test_callback_answers_are_safe()
     test_phoenix_broadcast_markers()
+    test_channel_post_auto_publish_markers()
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()

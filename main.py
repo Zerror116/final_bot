@@ -7,6 +7,7 @@ import time
 import telebot
 import locale
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
@@ -47,6 +48,9 @@ RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
 DELIVERY_COLLECTION_PAGE_SIZE = 8
 LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
+AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -71,6 +75,10 @@ logger = logging.getLogger(__name__)
 
 def now_local():
     return datetime.now()
+
+
+def now_samara():
+    return datetime.now(SAMARA_TZ)
 
 
 def build_channel_post_caption(post):
@@ -287,6 +295,9 @@ active_audit = {}
 reservation_auto_fulfill_started = False
 reservation_auto_fulfill_stop_event = threading.Event()
 phoenix_broadcast_lock = threading.Lock()
+channel_post_publish_lock = threading.Lock()
+channel_post_auto_publish_started = False
+channel_post_auto_publish_stop_event = threading.Event()
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -2946,60 +2957,117 @@ def go_back(message):
             message.chat.id, "Произошла ошибка. Пожалуйста, попробуйте снова позже."
         )
 
+def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
+    if not channel_post_publish_lock.acquire(blocking=False):
+        if notify_chat_id:
+            bot.send_message(
+                notify_chat_id,
+                "Отправка постов в канал уже выполняется. Дождитесь окончания, чтобы не создать дубли.",
+            )
+        logger.info("Channel post publish skipped: already running, source=%s", source)
+        return 0
+
+    sent_count = 0
+    try:
+        posts = Posts.get_unsent_posts()
+        if not posts:
+            if notify_chat_id:
+                bot.send_message(notify_chat_id, "Нет новых постов для отправки.")
+            logger.info("Channel post publish found no unsent posts, source=%s", source)
+            return 0
+
+        if notify_chat_id:
+            bot.send_message(notify_chat_id, f"Начинаю отправку постов в канал. Постов: {len(posts)}.")
+
+        for post in posts:
+            post_id = post.id
+            photo = post.photo
+            creator_name = Clients.get_name_by_user_id(post.chat_id) or "Неизвестный автор"
+            caption = build_channel_post_caption(post)
+            markup = build_channel_post_markup(post)
+
+            sent_message = bot.send_photo(
+                CHANNEL_ID,
+                photo=photo,
+                caption=caption,
+                reply_markup=markup,
+            )
+            Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
+            sent_count += 1
+
+            group_caption = f"Пост был создан пользователем: {creator_name}\n\n{caption}"
+            try:
+                bot.send_photo(ARCHIVE, photo=photo, caption=group_caption)
+            except Exception as exc:
+                logger.warning("Archive copy failed for post_id=%s: %s", post_id, exc)
+
+            time.sleep(4)
+
+        if notify_chat_id:
+            bot.send_message(
+                notify_chat_id,
+                f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.",
+            )
+        logger.info("Channel post publish completed: sent=%s source=%s", sent_count, source)
+        return sent_count
+    except Exception as exc:
+        logger.exception("Channel post publish failed, source=%s: %s", source, exc)
+        if notify_chat_id:
+            bot.send_message(notify_chat_id, f"Ошибка при отправке постов: {exc}")
+        return sent_count
+    finally:
+        channel_post_publish_lock.release()
+
+
+def should_auto_publish_channel_posts(value):
+    return (
+        value.hour in AUTO_CHANNEL_POST_HOURS
+        and value.minute == 0
+    )
+
+
+def channel_post_auto_publish_loop():
+    last_slot = None
+    while True:
+        try:
+            current = now_samara()
+            slot = (current.date(), current.hour)
+            if should_auto_publish_channel_posts(current) and slot != last_slot:
+                last_slot = slot
+                logger.info("Auto channel post publish started for Samara slot %s:00", current.hour)
+                publish_unsent_posts_to_channel(source="auto")
+        except Exception:
+            logger.exception("Auto channel post publish loop failed")
+
+        if channel_post_auto_publish_stop_event.wait(AUTO_CHANNEL_POST_CHECK_SECONDS):
+            return
+
+
+def start_channel_post_auto_publish_worker():
+    global channel_post_auto_publish_started
+    if channel_post_auto_publish_started:
+        return
+
+    channel_post_auto_publish_started = True
+    thread = threading.Thread(
+        target=channel_post_auto_publish_loop,
+        name="channel-post-auto-publish",
+        daemon=True,
+    )
+    thread.start()
+
+
 # Отправка в канал
 @bot.message_handler(func=lambda message: message.text == "📢 Отправить посты в канал")
 def send_new_posts_to_channel(message):
     user_id = message.chat.id
     role = get_client_role(user_id)
 
-    # Проверяем, есть ли права на отправку постов
-    if role not in ["admin","supreme_leader"]:
+    if role not in ["admin", "supreme_leader"]:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    # Получаем посты, которые ещё не были отправлены в канал
-    posts = Posts.get_unsent_posts()
-
-    if posts:
-        for post in posts:
-            post_id = post.id
-            photo = post.photo
-
-            # Используем user_id из Posts, чтобы найти имя создателя поста в Clients
-            creator_user_id = post.chat_id
-            creator_name = Clients.get_name_by_user_id(creator_user_id) or "Неизвестный автор"
-
-            # Формируем описание поста для канала
-            caption = build_channel_post_caption(post)
-
-            # Добавляем кнопки
-            markup = build_channel_post_markup(post)
-
-
-
-            # Отправка поста в канал
-            sent_message = bot.send_photo(
-                CHANNEL_ID, photo=photo, caption=caption, reply_markup=markup
-            )
-
-            # Формируем сообщение для группы
-            group_caption = (
-                f"Пост был создан пользователем: {creator_name}\n\n{caption}"
-            )
-            bot.send_photo(ARCHIVE, photo=photo, caption=group_caption)
-
-            # Обновляем статус публикации
-            Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
-
-            # Задержка секунда перед отправкой следующего поста
-            time.sleep(4)
-
-        bot.send_message(
-            user_id,
-            f"✅ Все новые посты ({len(posts)}) успешно отправлены в канал и группу.",
-        )
-    else:
-        bot.send_message(user_id, "Нет новых постов для отправки.")
+    publish_unsent_posts_to_channel(notify_chat_id=user_id, source="manual")
 
 # Статистика
 @bot.message_handler(commands=['statistic'])
@@ -4904,6 +4972,7 @@ def contact_client(call, user_id):
 # Запуск бота
 def run_bot():
     start_reservation_auto_fulfill_worker()
+    start_channel_post_auto_publish_worker()
     retry_delay = 5
 
     while True:
