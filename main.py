@@ -3003,10 +3003,12 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
 
             time.sleep(4)
 
+        phoenix_footer_sent = send_phoenix_channel_footer()
         if notify_chat_id:
+            footer_text = " Сообщение о Фениксе отправлено в канал." if phoenix_footer_sent else ""
             bot.send_message(
                 notify_chat_id,
-                f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.",
+                f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.{footer_text}",
             )
         logger.info("Channel post publish completed: sent=%s source=%s", sent_count, source)
         return sent_count
@@ -3017,6 +3019,21 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
         return sent_count
     finally:
         channel_post_publish_lock.release()
+
+
+def send_phoenix_channel_footer():
+    try:
+        with open(PHOENIX_QR_PATH, "rb") as photo:
+            bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=photo,
+                caption=PHOENIX_BROADCAST_TEXT,
+            )
+        logger.info("Phoenix footer sent to channel after post publish")
+        return True
+    except Exception as exc:
+        logger.warning("Phoenix footer send failed after post publish: %s", exc)
+        return False
 
 
 def should_auto_publish_channel_posts(value):

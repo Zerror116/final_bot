@@ -209,6 +209,9 @@ def test_channel_post_auto_publish_markers():
         "value.minute == 0",
         "def start_channel_post_auto_publish_worker():",
         "start_channel_post_auto_publish_worker()",
+        "def send_phoenix_channel_footer():",
+        "phoenix_footer_sent = send_phoenix_channel_footer()",
+        "Phoenix footer sent to channel after post publish",
     ]:
         if marker not in text:
             raise AssertionError(f"channel post auto publish marker missing {marker}")
