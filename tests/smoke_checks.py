@@ -330,6 +330,21 @@ def test_sold_out_channel_delete_keeps_reserved_group():
         raise AssertionError("sold-out channel deletion must not touch reserved group messages")
 
 
+def test_delivery_clients_summary_markers():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        '"Список Клиентов"',
+        "def get_delivery_clients_summary():",
+        "total_orders_sum",
+        "processed_orders_sum",
+        'group["processed_orders_sum"] < DELIVERY_THRESHOLD',
+        'key=lambda row: (row["processed_orders_sum"], row["total_orders_sum"])',
+        "def build_delivery_clients_summary_messages",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"delivery clients summary marker missing {marker}")
+
+
 class RaisingBot:
     def __init__(self, exc):
         self.exc = exc
@@ -380,6 +395,7 @@ def main():
     test_delivery_move_and_archive_are_loss_safe()
     test_cart_clear_processed_is_available()
     test_sold_out_channel_delete_keeps_reserved_group()
+    test_delivery_clients_summary_markers()
     test_telegram_safe_helpers()
     print("smoke checks ok")
 

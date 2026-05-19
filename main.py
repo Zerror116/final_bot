@@ -2230,8 +2230,35 @@ def handle_delivery_management(message):
         return
     # Создаем клавиатуру с кнопками
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("📤 Отправить рассылку", "👨‍🦯 Засунуть в доставку", "🧺 Собрать доставку", "🗄 Архив доставки", "⬅️ Назад")
+    markup.add(
+        "📤 Отправить рассылку",
+        "👨‍🦯 Засунуть в доставку",
+        "🧺 Собрать доставку",
+        "Список Клиентов",
+        "🗄 Архив доставки",
+        "⬅️ Назад",
+    )
     bot.send_message(message.chat.id, "Выберите действие:", reply_markup=markup)
+
+
+@bot.message_handler(func=lambda message: message.text == "Список Клиентов")
+def show_delivery_clients_summary(message):
+    if not require_role(message, DELIVERY_ROLES):
+        return
+
+    clients = get_delivery_clients_summary()
+    if not clients:
+        bot.send_message(
+            message.chat.id,
+            f"Клиентов с обработанными заказами на {DELIVERY_THRESHOLD} ₽ и более не найдено.",
+        )
+        return
+
+    messages = build_delivery_clients_summary_messages(clients)
+    for text in messages:
+        bot.send_message(message.chat.id, text)
+        time.sleep(0.2)
+
 
 # Хэедлнр для поиска по последним 4 цифрам номера
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "AWAITING_PHONE_LAST_4")
@@ -2305,6 +2332,10 @@ def format_admin_phone(phone):
 
 def truncate_button_text(text, max_length=60):
     return text if len(text) <= max_length else f"{text[:max_length - 3]}..."
+
+
+def format_money(value):
+    return int(value or 0)
 
 
 def format_cart_date(value):
@@ -4121,6 +4152,79 @@ def calculate_for_delivery():
         })
 
     return delivery_users
+
+
+def get_delivery_clients_summary():
+    with Session(bind=engine) as session:
+        rows = session.query(Reservations, Posts, Clients).join(
+            Posts, Posts.id == Reservations.post_id
+        ).join(
+            Clients, Clients.user_id == Reservations.user_id
+        ).all()
+
+    grouped_by_phone = {}
+    for reservation, post, client in rows:
+        phone = normalize_phone(client.phone)
+        phone_key = phone or f"user:{client.user_id}"
+        group = grouped_by_phone.setdefault(phone_key, {
+            "phone": phone or "номер не указан",
+            "names": set(),
+            "total_orders_sum": 0,
+            "processed_orders_sum": 0,
+        })
+
+        group["names"].add(client.name or "Имя не указано")
+        amount = calculate_order_amount(reservation, post)
+        group["total_orders_sum"] += amount
+        if reservation.is_fulfilled:
+            group["processed_orders_sum"] += amount
+
+    clients = []
+    for group in grouped_by_phone.values():
+        if group["processed_orders_sum"] < DELIVERY_THRESHOLD:
+            continue
+
+        names = ", ".join(sorted(group["names"])) or "Имя не указано"
+        clients.append({
+            "phone": group["phone"],
+            "name": truncate_button_text(names, 180),
+            "total_orders_sum": group["total_orders_sum"],
+            "processed_orders_sum": group["processed_orders_sum"],
+        })
+
+    return sorted(
+        clients,
+        key=lambda row: (row["processed_orders_sum"], row["total_orders_sum"]),
+        reverse=True,
+    )
+
+
+def build_delivery_clients_summary_messages(clients, max_length=3500):
+    header = (
+        "Список клиентов для доставки\n"
+        f"Порог: обработанные заказы от {DELIVERY_THRESHOLD} ₽\n"
+        f"Всего клиентов: {len(clients)}"
+    )
+    messages = []
+    current = header
+
+    for index, client in enumerate(clients, start=1):
+        block = (
+            f"{index}. Телефон: {client['phone']}\n"
+            f"Имя: {client['name']}\n"
+            f"Общая сумма заказов: {format_money(client['total_orders_sum'])} ₽\n"
+            f"Общая сумма обработанных заказов: {format_money(client['processed_orders_sum'])} ₽"
+        )
+        candidate = f"{current}\n\n{block}"
+        if len(candidate) > max_length and current != header:
+            messages.append(current)
+            current = f"Список клиентов для доставки (продолжение)\n\n{block}"
+        else:
+            current = candidate
+
+    messages.append(current)
+    return messages
+
 
 # Отправка рассылки
 def send_delivery_offer(bot, user_id, user_name):
