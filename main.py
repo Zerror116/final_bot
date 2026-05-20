@@ -2346,6 +2346,15 @@ def format_cart_date(value):
     return str(value)
 
 
+def build_item_list_caption(description, price, quantity, created_at):
+    return (
+        f"Описание: {description}\n"
+        f"Цена: {price} ₽\n"
+        f"Количество: {quantity}\n"
+        f"Дата создания: {format_cart_date(created_at)}"
+    )
+
+
 def show_cart_for_client(chat_id, client):
     related_clients = Clients.get_rows_by_phone(client.phone)
     total_orders = sum(calculate_total_sum(related.user_id) for related in related_clients)
@@ -2369,29 +2378,339 @@ def show_cart_for_client(chat_id, client):
 
 def build_cart_item_caption(post, reservation):
     unit_price = reservation_unit_price(reservation, post)
-    return (
-        f"Описание: {post.description}\n"
-        f"Цена товара: {unit_price} руб.\n"
-        f"Дата создания: {format_cart_date(post.created_at)}\n"
-        f"Количество: {reservation.quantity}\n"
-        f"Статус: {'Выполнено' if reservation.is_fulfilled else 'В ожидании'}"
+    return build_item_list_caption(
+        description=post.description,
+        price=unit_price,
+        quantity=reservation.quantity,
+        created_at=post.created_at,
     )
+
+
+def empty_cart_cleanup_stats():
+    return {
+        "deleted": 0,
+        "processed_deleted": 0,
+        "unprocessed_deleted": 0,
+        "temp_deleted": 0,
+        "returned": 0,
+        "queued": 0,
+        "for_delivery_removed": 0,
+        "for_delivery_updated": 0,
+        "missing_posts": 0,
+    }
+
+
+def merge_cart_cleanup_stats(target, source):
+    for key, value in source.items():
+        target[key] = target.get(key, 0) + int(value or 0)
+    return target
+
+
+def format_cart_cleanup_result(stats):
+    if not stats.get("deleted"):
+        return "Товар уже удален или корзина пуста."
+
+    parts = [
+        f"Удалено позиций: {stats['deleted']}",
+        f"обработанных: {stats['processed_deleted']}",
+        f"в обработке: {stats['unprocessed_deleted']}",
+    ]
+    if stats.get("temp_deleted"):
+        parts.append(f"очищено обработанных строк: {stats['temp_deleted']}")
+    if stats.get("returned"):
+        parts.append(f"возвращено в остаток: {stats['returned']}")
+    if stats.get("queued"):
+        parts.append(f"передано очереди: {stats['queued']}")
+    if stats.get("for_delivery_removed"):
+        parts.append(f"удалено заявок доставки: {stats['for_delivery_removed']}")
+    if stats.get("for_delivery_updated"):
+        parts.append(f"обновлено заявок доставки: {stats['for_delivery_updated']}")
+    if stats.get("missing_posts"):
+        parts.append(f"без карточки товара: {stats['missing_posts']}")
+    return ". ".join(parts) + "."
+
+
+def delete_temp_fulfilled_for_reservation(session, reservation):
+    temp_items = session.query(Temp_Fulfilled).filter(
+        Temp_Fulfilled.reservation_id == reservation.id,
+    ).all()
+
+    if not temp_items:
+        legacy_item = session.query(Temp_Fulfilled).filter(
+            Temp_Fulfilled.reservation_id == None,
+            Temp_Fulfilled.user_id == reservation.user_id,
+            Temp_Fulfilled.post_id == reservation.post_id,
+        ).order_by(Temp_Fulfilled.created_at).first()
+        if legacy_item:
+            temp_items = [legacy_item]
+
+    deleted_count = len(temp_items)
+    for temp_item in temp_items:
+        session.delete(temp_item)
+    return deleted_count
+
+
+def mark_reserved_group_message_removed_by_admin(reservation, post, client):
+    if not reservation.reserved_group_message_id:
+        return False
+    caption = (
+        f"{build_reserved_group_caption(reservation, post, client)}\n"
+        f"❌ Заказ расформирован администратором: {format_datetime(now_local())}"
+    )
+    return edit_reserved_group_message(reservation.reserved_group_message_id, post, caption)
+
+
+def create_reservation_from_queue(session, queued_entry, post):
+    queued_client = session.query(Clients).filter(
+        Clients.user_id == queued_entry.user_id
+    ).first()
+    queued_reservation = Reservations(
+        user_id=queued_entry.user_id,
+        post_id=queued_entry.post_id,
+        quantity=1,
+        is_fulfilled=False,
+        old_price=post.price if post else 0,
+        created_at=now_local(),
+    )
+    session.add(queued_reservation)
+    session.flush()
+    queued_entry.temp_fulfilled = True
+    return {
+        "reservation_id": queued_reservation.id,
+        "user_id": queued_entry.user_id,
+        "post_id": queued_entry.post_id,
+        "client_name": queued_client.name if queued_client else None,
+    }
+
+
+def send_queue_transfer_notifications(queued_notifications):
+    for item in queued_notifications:
+        try:
+            with Session(bind=engine) as session:
+                reservation = session.query(Reservations).filter(
+                    Reservations.id == item["reservation_id"],
+                ).first()
+                post = session.query(Posts).filter(Posts.id == item["post_id"]).first()
+                client = session.query(Clients).filter(
+                    Clients.user_id == item["user_id"],
+                ).first()
+                if reservation and post and client:
+                    send_reserved_group_message(session, reservation, post, client)
+
+            bot.send_message(
+                chat_id=item["user_id"],
+                text="Ваш товар в очереди стал доступен и добавлен в вашу корзину.",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Queue transfer notification failed for reservation_id=%s: %s",
+                item.get("reservation_id"),
+                exc,
+            )
+
+
+def cleanup_or_refresh_for_delivery_by_phone(session, phone):
+    stats = empty_cart_cleanup_stats()
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return stats
+
+    related_clients = session.query(Clients).filter(
+        Clients.phone.in_(phone_variants(normalized_phone))
+    ).all()
+    related_user_ids = [client.user_id for client in related_clients]
+    if not related_user_ids:
+        return stats
+
+    processed_sum = session.query(
+        func.sum(
+            (func.coalesce(Reservations.old_price, Posts.price) * Reservations.quantity)
+            - func.coalesce(Reservations.return_order, 0)
+        )
+    ).select_from(
+        Reservations
+    ).join(
+        Posts, Posts.id == Reservations.post_id
+    ).filter(
+        Reservations.user_id.in_(related_user_ids),
+        Reservations.is_fulfilled == True,
+    ).scalar()
+    processed_sum = int(processed_sum or 0)
+
+    delivery_entries = session.query(ForDelivery).filter(
+        or_(
+            ForDelivery.phone.in_(phone_variants(normalized_phone)),
+            ForDelivery.user_id.in_(related_user_ids),
+        )
+    ).all()
+
+    if processed_sum < DELIVERY_THRESHOLD:
+        for delivery_entry in delivery_entries:
+            session.delete(delivery_entry)
+        stats["for_delivery_removed"] = len(delivery_entries)
+        return stats
+
+    for delivery_entry in delivery_entries:
+        if delivery_entry.total_sum != processed_sum:
+            delivery_entry.total_sum = processed_sum
+            stats["for_delivery_updated"] += 1
+    return stats
+
+
+def remove_unprocessed_reservation_from_cart(session, reservation, post, stats, queued_notifications):
+    client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+    if post:
+        mark_reserved_group_message_removed_by_admin(reservation, post, client)
+    else:
+        stats["missing_posts"] += 1
+
+    quantity_to_release = max(int(reservation.quantity or 0), 1)
+    post_id = reservation.post_id
+    session.delete(reservation)
+    stats["deleted"] += 1
+    stats["unprocessed_deleted"] += 1
+
+    for _ in range(quantity_to_release):
+        next_in_queue = session.query(TempReservations).filter(
+            TempReservations.post_id == post_id,
+            TempReservations.temp_fulfilled == False,
+        ).order_by(TempReservations.created_at).first()
+
+        if next_in_queue and post:
+            queued_notifications.append(create_reservation_from_queue(session, next_in_queue, post))
+            stats["queued"] += 1
+            continue
+
+        if post:
+            post.quantity += 1
+            stats["returned"] += 1
+
+    return post_id
+
+
+def remove_processed_reservation_from_cart(session, reservation, stats):
+    stats["temp_deleted"] += delete_temp_fulfilled_for_reservation(session, reservation)
+    if not session.query(Posts.id).filter(Posts.id == reservation.post_id).first():
+        stats["missing_posts"] += 1
+    session.delete(reservation)
+    stats["deleted"] += 1
+    stats["processed_deleted"] += 1
+    return reservation.post_id
+
+
+def remove_reservation_from_cart(session, reservation, stats, queued_notifications):
+    post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
+    if reservation.is_fulfilled:
+        return remove_processed_reservation_from_cart(session, reservation, stats)
+    return remove_unprocessed_reservation_from_cart(session, reservation, post, stats, queued_notifications)
+
+
+def clear_client_cart(user_id, processed_only=False, reservation_id=None):
+    stats = empty_cart_cleanup_stats()
+    queued_notifications = []
+    channel_post_ids = set()
+
+    with Session(bind=engine) as session:
+        if reservation_id is not None:
+            reservation = session.query(Reservations).filter(
+                Reservations.id == reservation_id,
+            ).first()
+            if not reservation:
+                return stats
+            source_client = session.query(Clients).filter(
+                Clients.user_id == reservation.user_id,
+            ).first()
+            source_phone = source_client.phone if source_client else None
+            channel_post_ids.add(remove_reservation_from_cart(session, reservation, stats, queued_notifications))
+        else:
+            source_client = session.query(Clients).filter(Clients.user_id == user_id).first()
+            if not source_client:
+                return stats
+
+            related_clients = session.query(Clients).filter(
+                Clients.phone.in_(phone_variants(source_client.phone))
+            ).all()
+            related_user_ids = [client.user_id for client in related_clients] or [user_id]
+            query = session.query(Reservations).filter(
+                Reservations.user_id.in_(related_user_ids),
+            ).order_by(Reservations.id)
+            if processed_only:
+                query = query.filter(Reservations.is_fulfilled == True)
+
+            reservations = query.all()
+            source_phone = source_client.phone
+            for reservation in reservations:
+                channel_post_ids.add(remove_reservation_from_cart(session, reservation, stats, queued_notifications))
+
+        if source_phone:
+            merge_cart_cleanup_stats(stats, cleanup_or_refresh_for_delivery_by_phone(session, source_phone))
+
+        session.commit()
+
+    for post_id in channel_post_ids:
+        if post_id:
+            update_channel_post_message(Posts.get_row_by_id(post_id))
+            delete_channel_post_if_fully_processed(post_id)
+    send_queue_transfer_notifications(queued_notifications)
+    return stats
 
 
 # Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров
 def send_cart_content(chat_id, reservations, user_id):
     for reservation in reservations:
         post = Posts.get_row_by_id(reservation.post_id)
+        item_markup = types.InlineKeyboardMarkup()
+        item_markup.add(
+            types.InlineKeyboardButton(
+                "Убрать товар",
+                callback_data=f"admin_remove_cart_item_{reservation.id}",
+            )
+        )
 
         if post:
             caption = build_cart_item_caption(post, reservation)
-            send_photo_or_text(bot, chat_id, post.photo, caption)
+            send_photo_or_text(bot, chat_id, post.photo, caption, reply_markup=item_markup)
         else:
-            bot.send_message(chat_id, f"Товар с ID {reservation.post_id} не найден!")
+            bot.send_message(
+                chat_id,
+                f"Товар с ID {reservation.post_id} не найден!",
+                reply_markup=item_markup,
+            )
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
+    markup.add(types.InlineKeyboardButton("Расформировать полностью", callback_data=f"clear_full_cart_{user_id}"))
     bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_remove_cart_item_"))
+def handle_admin_remove_cart_item(call):
+    if not has_role(call.from_user.id, ADMIN_ROLES):
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        return
+
+    try:
+        reservation_id = int(call.data.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        safe_answer_callback_query(call.id, "Некорректный товар.", show_alert=True)
+        return
+
+    try:
+        stats = clear_client_cart(call.from_user.id, reservation_id=reservation_id)
+    except Exception as exc:
+        logger.exception("Admin cart item remove failed for reservation_id=%s", reservation_id)
+        safe_answer_callback_query(call.id, "Ошибка при удалении товара.", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Ошибка при удалении товара: {exc}")
+        return
+
+    if not stats.get("deleted"):
+        safe_answer_callback_query(call.id, "Товар уже удален.", show_alert=True)
+        return
+
+    safe_answer_callback_query(call.id, "Товар убран из корзины.")
+    safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
+    bot.send_message(call.message.chat.id, format_cart_cleanup_result(stats))
+
 
 # Callback для кнопки "Расформировать обработанные"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("clear_processed_"))
@@ -2401,27 +2720,58 @@ def handle_clear_processed(call):
         return
     user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
 
-    cleared_items = clear_processed(user_id)
+    try:
+        stats = clear_processed(user_id)
+    except Exception as exc:
+        logger.exception("Clear processed cart failed for user_id=%s", user_id)
+        safe_answer_callback_query(call.id, "Ошибка при расформировании обработанных.", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Ошибка при расформировании обработанных: {exc}")
+        return
 
-    if cleared_items > 0:
-        safe_answer_callback_query(call.id, f"Удалено обработанных товаров: {cleared_items}.", show_alert=True)
+    if stats.get("deleted", 0) > 0:
+        safe_answer_callback_query(call.id, f"Удалено обработанных товаров: {stats['deleted']}.", show_alert=True)
         bot.send_message(
             call.message.chat.id,
-            f"Обработанные товары удалены из корзины. Количество: {cleared_items}.",
+            f"Обработанные товары удалены из корзины. {format_cart_cleanup_result(stats)}",
         )
     else:
         safe_answer_callback_query(call.id, "В корзине нет обработанных товаров для удаления.", show_alert=True)
 
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("clear_full_cart_"))
+def handle_clear_full_cart(call):
+    if not has_role(call.from_user.id, ADMIN_ROLES):
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        return
+
+    try:
+        user_id = int(call.data.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        safe_answer_callback_query(call.id, "Некорректный клиент.", show_alert=True)
+        return
+
+    try:
+        stats = clear_client_cart(user_id, processed_only=False)
+    except Exception as exc:
+        logger.exception("Clear full cart failed for user_id=%s", user_id)
+        safe_answer_callback_query(call.id, "Ошибка при полном расформировании.", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Ошибка при полном расформировании: {exc}")
+        return
+
+    if stats.get("deleted", 0) > 0:
+        safe_answer_callback_query(call.id, f"Корзина расформирована. Удалено: {stats['deleted']}.", show_alert=True)
+        bot.send_message(
+            call.message.chat.id,
+            f"Корзина полностью расформирована. {format_cart_cleanup_result(stats)}",
+        )
+    else:
+        safe_answer_callback_query(call.id, "Корзина уже пуста.", show_alert=True)
+
+
 # Удаляет обработанные товары из корзины пользователя
 def clear_processed(user_id):
-    related_user_ids = get_related_user_ids_by_full_phone(user_id) or [user_id]
-    with Session(bind=engine) as session:
-        deleted_count = session.query(Reservations).filter(
-            Reservations.user_id.in_(related_user_ids),
-            Reservations.is_fulfilled == True,
-        ).delete(synchronize_session=False)
-        session.commit()
-        return deleted_count
+    return clear_client_cart(user_id, processed_only=True)
+
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
@@ -4252,39 +4602,139 @@ def get_related_delivery_user_ids(session, delivery_entry):
     return related_user_ids or [delivery_entry.user_id]
 
 
+def get_temp_fulfilled_for_reservation(session, reservation):
+    temp_item = session.query(Temp_Fulfilled).filter(
+        Temp_Fulfilled.reservation_id == reservation.id,
+    ).first()
+    if temp_item:
+        return temp_item
+
+    return session.query(Temp_Fulfilled).filter(
+        Temp_Fulfilled.reservation_id == None,
+        Temp_Fulfilled.user_id == reservation.user_id,
+        Temp_Fulfilled.post_id == reservation.post_id,
+    ).order_by(Temp_Fulfilled.created_at).first()
+
+
+def calculate_delivery_row_amount(reservation, post=None, temp_item=None):
+    if post:
+        return max(calculate_order_amount(reservation, post), 0)
+
+    if temp_item and temp_item.price is not None:
+        return max(int(temp_item.price), 0)
+
+    unit_price = reservation.old_price or 0
+    return max((unit_price * reservation.quantity) - (reservation.return_order or 0), 0)
+
+
+def build_delivery_row_description(reservation, post=None, temp_item=None):
+    if post and post.description:
+        return post.description
+    if temp_item and temp_item.item_description:
+        return temp_item.item_description
+    return f"Товар удалён из карточек (ID {reservation.post_id})"
+
+
+def get_delivery_row_created_at(reservation, post=None, temp_item=None):
+    if post and post.created_at:
+        return post.created_at
+    if temp_item and temp_item.created_at:
+        return temp_item.created_at
+    return reservation.created_at
+
+
+def allocate_delivery_amounts(rows_payload, manual_total_sum=None):
+    base_amounts = [max(int(row["base_amount"] or 0), 0) for row in rows_payload]
+    if manual_total_sum is None:
+        return base_amounts
+
+    target_total = max(int(manual_total_sum or 0), 0)
+    if not rows_payload:
+        return []
+    if len(rows_payload) == 1:
+        return [target_total]
+    if target_total == 0:
+        return [0] * len(rows_payload)
+
+    weights = [amount for amount in base_amounts if amount > 0]
+    if sum(weights) <= 0:
+        weights = [max(int(row["quantity"] or 0), 1) for row in rows_payload]
+    else:
+        weights = [max(amount, 0) for amount in base_amounts]
+
+    total_weight = sum(weights) or len(rows_payload)
+    allocated = []
+    allocated_sum = 0
+
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            amount = target_total - allocated_sum
+        else:
+            amount = (target_total * weight) // total_weight
+            allocated_sum += amount
+        allocated.append(max(amount, 0))
+
+    return allocated
+
+
+def parse_delivery_total_input(text):
+    digits = re.sub(r"[^\d]", "", text or "")
+    if not digits:
+        return None
+    return int(digits)
+
+
 def get_delivery_entry_cart_items(session, delivery_entry):
     related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
     cutoff_at = get_delivery_cutoff_at(delivery_entry)
-    rows = session.query(Reservations, Posts, Clients).join(
-        Posts, Posts.id == Reservations.post_id
-    ).outerjoin(
-        Clients, Clients.user_id == Reservations.user_id
-    ).filter(
-        Reservations.user_id.in_(related_user_ids),
-        Reservations.is_fulfilled == True,
-        Reservations.fulfilled_at != None,
-        Reservations.fulfilled_at <= cutoff_at,
-    ).order_by(Posts.description).all()
+    reservations = get_delivery_reservations_query(
+        session,
+        related_user_ids,
+        cutoff_at,
+    ).all()
+
+    if not reservations:
+        return []
+
+    post_ids = {reservation.post_id for reservation in reservations}
+    posts_by_id = {
+        post.id: post
+        for post in session.query(Posts).filter(Posts.id.in_(post_ids)).all()
+    }
+    clients_by_user_id = {
+        client.user_id: client
+        for client in session.query(Clients).filter(
+            Clients.user_id.in_({reservation.user_id for reservation in reservations})
+        ).all()
+    }
 
     grouped_items = {}
-    for reservation, post, client in rows:
-        unit_price = reservation_unit_price(reservation, post)
-        item_key = (post.id, unit_price)
+    for reservation in reservations:
+        post = posts_by_id.get(reservation.post_id)
+        client = clients_by_user_id.get(reservation.user_id)
+        temp_item = get_temp_fulfilled_for_reservation(session, reservation)
+        amount = calculate_delivery_row_amount(reservation, post=post, temp_item=temp_item)
+        unit_price = max((amount // reservation.quantity), 0) if reservation.quantity else 0
+        description = build_delivery_row_description(reservation, post=post, temp_item=temp_item)
+        item_key = (reservation.post_id, unit_price, description)
         if item_key not in grouped_items:
             grouped_items[item_key] = {
-                "post_id": post.id,
-                "photo": post.photo,
-                "description": post.description,
+                "post_id": reservation.post_id,
+                "photo": post.photo if post else None,
+                "description": description,
                 "unit_price": unit_price,
                 "quantity": 0,
                 "total_price": 0,
                 "names": set(),
+                "created_at": get_delivery_row_created_at(reservation, post=post, temp_item=temp_item),
             }
         item = grouped_items[item_key]
         item["quantity"] += reservation.quantity
-        item["total_price"] += calculate_order_amount(reservation, post)
+        item["total_price"] += amount
         if client and client.name:
             item["names"].add(client.name)
+        if not item.get("created_at"):
+            item["created_at"] = get_delivery_row_created_at(reservation, post=post, temp_item=temp_item)
 
     return list(grouped_items.values())
 
@@ -4394,19 +4844,23 @@ def show_delivery_collection_client(call):
         return
 
     for item in items:
-        names = ", ".join(sorted(item["names"])) if item["names"] else "клиент"
-        caption = (
-            f"Описание: {item['description']}\n"
-            f"Цена: {item['unit_price']} ₽\n"
-            f"Количество: {item['quantity']}\n"
-            f"Сумма: {item['total_price']} ₽\n"
-            f"Кому: {names}"
+        caption = build_item_list_caption(
+            description=item["description"],
+            price=item["unit_price"],
+            quantity=item["quantity"],
+            created_at=item.get("created_at"),
         )
         try:
             send_photo_or_text(bot, call.message.chat.id, item["photo"], caption)
             time.sleep(0.3)
         except Exception as e:
             bot.send_message(call.message.chat.id, f"{caption}\n\nНе удалось отправить фото: {e}")
+
+    total_processed_sum = sum(item["total_price"] for item in items)
+    bot.send_message(
+        call.message.chat.id,
+        f"Общая сумма обработанных заказов: {total_processed_sum} ₽",
+    )
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("✅ Собрано", callback_data=f"delivery_collected_{delivery_id}"))
@@ -4415,7 +4869,7 @@ def show_delivery_collection_client(call):
     safe_answer_callback_query(call.id)
 
 
-def move_for_delivery_to_in_delivery(delivery_id):
+def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None):
     with Session(bind=engine) as session:
         delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
         if not delivery_entry:
@@ -4437,17 +4891,6 @@ def move_for_delivery_to_in_delivery(delivery_id):
             post.id: post
             for post in session.query(Posts).filter(Posts.id.in_(post_ids)).all()
         }
-        missing_reservations = [
-            reservation.id for reservation in reservations
-            if reservation.post_id not in posts_by_id
-        ]
-        if missing_reservations:
-            return (
-                False,
-                "Перенос остановлен: у части броней удалены карточки товаров. "
-                f"Проблемных строк: {len(missing_reservations)}.",
-                0,
-            )
 
         clients_by_user_id = {
             client.user_id: client
@@ -4456,34 +4899,41 @@ def move_for_delivery_to_in_delivery(delivery_id):
             ).all()
         }
 
-        moved_count = 0
+        rows_payload = []
+        problematic_count = 0
         for reservation in reservations:
-            post = posts_by_id[reservation.post_id]
+            post = posts_by_id.get(reservation.post_id)
+            if not post:
+                problematic_count += 1
+            temp_item = get_temp_fulfilled_for_reservation(session, reservation)
             reservation_client = clients_by_user_id.get(reservation.user_id)
+            rows_payload.append({
+                "reservation": reservation,
+                "post_id": reservation.post_id,
+                "user_id": reservation.user_id,
+                "user_name": reservation_client.name if reservation_client else delivery_entry.name,
+                "item_description": build_delivery_row_description(reservation, post=post, temp_item=temp_item),
+                "quantity": reservation.quantity,
+                "base_amount": calculate_delivery_row_amount(reservation, post=post, temp_item=temp_item),
+                "temp_item": temp_item,
+            })
 
+        allocated_amounts = allocate_delivery_amounts(rows_payload, manual_total_sum=manual_total_sum)
+        moved_count = 0
+        for row, allocated_amount in zip(rows_payload, allocated_amounts):
+            reservation = row["reservation"]
             session.add(InDelivery(
                 reservation_id=reservation.id,
-                post_id=reservation.post_id,
-                user_id=reservation.user_id,
-                user_name=reservation_client.name if reservation_client else delivery_entry.name,
-                item_description=post.description,
-                quantity=reservation.quantity,
-                price=calculate_order_amount(reservation, post),
+                post_id=row["post_id"],
+                user_id=row["user_id"],
+                user_name=row["user_name"],
+                item_description=row["item_description"],
+                quantity=row["quantity"],
+                price=allocated_amount,
                 delivery_address=delivery_entry.address or "",
             ))
 
-            temp_item = session.query(Temp_Fulfilled).filter(
-                Temp_Fulfilled.reservation_id == reservation.id,
-                Temp_Fulfilled.in_delivery == False,
-            ).first()
-            if not temp_item:
-                temp_item = session.query(Temp_Fulfilled).filter(
-                    Temp_Fulfilled.reservation_id == None,
-                    Temp_Fulfilled.user_id == reservation.user_id,
-                    Temp_Fulfilled.post_id == reservation.post_id,
-                    Temp_Fulfilled.in_delivery == False,
-                ).order_by(Temp_Fulfilled.created_at).first()
-
+            temp_item = row["temp_item"]
             if temp_item:
                 temp_item.in_delivery = True
 
@@ -4492,7 +4942,12 @@ def move_for_delivery_to_in_delivery(delivery_id):
 
         session.delete(delivery_entry)
         session.commit()
-        return True, "Клиент перенесён в доставку.", moved_count
+        message_parts = ["Клиент перенесён в доставку."]
+        if manual_total_sum is not None:
+            message_parts.append(f"Итоговая сумма: {manual_total_sum} ₽.")
+        if problematic_count:
+            message_parts.append(f"Строк без карточек товаров перенесено: {problematic_count}.")
+        return True, " ".join(message_parts), moved_count
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delivery_collected_"))
@@ -4502,20 +4957,58 @@ def mark_delivery_collected(call):
         return
 
     delivery_id = int(call.data.rsplit("_", 1)[1])
-    success, message_text, moved_count = move_for_delivery_to_in_delivery(delivery_id)
-    if success:
-        safe_edit_message_text(
-            bot,
-            logger=logger,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"✅ {message_text} Товарных строк: {moved_count}.",
-        )
-    else:
-        safe_answer_callback_query(call.id, message_text, show_alert=True)
+    with Session(bind=engine) as session:
+        delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
+        if not delivery_entry:
+            safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
+            return
+
+    set_user_state(call.from_user.id, {
+        "action": "AWAITING_DELIVERY_COLLECTED_SUM",
+        "delivery_id": delivery_id,
+        "source_message_id": call.message.message_id,
+    })
+    safe_edit_message_text(
+        bot,
+        logger=logger,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text="Введите итоговую сумму по собранной доставке одним числом.",
+    )
+    safe_answer_callback_query(call.id)
+
+
+@bot.message_handler(func=lambda message: get_state_action(message.chat.id) == "AWAITING_DELIVERY_COLLECTED_SUM")
+def handle_delivery_collected_sum(message):
+    if not require_role(message, DELIVERY_ROLES):
+        clear_user_state(message.chat.id)
         return
 
-    safe_answer_callback_query(call.id)
+    manual_total_sum = parse_delivery_total_input(message.text)
+    if manual_total_sum is None:
+        bot.send_message(message.chat.id, "Введите сумму цифрами, например: 3500")
+        return
+
+    state = get_user_state(message.chat.id) or {}
+    delivery_id = state.get("delivery_id")
+    source_message_id = state.get("source_message_id")
+    clear_user_state(message.chat.id)
+
+    if not delivery_id:
+        bot.send_message(message.chat.id, "Не удалось найти сборку доставки. Откройте список заново.")
+        show_delivery_collection_list(message.chat.id, message_id=source_message_id, page=0)
+        return
+
+    safe_delete_message(bot, message.chat.id, message.message_id, logger=logger)
+    success, message_text, moved_count = move_for_delivery_to_in_delivery(
+        delivery_id,
+        manual_total_sum=manual_total_sum,
+    )
+    bot.send_message(
+        message.chat.id,
+        f"{'✅' if success else '❌'} {message_text} Товарных строк: {moved_count}.",
+    )
+    show_delivery_collection_list(message.chat.id, message_id=source_message_id, page=0)
 
 @bot.message_handler(func=lambda message: message.text == "✅ Подтвердить доставку")
 def confirm_delivery(message):

@@ -289,8 +289,9 @@ def test_post_delete_and_zero_quantity_are_safe():
 def test_delivery_move_and_archive_are_loss_safe():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
-        "missing_reservations = [",
-        "Перенос остановлен: у части броней удалены карточки товаров",
+        "problematic_count = 0",
+        "Строк без карточек товаров перенесено",
+        "def build_delivery_row_description",
         "archive_delivery_clear_yes",
         "InDelivery.clear_table()",
     ]:
@@ -302,9 +303,15 @@ def test_cart_clear_processed_is_available():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
         "Расформировать обработанные",
+        "Расформировать полностью",
+        "admin_remove_cart_item_",
+        "def clear_client_cart(",
         "def clear_processed(user_id):",
+        "def delete_temp_fulfilled_for_reservation",
+        "Temp_Fulfilled.reservation_id == reservation.id",
+        "cleanup_or_refresh_for_delivery_by_phone",
         "Reservations.is_fulfilled == True",
-        "deleted_count = session.query(Reservations).filter(",
+        "def handle_clear_full_cart",
     ]:
         if marker not in text:
             raise AssertionError(f"cart clear processed marker missing {marker}")
