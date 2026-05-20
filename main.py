@@ -112,40 +112,110 @@ def build_unavailable_channel_post_caption(post, reason="Товар снят с 
     )
 
 
+def telegram_error_text(exc):
+    return str(exc).lower()
+
+
+def telegram_error_contains(exc, *markers):
+    text = telegram_error_text(exc)
+    return any(marker in text for marker in markers)
+
+
+def telegram_retry_after_seconds(exc):
+    match = re.search(r"retry after (\d+)", telegram_error_text(exc))
+    return int(match.group(1)) if match else None
+
+
+def log_channel_sync_error(action, post_id, exc):
+    expected_errors = (
+        "message to edit not found",
+        "message to delete not found",
+        "there is no text in the message to edit",
+        "message can't be deleted",
+    )
+    retry_after = telegram_retry_after_seconds(exc)
+    if retry_after is not None:
+        logger.info(
+            "Channel post %s rate-limited for post_id=%s retry_after=%ss",
+            action,
+            post_id,
+            retry_after,
+        )
+        return
+
+    if telegram_error_contains(exc, *expected_errors):
+        logger.debug("Channel post %s skipped for post_id=%s: %s", action, post_id, exc)
+        return
+
+    logger.warning("Channel post %s failed for post_id=%s: %s", action, post_id, exc)
+
+
+def sleep_for_short_retry_after(exc, max_retry_after=5):
+    retry_after = telegram_retry_after_seconds(exc)
+    if retry_after is None or retry_after > max_retry_after:
+        return False
+
+    time.sleep(retry_after + 0.2)
+    return True
+
+
+def edit_channel_post_caption(post, caption, markup, action):
+    for attempt in range(2):
+        try:
+            bot.edit_message_caption(
+                chat_id=CHANNEL_ID,
+                message_id=post.message_id,
+                caption=caption,
+                reply_markup=markup,
+            )
+            return True
+        except Exception as exc:
+            if is_message_not_modified_error(exc):
+                logger.debug("Channel post %s already up to date for post_id=%s", action, post.id)
+                return True
+            if attempt == 0 and sleep_for_short_retry_after(exc):
+                continue
+            log_channel_sync_error(f"{action} caption", post.id, exc)
+            if telegram_error_contains(exc, "message to edit not found"):
+                return False
+            return None
+
+
+def edit_channel_post_text(post, text, markup, action):
+    for attempt in range(2):
+        try:
+            bot.edit_message_text(
+                chat_id=CHANNEL_ID,
+                message_id=post.message_id,
+                text=text,
+                reply_markup=markup,
+            )
+            return True
+        except Exception as exc:
+            if is_message_not_modified_error(exc):
+                logger.debug("Channel post %s already up to date for post_id=%s", action, post.id)
+                return True
+            if attempt == 0 and sleep_for_short_retry_after(exc):
+                continue
+            log_channel_sync_error(f"{action} text", post.id, exc)
+            return False
+
+
+def edit_channel_post_message(post, text, markup, action):
+    caption_result = edit_channel_post_caption(post, text, markup, action)
+    if caption_result is True or caption_result is False:
+        return caption_result
+    return edit_channel_post_text(post, text, markup, action)
+
+
 def update_channel_post_message(post):
     if not post or not post.message_id:
-        logger.warning("Channel post update skipped: missing post/message_id")
+        logger.debug("Channel post update skipped: missing post/message_id")
         return False
 
     caption = build_channel_post_caption(post)
     markup = build_channel_post_markup(post)
-    try:
-        bot.edit_message_caption(
-            chat_id=CHANNEL_ID,
-            message_id=post.message_id,
-            caption=caption,
-            reply_markup=markup,
-        )
-        return True
-    except Exception as exc:
-        if is_message_not_modified_error(exc):
-            logger.debug("Channel post message already up to date: %s", exc)
-            return True
-        logger.warning("Channel post caption update failed for post_id=%s: %s", post.id, exc)
-
-    try:
-        bot.edit_message_text(
-            chat_id=CHANNEL_ID,
-            message_id=post.message_id,
-            text=caption,
-            reply_markup=markup,
-        )
-        return True
-    except Exception as exc:
-        if is_message_not_modified_error(exc):
-            return True
-        logger.warning("Channel post text update failed for post_id=%s: %s", post.id, exc)
-        return False
+    return edit_channel_post_message(post, caption, markup, "update")
 
 
 def disable_channel_post_reservation(post, reason="Товар снят с продажи"):
@@ -154,32 +224,7 @@ def disable_channel_post_reservation(post, reason="Товар снят с про
 
     caption = build_unavailable_channel_post_caption(post, reason)
     markup = build_bot_only_markup()
-    try:
-        bot.edit_message_caption(
-            chat_id=CHANNEL_ID,
-            message_id=post.message_id,
-            caption=caption,
-            reply_markup=markup,
-        )
-        return True
-    except Exception as exc:
-        if is_message_not_modified_error(exc):
-            return True
-        logger.warning("Channel post disable caption failed for post_id=%s: %s", post.id, exc)
-
-    try:
-        bot.edit_message_text(
-            chat_id=CHANNEL_ID,
-            message_id=post.message_id,
-            text=caption,
-            reply_markup=markup,
-        )
-        return True
-    except Exception as exc:
-        if is_message_not_modified_error(exc):
-            return True
-        logger.warning("Channel post disable text failed for post_id=%s: %s", post.id, exc)
-        return False
+    return edit_channel_post_message(post, caption, markup, "disable")
 
 
 def delete_channel_post_if_fully_processed(post_id):
@@ -203,12 +248,7 @@ def delete_channel_post_if_fully_processed(post_id):
             bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
         except Exception as exc:
             if "message to delete not found" not in str(exc).lower():
-                logger.warning(
-                    "Sold-out channel post delete failed for post_id=%s message_id=%s: %s",
-                    post_id,
-                    message_id,
-                    exc,
-                )
+                log_channel_sync_error("sold-out delete", post_id, exc)
                 return disable_channel_post_reservation(post, reason="Товар закончился")
 
         post.message_id = None
@@ -2649,7 +2689,13 @@ def clear_client_cart(user_id, processed_only=False, reservation_id=None):
 
     for post_id in channel_post_ids:
         if post_id:
-            update_channel_post_message(Posts.get_row_by_id(post_id))
+            post = Posts.get_row_by_id(post_id)
+            if not post:
+                continue
+            if post.quantity <= 0:
+                delete_channel_post_if_fully_processed(post_id)
+                continue
+            update_channel_post_message(post)
             delete_channel_post_if_fully_processed(post_id)
     send_queue_transfer_notifications(queued_notifications)
     return stats

@@ -151,9 +151,12 @@ def test_channel_post_updates_are_centralized():
     text = MAIN.read_text(encoding="utf-8")
     required = [
         "def update_channel_post_message",
+        "def log_channel_sync_error",
+        "def telegram_retry_after_seconds",
         "build_channel_post_markup(post)",
         "if post.quantity > 0:",
-        "Channel post caption update failed",
+        "there is no text in the message to edit",
+        "post.quantity <= 0",
     ]
     for marker in required:
         if marker not in text:
