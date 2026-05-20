@@ -7,6 +7,9 @@ from .temp_fulfilied import Temp_Fulfilled
 from .in_delivery import InDelivery
 from .temp_reservations import TempReservations
 from .bot_session import BotSession
+from .revision_logs import RevisionLog
+from .deleted_post_snapshots import DeletedPostSnapshot
+from .delivery_cleanup_runs import DeliveryCleanupRun
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -23,6 +26,7 @@ def run_schema_migrations():
     ensure_schema_migrations()
     run_migration("001_reservations_created_at", ensure_reservations_created_at)
     run_migration("002_delivery_cutoff_metadata", ensure_delivery_cutoff_metadata)
+    run_migration("003_revision_delivery_cleanup_tables", ensure_revision_delivery_cleanup_tables)
 
 
 def ensure_schema_migrations():
@@ -235,6 +239,40 @@ def ensure_delivery_cutoff_metadata():
         connection.execute(text(backfill_query))
         connection.execute(text(temp_backfill_query))
 
+
+def ensure_revision_delivery_cleanup_tables():
+    AbstractModel.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_revision_logs_auditor_created "
+            "ON revision_logs (auditor_user_id, created_at)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_revision_logs_post_id "
+            "ON revision_logs (post_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_revision_logs_selected_date "
+            "ON revision_logs (selected_date)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_deleted_post_snapshots_post_id "
+            "ON deleted_post_snapshots (post_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_deleted_post_snapshots_created_at "
+            "ON deleted_post_snapshots (created_at)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_cleanup_runs_slot_key "
+            "ON delivery_cleanup_runs (slot_key)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_delivery_cleanup_runs_started_at "
+            "ON delivery_cleanup_runs (started_at)"
+        ))
+
 __all__ = {
     "Posts",
     "Clients",
@@ -245,5 +283,8 @@ __all__ = {
     "InDelivery",
     "Temp_Fulfilled",
     "BotSession",
+    "RevisionLog",
+    "DeletedPostSnapshot",
+    "DeliveryCleanupRun",
     "init_db",
 }

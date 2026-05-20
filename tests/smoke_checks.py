@@ -54,21 +54,21 @@ def test_manual_audit_old_flow_removed():
             raise AssertionError(f"manual audit flow still contains {marker}")
 
 
-def test_reservation_sum_queries_have_explicit_from():
+def test_reservation_sum_queries_use_reserved_price_without_posts_join():
     text = (ROOT / "handlers" / "reservations_manage.py").read_text(encoding="utf-8")
-    marker = ").select_from(\n            Reservations\n        ).join("
-    if text.count(marker) < 2:
-        raise AssertionError("reservation sum queries must select_from Reservations before join")
-    if "func.coalesce(Reservations.old_price, Posts.price)" not in text:
-        raise AssertionError("reservation sums must use reservation old_price")
+    if text.count("func.coalesce(Reservations.old_price, 0)") < 2:
+        raise AssertionError("reservation sums must use reservation old_price without live posts")
+    if ".join(" in text or "Posts.price" in text:
+        raise AssertionError("reservation sums must not drop rows when posts were snapshotted")
 
 
 def test_order_amount_uses_reserved_price():
     text = MAIN.read_text(encoding="utf-8")
     required = [
-        "def calculate_order_amount(order, post):",
-        "unit_price = order.old_price if order.old_price is not None else post.price",
-        "(func.coalesce(Reservations.old_price, Posts.price) * Reservations.quantity)",
+        "def calculate_order_amount(order, post=None):",
+        "unit_price = order.old_price if order.old_price is not None else fallback_price",
+        "def get_post_or_snapshot(session, post_id):",
+        "DeletedPostSnapshot.post_id == post_id",
     ]
     for marker in required:
         if marker not in text:
@@ -296,10 +296,74 @@ def test_delivery_move_and_archive_are_loss_safe():
         "Строк без карточек товаров перенесено",
         "def build_delivery_row_description",
         "archive_delivery_clear_yes",
-        "InDelivery.clear_table()",
+        "def cleanup_in_delivery_records",
+        "DeliveryCleanupRun",
     ]:
         if marker not in text:
             raise AssertionError(f"delivery loss-safety marker missing {marker}")
+
+
+def test_revision_excludes_linked_posts_and_logs_work():
+    text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    for marker in [
+        "def get_revision_blocked_post_ids(session):",
+        "session.query(Reservations.post_id)",
+        "session.query(InDelivery.post_id)",
+        "session.query(Temp_Fulfilled.post_id)",
+        "session.query(TempReservations.post_id).filter(",
+        "Posts.quantity > 0",
+        "session.add(RevisionLog(",
+        "Исключено из-за корзины/доставки/очереди",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"revision safety marker missing {marker}")
+
+    revision_block = text.split("def apply_auto_audit_for_date", 1)[1].split("def answer_manual_audit_disabled", 1)[0]
+    if "today_start" in revision_block:
+        raise AssertionError("revision must not move sold-out posts to today 00:00")
+
+    for marker in [
+        "RevisionLog",
+        "DeletedPostSnapshot",
+        "DeliveryCleanupRun",
+        '"003_revision_delivery_cleanup_tables"',
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"new additive migration marker missing {marker}")
+
+
+def test_delivery_cleanup_schedule_markers():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "DELIVERY_CLEANUP_WEEKDAYS = {0, 2, 4}",
+        "DELIVERY_CLEANUP_HOUR = 22",
+        "def delivery_cleanup_slot_key(value):",
+        "def should_run_delivery_cleanup(value):",
+        "value.hour == DELIVERY_CLEANUP_HOUR",
+        "def run_scheduled_delivery_cleanup(current=None):",
+        "slot_key=slot_key",
+        "def start_delivery_cleanup_worker():",
+        "start_delivery_cleanup_worker()",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"delivery cleanup schedule marker missing {marker}")
+
+
+def test_midnight_posts_are_snapshotted_before_delete():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "def ensure_deleted_post_snapshot(session, post, reason):",
+        "def cleanup_midnight_posts_after_snapshot",
+        "post.created_at.time() == datetime.min.time()",
+        "session.delete(post)",
+        "with_reservations",
+        "with_in_delivery",
+        "with_temp_fulfilled",
+        "with_wait_queue",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"midnight cleanup marker missing {marker}")
 
 
 def test_cart_clear_processed_is_available():
@@ -389,7 +453,7 @@ def main():
     test_audit_prices()
     test_delivery_callbacks_are_namespaced()
     test_manual_audit_old_flow_removed()
-    test_reservation_sum_queries_have_explicit_from()
+    test_reservation_sum_queries_use_reserved_price_without_posts_join()
     test_order_amount_uses_reserved_price()
     test_delivery_cutoff_markers()
     test_reserved_group_flow_markers()
@@ -403,6 +467,9 @@ def main():
     test_reservation_creation_is_atomic_and_missing_posts_do_not_queue()
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()
+    test_revision_excludes_linked_posts_and_logs_work()
+    test_delivery_cleanup_schedule_markers()
+    test_midnight_posts_are_snapshotted_before_delete()
     test_cart_clear_processed_is_available()
     test_sold_out_channel_delete_keeps_reserved_group()
     test_delivery_clients_summary_markers()
