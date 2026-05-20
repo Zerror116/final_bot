@@ -466,12 +466,14 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
 
     for marker in [
         "reserved_post_id = Posts.reserve_next_id(chat_id=user_id)",
-        "Напишите на товаре ID",
+        "Id товара: {reserved_post_id}",
+        "Отправьте фото",
         '"post_id": reserved_post_id',
         "Posts.release_reserved_id(data.get(\"post_id\"), chat_id=chat_id)",
-        "Ваш пост #{created_post_id} успешно создан!",
+        "Id товара: {created_post_id}",
+        "Ваш пост успешно создан!",
         "def build_item_list_caption(description, price, quantity, created_at, post_id=None):",
-        "ID товара: {post_id}",
+        "Id товара: {post_id}",
         'post_id=item["post_id"]',
     ]:
         if marker not in main_text:

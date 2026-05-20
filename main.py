@@ -2462,7 +2462,7 @@ def format_cart_date(value):
 def build_item_list_caption(description, price, quantity, created_at, post_id=None):
     lines = []
     if post_id is not None:
-        lines.append(f"ID товара: {post_id}")
+        lines.append(f"Id товара: {post_id}")
     lines.extend([
         f"Описание: {description}",
         f"Цена: {price} ₽",
@@ -3050,8 +3050,8 @@ def create_new_post(message):
 
     bot.send_message(
         message.chat.id,
-        f"Напишите на товаре ID: {reserved_post_id}\n\n"
-        "Пожалуйста, отправьте фотографию для вашего поста.",
+        f"Id товара: {reserved_post_id}\n"
+        "Отправьте фото",
     )
     temp_post_data[message.chat.id] = {"post_id": reserved_post_id}
     set_user_state(message.chat.id, CreatingPost.CREATING_POST)
@@ -3127,7 +3127,11 @@ def handle_post_details(message):
             bot.send_message(chat_id, "Не удалось сохранить пост. Нажмите «Новый пост» и попробуйте ещё раз.")
             return
 
-        bot.send_message(chat_id, f"Ваш пост #{created_post_id} успешно создан!")
+        bot.send_message(
+            chat_id,
+            f"Id товара: {created_post_id}\n"
+            "Ваш пост успешно создан!",
+        )
 
         # Очищаем состояние пользователя после завершения
         temp_post_data.pop(chat_id, None)
