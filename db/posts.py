@@ -2,13 +2,16 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, func, text
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, text
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
+from .post_id_reservations import PostIdReservation
 
 
 SAMARA_TZ = ZoneInfo("Europe/Samara")
+POST_ID_RESERVATION_LOCK_KEY = 18450
+POST_ID_RESERVATION_TTL = timedelta(hours=6)
 
 
 def samara_now_naive():
@@ -52,19 +55,88 @@ class Posts(AbstractModel):
         return normalize_post_created_at(value)
 
     @staticmethod
-    def reserve_next_id():
-        with Session(bind=engine) as session:
-            if engine.dialect.name == "postgresql":
-                return session.execute(
-                    text("SELECT nextval(pg_get_serial_sequence('posts', 'id'))")
-                ).scalar_one()
+    def lock_post_id_reservations(session):
+        if engine.dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": POST_ID_RESERVATION_LOCK_KEY},
+            )
 
-            return session.query(func.coalesce(func.max(Posts.id), 0) + 1).scalar()
+    @staticmethod
+    def reserve_next_id(chat_id=None):
+        owner_chat_id = int(chat_id or 0)
+        now = samara_now_naive()
+        expires_before = now - POST_ID_RESERVATION_TTL
+
+        with Session(bind=engine) as session:
+            Posts.lock_post_id_reservations(session)
+            session.query(PostIdReservation).filter(
+                PostIdReservation.reserved_at < expires_before
+            ).delete(synchronize_session=False)
+            if owner_chat_id:
+                session.query(PostIdReservation).filter(
+                    PostIdReservation.chat_id == owner_chat_id
+                ).delete(synchronize_session=False)
+            session.flush()
+
+            reserved_post_id = session.execute(text("""
+                WITH candidates AS (
+                    SELECT 1 AS id
+                    UNION
+                    SELECT id + 1 FROM posts WHERE id > 0
+                    UNION
+                    SELECT post_id + 1 FROM post_id_reservations WHERE post_id > 0
+                )
+                SELECT MIN(c.id)
+                FROM candidates c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM posts p WHERE p.id = c.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM post_id_reservations r WHERE r.post_id = c.id
+                )
+            """)).scalar()
+
+            reserved_post_id = int(reserved_post_id or 1)
+            session.add(PostIdReservation(
+                post_id=reserved_post_id,
+                chat_id=owner_chat_id,
+                reserved_at=now,
+            ))
+            session.commit()
+            return reserved_post_id
+
+    @staticmethod
+    def release_reserved_id(post_id, chat_id=None):
+        if post_id is None:
+            return
+
+        with Session(bind=engine) as session:
+            query = session.query(PostIdReservation).filter(
+                PostIdReservation.post_id == int(post_id)
+            )
+            if chat_id is not None:
+                query = query.filter(PostIdReservation.chat_id == int(chat_id))
+            query.delete(synchronize_session=False)
+            session.commit()
 
     @staticmethod
     def insert(chat_id: int, photo: str, price: str, description: str, quantity: int,
                created_at: datetime = None, post_id: int = None):
+        if post_id is None:
+            post_id = Posts.reserve_next_id(chat_id=chat_id)
+        else:
+            post_id = int(post_id)
+
         with Session(bind=engine) as session:
+            reservation = session.query(PostIdReservation).filter(
+                PostIdReservation.post_id == post_id
+            ).first()
+            if reservation and int(reservation.chat_id) != int(chat_id):
+                raise ValueError(f"ID {post_id} уже зарезервирован для другого поста.")
+            if session.query(Posts.id).filter(Posts.id == post_id).first():
+                raise ValueError(f"ID {post_id} уже занят другим товаром.")
+
             posts = Posts(
                 id=post_id,
                 chat_id=chat_id,
@@ -75,6 +147,8 @@ class Posts(AbstractModel):
                 created_at=normalize_post_created_at(created_at),
             )
             session.add(posts)
+            if reservation:
+                session.delete(reservation)
             session.commit()
             session.refresh(posts)
             return posts.id

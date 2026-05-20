@@ -423,15 +423,39 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
     main_text = MAIN.read_text(encoding="utf-8")
     posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
     posts_manage_text = (ROOT / "handlers" / "posts_manage.py").read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    reservation_text = (ROOT / "db" / "post_id_reservations.py").read_text(encoding="utf-8")
 
     for marker in [
-        "def reserve_next_id():",
-        "nextval(pg_get_serial_sequence('posts', 'id'))",
+        "def reserve_next_id(chat_id=None):",
+        "post_id_reservations",
+        "SELECT 1 AS id",
+        "SELECT id + 1 FROM posts WHERE id > 0",
+        "SELECT post_id + 1 FROM post_id_reservations WHERE post_id > 0",
+        "PostIdReservation(",
+        "def release_reserved_id(post_id, chat_id=None):",
         "post_id: int = None",
         "id=post_id",
+        "ID {post_id} уже занят другим товаром.",
     ]:
         if marker not in posts_text:
             raise AssertionError(f"post id reservation marker missing {marker}")
+
+    for marker in [
+        "class PostIdReservation",
+        "__tablename__ = \"post_id_reservations\"",
+        "post_id = mapped_column(Integer, primary_key=True)",
+    ]:
+        if marker not in reservation_text:
+            raise AssertionError(f"post id reservation table marker missing {marker}")
+
+    for marker in [
+        "PostIdReservation",
+        '"004_post_id_reservations"',
+        "def ensure_post_id_reservations():",
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"post id reservation migration marker missing {marker}")
 
     for marker in [
         "post_id: int = None",
@@ -441,9 +465,10 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
             raise AssertionError(f"save post id marker missing {marker}")
 
     for marker in [
-        "reserved_post_id = Posts.reserve_next_id()",
+        "reserved_post_id = Posts.reserve_next_id(chat_id=user_id)",
         "Напишите на товаре ID",
         '"post_id": reserved_post_id',
+        "Posts.release_reserved_id(data.get(\"post_id\"), chat_id=chat_id)",
         "Ваш пост #{created_post_id} успешно создан!",
         "def build_item_list_caption(description, price, quantity, created_at, post_id=None):",
         "ID товара: {post_id}",

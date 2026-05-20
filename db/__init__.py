@@ -10,6 +10,7 @@ from .bot_session import BotSession
 from .revision_logs import RevisionLog
 from .deleted_post_snapshots import DeletedPostSnapshot
 from .delivery_cleanup_runs import DeliveryCleanupRun
+from .post_id_reservations import PostIdReservation
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -27,6 +28,7 @@ def run_schema_migrations():
     run_migration("001_reservations_created_at", ensure_reservations_created_at)
     run_migration("002_delivery_cutoff_metadata", ensure_delivery_cutoff_metadata)
     run_migration("003_revision_delivery_cleanup_tables", ensure_revision_delivery_cleanup_tables)
+    run_migration("004_post_id_reservations", ensure_post_id_reservations)
 
 
 def ensure_schema_migrations():
@@ -273,6 +275,20 @@ def ensure_revision_delivery_cleanup_tables():
             "ON delivery_cleanup_runs (started_at)"
         ))
 
+
+def ensure_post_id_reservations():
+    AbstractModel.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_post_id_reservations_chat_id "
+            "ON post_id_reservations (chat_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_post_id_reservations_reserved_at "
+            "ON post_id_reservations (reserved_at)"
+        ))
+
 __all__ = {
     "Posts",
     "Clients",
@@ -286,5 +302,6 @@ __all__ = {
     "RevisionLog",
     "DeletedPostSnapshot",
     "DeliveryCleanupRun",
+    "PostIdReservation",
     "init_db",
 }

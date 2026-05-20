@@ -3041,7 +3041,13 @@ def create_new_post(message):
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
-    reserved_post_id = Posts.reserve_next_id()
+    try:
+        reserved_post_id = Posts.reserve_next_id(chat_id=user_id)
+    except Exception as exc:
+        logger.exception("Post ID reservation failed for user_id=%s: %s", user_id, exc)
+        bot.send_message(user_id, "Не удалось зарезервировать ID товара. Попробуйте ещё раз.")
+        return
+
     bot.send_message(
         message.chat.id,
         f"Напишите на товаре ID: {reserved_post_id}\n\n"
@@ -3104,14 +3110,23 @@ def handle_post_details(message):
 
         # Сохраняем пост
         data = temp_post_data[chat_id]
-        created_post_id = save_post(
-            chat_id,
-            data["photo"],
-            data["price"],
-            data["description"],
-            data["quantity"],
-            post_id=data.get("post_id"),
-        )
+        try:
+            created_post_id = save_post(
+                chat_id,
+                data["photo"],
+                data["price"],
+                data["description"],
+                data["quantity"],
+                post_id=data.get("post_id"),
+            )
+        except Exception as exc:
+            Posts.release_reserved_id(data.get("post_id"), chat_id=chat_id)
+            temp_post_data.pop(chat_id, None)
+            clear_user_state(chat_id)
+            logger.exception("Post save failed for user_id=%s: %s", chat_id, exc)
+            bot.send_message(chat_id, "Не удалось сохранить пост. Нажмите «Новый пост» и попробуйте ещё раз.")
+            return
+
         bot.send_message(chat_id, f"Ваш пост #{created_post_id} успешно создан!")
 
         # Очищаем состояние пользователя после завершения
