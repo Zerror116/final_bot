@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, func, text
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
@@ -52,9 +52,21 @@ class Posts(AbstractModel):
         return normalize_post_created_at(value)
 
     @staticmethod
-    def insert(chat_id: int, photo: str, price: str, description: str, quantity: int, created_at: datetime = None):
+    def reserve_next_id():
+        with Session(bind=engine) as session:
+            if engine.dialect.name == "postgresql":
+                return session.execute(
+                    text("SELECT nextval(pg_get_serial_sequence('posts', 'id'))")
+                ).scalar_one()
+
+            return session.query(func.coalesce(func.max(Posts.id), 0) + 1).scalar()
+
+    @staticmethod
+    def insert(chat_id: int, photo: str, price: str, description: str, quantity: int,
+               created_at: datetime = None, post_id: int = None):
         with Session(bind=engine) as session:
             posts = Posts(
+                id=post_id,
                 chat_id=chat_id,
                 photo=photo,
                 price=price,

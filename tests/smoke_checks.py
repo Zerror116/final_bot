@@ -419,6 +419,40 @@ def test_delivery_clients_summary_markers():
             raise AssertionError(f"delivery clients summary marker missing {marker}")
 
 
+def test_post_id_labels_for_new_posts_and_delivery_collection():
+    main_text = MAIN.read_text(encoding="utf-8")
+    posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
+    posts_manage_text = (ROOT / "handlers" / "posts_manage.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "def reserve_next_id():",
+        "nextval(pg_get_serial_sequence('posts', 'id'))",
+        "post_id: int = None",
+        "id=post_id",
+    ]:
+        if marker not in posts_text:
+            raise AssertionError(f"post id reservation marker missing {marker}")
+
+    for marker in [
+        "post_id: int = None",
+        "post_id=post_id",
+    ]:
+        if marker not in posts_manage_text:
+            raise AssertionError(f"save post id marker missing {marker}")
+
+    for marker in [
+        "reserved_post_id = Posts.reserve_next_id()",
+        "Напишите на товаре ID",
+        '"post_id": reserved_post_id',
+        "Ваш пост #{created_post_id} успешно создан!",
+        "def build_item_list_caption(description, price, quantity, created_at, post_id=None):",
+        "ID товара: {post_id}",
+        'post_id=item["post_id"]',
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"post id display marker missing {marker}")
+
+
 class RaisingBot:
     def __init__(self, exc):
         self.exc = exc
@@ -473,6 +507,7 @@ def main():
     test_cart_clear_processed_is_available()
     test_sold_out_channel_delete_keeps_reserved_group()
     test_delivery_clients_summary_markers()
+    test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
     print("smoke checks ok")
 
