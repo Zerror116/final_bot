@@ -57,6 +57,8 @@ AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 DELIVERY_CLEANUP_WEEKDAYS = {0, 2, 4}
 DELIVERY_CLEANUP_HOUR = 22
 DELIVERY_CLEANUP_CHECK_SECONDS = 60
+RESERVED_GROUP_FLOW_STATE_KEY = 0
+RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -346,6 +348,7 @@ channel_post_auto_publish_started = False
 channel_post_auto_publish_stop_event = threading.Event()
 delivery_cleanup_started = False
 delivery_cleanup_stop_event = threading.Event()
+reserved_group_flow_lock = threading.Lock()
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -1089,6 +1092,153 @@ def build_reserved_group_caption(reservation, post, client):
     return "\n".join(lines)
 
 
+def get_reserved_group_flow_state():
+    state = user_data.get(RESERVED_GROUP_FLOW_STATE_KEY, {})
+    return state if isinstance(state, dict) else {}
+
+
+def save_reserved_group_flow_state(state):
+    user_data[RESERVED_GROUP_FLOW_STATE_KEY] = state
+
+
+def is_reserved_group_delivery_paused():
+    state = get_reserved_group_flow_state()
+    return bool(state.get("delivery_collection_paused"))
+
+
+def activate_reserved_group_delivery_pause():
+    with reserved_group_flow_lock:
+        state = get_reserved_group_flow_state()
+        if state.get("delivery_collection_paused"):
+            return False
+
+        state.update({
+            "delivery_collection_paused": True,
+            "paused_at": serialize_datetime(now_local()),
+            "resume_flush_running": False,
+        })
+        save_reserved_group_flow_state(state)
+        return True
+
+
+def get_reserved_group_queue_count():
+    with Session(bind=engine) as session:
+        return session.query(func.count(Reservations.id)).filter(
+            Reservations.reserved_group_message_id == None,
+        ).scalar() or 0
+
+
+def get_reserved_group_queued_reservation_ids(limit=RESERVED_GROUP_RESUME_BATCH_SIZE):
+    with Session(bind=engine) as session:
+        rows = session.query(Reservations.id).filter(
+            Reservations.reserved_group_message_id == None,
+        ).order_by(
+            Reservations.created_at,
+            Reservations.id,
+        ).limit(limit).all()
+    return [row[0] for row in rows]
+
+
+def reserved_group_resume_delay(remaining_count):
+    if remaining_count > 50:
+        return 0.25
+    if remaining_count > 20:
+        return 0.45
+    if remaining_count > 5:
+        return 0.9
+    return 1.4
+
+
+def clear_reserved_group_delivery_pause(sent_count=0):
+    with reserved_group_flow_lock:
+        state = get_reserved_group_flow_state()
+        state.update({
+            "delivery_collection_paused": False,
+            "resume_flush_running": False,
+            "resumed_at": serialize_datetime(now_local()),
+            "last_resume_sent_count": sent_count,
+        })
+        save_reserved_group_flow_state(state)
+
+
+def mark_reserved_group_flush_stopped():
+    with reserved_group_flow_lock:
+        state = get_reserved_group_flow_state()
+        state["resume_flush_running"] = False
+        save_reserved_group_flow_state(state)
+
+
+def flush_reserved_group_queue_after_delivery(admin_chat_id=None):
+    sent_count = 0
+    try:
+        while True:
+            queued_ids = get_reserved_group_queued_reservation_ids()
+            if not queued_ids:
+                time.sleep(0.5)
+                if get_reserved_group_queue_count():
+                    continue
+                clear_reserved_group_delivery_pause(sent_count)
+                logger.info("Reserved group flow resumed after delivery collection. Sent queued=%s", sent_count)
+                return
+
+            for reservation_id in queued_ids:
+                with Session(bind=engine) as session:
+                    reservation = session.query(Reservations).filter(
+                        Reservations.id == reservation_id,
+                        Reservations.reserved_group_message_id == None,
+                    ).first()
+                    if not reservation:
+                        continue
+
+                    post = get_post_or_snapshot(session, reservation.post_id)
+                    client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+                    if not send_reserved_group_message(session, reservation, post, client, force=True):
+                        raise RuntimeError(f"queued reserved message send failed for reservation_id={reservation_id}")
+                    sent_count += 1
+
+                remaining_count = get_reserved_group_queue_count()
+                if remaining_count:
+                    time.sleep(reserved_group_resume_delay(remaining_count))
+    except Exception as exc:
+        logger.exception("Reserved group resume flush failed: %s", exc)
+        mark_reserved_group_flush_stopped()
+        if admin_chat_id:
+            try:
+                bot.send_message(
+                    admin_chat_id,
+                    "Не удалось полностью возобновить поток забронированного товара. "
+                    "Новые брони пока остаются в очереди.",
+                )
+            except Exception:
+                logger.exception("Reserved group resume failure notification failed")
+
+
+def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None):
+    with Session(bind=engine) as session:
+        remaining_delivery_count = session.query(func.count(ForDelivery.id)).scalar() or 0
+    if remaining_delivery_count > 0:
+        return False
+
+    with reserved_group_flow_lock:
+        state = get_reserved_group_flow_state()
+        if not state.get("delivery_collection_paused"):
+            return False
+        if state.get("resume_flush_running"):
+            return False
+
+        state["resume_flush_running"] = True
+        save_reserved_group_flow_state(state)
+
+    thread = threading.Thread(
+        target=flush_reserved_group_queue_after_delivery,
+        args=(admin_chat_id,),
+        name="reserved-group-resume-flush",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
 def edit_reserved_group_message(message_id, post, caption):
     if not message_id:
         return False
@@ -1129,7 +1279,11 @@ def edit_reserved_group_message(message_id, post, caption):
         return False
 
 
-def send_reserved_group_message(session, reservation, post, client):
+def send_reserved_group_message(session, reservation, post, client, force=False):
+    if not force and is_reserved_group_delivery_paused():
+        logger.debug("Reserved group message queued while delivery collection is active: reservation_id=%s", reservation.id)
+        return False
+
     caption = build_reserved_group_caption(reservation, post, client)
     try:
         message = send_photo_or_text(bot, TARGET_GROUP_ID, post.photo if post else None, caption)
@@ -5102,6 +5256,155 @@ def parse_delivery_total_input(text):
     return int(digits)
 
 
+def get_delivery_collection_reserved_group_items():
+    with Session(bind=engine) as session:
+        deduplicate_for_delivery_entries(session)
+        session.flush()
+        delivery_entries = session.query(ForDelivery).order_by(
+            ForDelivery.name,
+            ForDelivery.phone,
+            ForDelivery.id,
+        ).all()
+
+        items = []
+        seen_reservation_ids = set()
+        for delivery_entry in delivery_entries:
+            related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
+            reservations = get_delivery_reservations_query(
+                session,
+                related_user_ids,
+                get_delivery_cutoff_at(delivery_entry),
+            ).all()
+            if not reservations:
+                continue
+
+            posts_by_id = get_posts_or_snapshots_by_ids(
+                session,
+                {reservation.post_id for reservation in reservations},
+            )
+            clients_by_user_id = {
+                client.user_id: client
+                for client in session.query(Clients).filter(
+                    Clients.user_id.in_({reservation.user_id for reservation in reservations})
+                ).all()
+            }
+
+            for reservation in reservations:
+                if reservation.id in seen_reservation_ids:
+                    continue
+                seen_reservation_ids.add(reservation.id)
+
+                post = posts_by_id.get(reservation.post_id)
+                client = clients_by_user_id.get(reservation.user_id)
+                temp_item = get_temp_fulfilled_for_reservation(session, reservation)
+                amount = calculate_delivery_row_amount(reservation, post=post, temp_item=temp_item)
+                unit_price = max((amount // reservation.quantity), 0) if reservation.quantity else 0
+                items.append({
+                    "reservation_id": reservation.id,
+                    "post_id": reservation.post_id,
+                    "photo": post.photo if post else None,
+                    "description": build_delivery_row_description(reservation, post=post, temp_item=temp_item),
+                    "unit_price": unit_price,
+                    "quantity": reservation.quantity,
+                    "total_price": amount,
+                    "client_name": client.name if client and client.name else delivery_entry.name,
+                    "phone": normalize_phone(client.phone if client else delivery_entry.phone) or delivery_entry.phone,
+                    "address": delivery_entry.address or "",
+                    "created_at": get_delivery_row_created_at(reservation, post=post, temp_item=temp_item),
+                    "reserved_at": reservation.created_at,
+                    "fulfilled_at": reservation.fulfilled_at,
+                    "cutoff_at": get_delivery_cutoff_at(delivery_entry),
+                })
+
+        session.commit()
+
+    return sorted(
+        items,
+        key=lambda item: (
+            item.get("created_at") or datetime.min,
+            item.get("reserved_at") or datetime.min,
+            item["reservation_id"],
+        ),
+    )
+
+
+def build_delivery_reserved_group_item_caption(item):
+    return "\n".join([
+        "Бронь на доставку",
+        f"Id товара: {item['post_id']}",
+        f"Клиент: {item['client_name'] or 'Имя не указано'}",
+        f"Телефон: {item['phone'] or 'Телефон не указан'}",
+        f"Описание: {item['description']}",
+        f"Цена: {item['unit_price']} ₽",
+        f"Количество: {item['quantity']}",
+        f"Сумма: {item['total_price']} ₽",
+        f"Дата создания: {format_cart_date(item.get('created_at'))}",
+        f"Забронировано: {format_datetime(item.get('reserved_at'))}",
+        f"Обработано: {format_datetime(item.get('fulfilled_at'))}",
+        f"Срез доставки: {format_datetime(item.get('cutoff_at'))}",
+        f"Адрес: {item['address'] or 'адрес не указан'}",
+    ])
+
+
+def send_delivery_reserved_group_item(item):
+    caption = build_delivery_reserved_group_item_caption(item)
+    for attempt in range(2):
+        try:
+            send_photo_or_text(bot, TARGET_GROUP_ID, item.get("photo"), caption)
+            return True
+        except Exception as exc:
+            if attempt == 0 and sleep_for_short_retry_after(exc, max_retry_after=10):
+                continue
+            logger.warning(
+                "Delivery reserved group item send failed for reservation_id=%s: %s",
+                item.get("reservation_id"),
+                exc,
+            )
+            return False
+
+
+def send_delivery_reserved_group_snapshot():
+    bot.send_message(TARGET_GROUP_ID, "Брони на доставку")
+    time.sleep(0.5)
+
+    items = get_delivery_collection_reserved_group_items()
+    if not items:
+        bot.send_message(TARGET_GROUP_ID, "Товаров для сборки доставки не найдено.")
+        return 0
+
+    sent_count = 0
+    for item in items:
+        if send_delivery_reserved_group_item(item):
+            sent_count += 1
+        time.sleep(0.35)
+
+    return sent_count
+
+
+def start_delivery_reserved_group_pause_and_snapshot():
+    with Session(bind=engine) as session:
+        deduplicate_for_delivery_entries(session)
+        session.commit()
+        delivery_count = session.query(func.count(ForDelivery.id)).scalar() or 0
+
+    if delivery_count == 0:
+        return False, 0
+
+    if not activate_reserved_group_delivery_pause():
+        logger.info("Delivery collection reserved group pause already active.")
+        return False, 0
+
+    try:
+        sent_count = send_delivery_reserved_group_snapshot()
+    except Exception as exc:
+        clear_reserved_group_delivery_pause(0)
+        logger.exception("Delivery reserved group snapshot failed: %s", exc)
+        return False, 0
+
+    logger.info("Delivery reserved group snapshot sent: items=%s", sent_count)
+    return True, sent_count
+
+
 def get_delivery_entry_cart_items(session, delivery_entry):
     related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
     cutoff_at = get_delivery_cutoff_at(delivery_entry)
@@ -5214,6 +5517,18 @@ def collect_delivery(message):
     if not require_role(message, DELIVERY_ROLES):
         return
     auto_fulfill_expired_reservations()
+    started_snapshot, snapshot_count = start_delivery_reserved_group_pause_and_snapshot()
+    if started_snapshot:
+        bot.send_message(
+            message.chat.id,
+            f"Поток забронированного товара в группе временно остановлен. "
+            f"В группу отправлено товаров для доставки: {snapshot_count}.",
+        )
+    elif start_reserved_group_resume_flush_if_delivery_done(message.chat.id):
+        bot.send_message(
+            message.chat.id,
+            "Список доставки пуст. Повторно запускаю возобновление потока забронированного товара.",
+        )
     show_delivery_collection_list(message.chat.id)
 
 
@@ -5425,6 +5740,11 @@ def handle_delivery_collected_sum(message):
         message.chat.id,
         f"{'✅' if success else '❌'} {message_text} Товарных строк: {moved_count}.",
     )
+    if success and start_reserved_group_resume_flush_if_delivery_done(message.chat.id):
+        bot.send_message(
+            message.chat.id,
+            "Все корзины доставки собраны. Возобновляю поток забронированного товара в группе.",
+        )
     show_delivery_collection_list(message.chat.id, message_id=source_message_id, page=0)
 
 @bot.message_handler(func=lambda message: message.text == "✅ Подтвердить доставку")
@@ -6058,6 +6378,7 @@ def run_bot():
     start_reservation_auto_fulfill_worker()
     start_channel_post_auto_publish_worker()
     start_delivery_cleanup_worker()
+    start_reserved_group_resume_flush_if_delivery_done()
     retry_delay = 5
 
     while True:

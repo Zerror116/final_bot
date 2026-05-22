@@ -419,6 +419,29 @@ def test_delivery_clients_summary_markers():
             raise AssertionError(f"delivery clients summary marker missing {marker}")
 
 
+def test_delivery_collection_pauses_reserved_group_flow():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "RESERVED_GROUP_FLOW_STATE_KEY = 0",
+        "def activate_reserved_group_delivery_pause():",
+        "def is_reserved_group_delivery_paused():",
+        "def send_delivery_reserved_group_snapshot():",
+        "bot.send_message(TARGET_GROUP_ID, \"Брони на доставку\")",
+        "def start_delivery_reserved_group_pause_and_snapshot():",
+        "start_delivery_reserved_group_pause_and_snapshot()",
+        "def flush_reserved_group_queue_after_delivery(",
+        "def start_reserved_group_resume_flush_if_delivery_done(",
+        "Reservations.reserved_group_message_id == None",
+        "reserved_group_resume_delay(remaining_count)",
+        "send_reserved_group_message(session, reservation, post, client, force=True)",
+        "if not force and is_reserved_group_delivery_paused():",
+        "start_reserved_group_resume_flush_if_delivery_done(message.chat.id)",
+        "start_reserved_group_resume_flush_if_delivery_done()",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"delivery reserved group pause marker missing {marker}")
+
+
 def test_post_id_labels_for_new_posts_and_delivery_collection():
     main_text = MAIN.read_text(encoding="utf-8")
     posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
@@ -534,6 +557,7 @@ def main():
     test_cart_clear_processed_is_available()
     test_sold_out_channel_delete_keeps_reserved_group()
     test_delivery_clients_summary_markers()
+    test_delivery_collection_pauses_reserved_group_flow()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
     print("smoke checks ok")
