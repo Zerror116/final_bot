@@ -111,6 +111,7 @@ def test_delivery_cutoff_markers():
 def test_reserved_group_flow_markers():
     text = MAIN.read_text(encoding="utf-8")
     required = [
+        "f\"Id товара: {reservation.post_id}\"",
         "def send_reserved_group_message",
         "def store_reserved_group_message_id",
         "TARGET_GROUP_ID",
@@ -427,6 +428,7 @@ def test_delivery_collection_pauses_reserved_group_flow():
         "def is_reserved_group_delivery_paused():",
         "def send_delivery_reserved_group_snapshot():",
         "bot.send_message(TARGET_GROUP_ID, \"Брони на доставку\")",
+        "f\"Id товара: {item['post_id']}\"",
         "def start_delivery_reserved_group_pause_and_snapshot():",
         "start_delivery_reserved_group_pause_and_snapshot()",
         "def flush_reserved_group_queue_after_delivery(",

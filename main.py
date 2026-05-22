@@ -1076,8 +1076,7 @@ def build_reserved_group_caption(reservation, post, client):
     status = "✅ Обработан" if reservation.is_fulfilled else "⏳ В обработке"
     price = reservation_unit_price(reservation, post) if post else "Не указана"
     lines = [
-        "💼 Новый заказ:",
-        "",
+        f"Id товара: {reservation.post_id}",
         f"👤 Клиент: {client.name if client and client.name else 'Имя не указано'}",
         f"📞 Телефон: {client.phone if client and client.phone else 'Телефон не указан'}",
         f"💰 Цена: {price}₽",
@@ -5330,8 +5329,8 @@ def get_delivery_collection_reserved_group_items():
 
 def build_delivery_reserved_group_item_caption(item):
     return "\n".join([
-        "Бронь на доставку",
         f"Id товара: {item['post_id']}",
+        "Бронь на доставку",
         f"Клиент: {item['client_name'] or 'Имя не указано'}",
         f"Телефон: {item['phone'] or 'Телефон не указан'}",
         f"Описание: {item['description']}",
