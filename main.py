@@ -580,7 +580,13 @@ def save_reservation_stats_report_state(state):
 
 def should_send_reservation_stats_report(value):
     value = value.astimezone(SAMARA_TZ) if value.tzinfo else value.replace(tzinfo=SAMARA_TZ)
-    return value.hour == RESERVATION_STATS_REPORT_HOUR and value.minute == RESERVATION_STATS_REPORT_MINUTE
+    report_at = value.replace(
+        hour=RESERVATION_STATS_REPORT_HOUR,
+        minute=RESERVATION_STATS_REPORT_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    return value >= report_at
 
 
 def run_reservation_stats_daily_report(current=None):
