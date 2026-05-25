@@ -55,6 +55,8 @@ LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
 AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
 AUTO_CHANNEL_POST_CHECK_SECONDS = 30
+CHANNEL_POST_SEND_ATTEMPTS = 3
+CHANNEL_POST_SEND_RETRY_SECONDS = 5
 DELIVERY_CLEANUP_WEEKDAYS = {0, 2, 4}
 DELIVERY_CLEANUP_HOUR = 22
 DELIVERY_CLEANUP_CHECK_SECONDS = 60
@@ -168,6 +170,22 @@ def sleep_for_short_retry_after(exc, max_retry_after=5):
 
     time.sleep(retry_after + 0.2)
     return True
+
+
+def is_connect_timeout_error(exc):
+    error_text = telegram_error_text(exc)
+    return "connecttimeout" in error_text or "connect timeout" in error_text
+
+
+def notify_publish_status(chat_id, text):
+    if not chat_id:
+        return False
+    try:
+        bot.send_message(chat_id, text)
+        return True
+    except Exception as exc:
+        logger.warning("Channel post publish notification failed for chat_id=%s: %s", chat_id, exc)
+        return False
 
 
 def edit_channel_post_caption(post, caption, markup, action):
@@ -3707,27 +3725,54 @@ def go_back(message):
             message.chat.id, "Произошла ошибка. Пожалуйста, попробуйте снова позже."
         )
 
+
+def send_channel_post_with_retries(post, caption, markup, source):
+    for attempt in range(1, CHANNEL_POST_SEND_ATTEMPTS + 1):
+        try:
+            return bot.send_photo(
+                CHANNEL_ID,
+                photo=post.photo,
+                caption=caption,
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            retry_after = telegram_retry_after_seconds(exc)
+            can_retry = retry_after is not None or is_connect_timeout_error(exc)
+            if not can_retry or attempt == CHANNEL_POST_SEND_ATTEMPTS:
+                raise
+
+            wait_seconds = retry_after + 1 if retry_after is not None else CHANNEL_POST_SEND_RETRY_SECONDS * attempt
+            logger.warning(
+                "Channel post send retry for post_id=%s source=%s attempt=%s/%s wait=%ss: %s",
+                post.id,
+                source,
+                attempt,
+                CHANNEL_POST_SEND_ATTEMPTS,
+                wait_seconds,
+                exc,
+            )
+            time.sleep(wait_seconds)
+
+
 def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
     if not channel_post_publish_lock.acquire(blocking=False):
-        if notify_chat_id:
-            bot.send_message(
-                notify_chat_id,
-                "Отправка постов в канал уже выполняется. Дождитесь окончания, чтобы не создать дубли.",
-            )
+        notify_publish_status(
+            notify_chat_id,
+            "Отправка постов в канал уже выполняется. Дождитесь окончания, чтобы не создать дубли.",
+        )
         logger.info("Channel post publish skipped: already running, source=%s", source)
         return 0
 
     sent_count = 0
+    failed_post_ids = []
     try:
         posts = Posts.get_unsent_posts()
         if not posts:
-            if notify_chat_id:
-                bot.send_message(notify_chat_id, "Нет новых постов для отправки.")
+            notify_publish_status(notify_chat_id, "Нет новых постов для отправки.")
             logger.info("Channel post publish found no unsent posts, source=%s", source)
             return 0
 
-        if notify_chat_id:
-            bot.send_message(notify_chat_id, f"Начинаю отправку постов в канал. Постов: {len(posts)}.")
+        notify_publish_status(notify_chat_id, f"Начинаю отправку постов в канал. Постов: {len(posts)}.")
 
         for post in posts:
             post_id = post.id
@@ -3736,12 +3781,14 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
             caption = build_channel_post_caption(post)
             markup = build_channel_post_markup(post)
 
-            sent_message = bot.send_photo(
-                CHANNEL_ID,
-                photo=photo,
-                caption=caption,
-                reply_markup=markup,
-            )
+            try:
+                sent_message = send_channel_post_with_retries(post, caption, markup, source)
+            except Exception as exc:
+                failed_post_ids.append(post_id)
+                logger.exception("Channel post send failed for post_id=%s source=%s: %s", post_id, source, exc)
+                time.sleep(1)
+                continue
+
             Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
             sent_count += 1
 
@@ -3753,20 +3800,33 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
 
             time.sleep(4)
 
-        if source == "auto":
+        if source == "auto" and sent_count and not failed_post_ids:
             send_phoenix_channel_footer()
 
-        if notify_chat_id:
-            bot.send_message(
+        if failed_post_ids:
+            failed_preview = ", ".join(str(post_id) for post_id in failed_post_ids[:20])
+            extra = "" if len(failed_post_ids) <= 20 else f" и ещё {len(failed_post_ids) - 20}"
+            notify_publish_status(
+                notify_chat_id,
+                f"Отправка завершена частично. Отправлено: {sent_count}. "
+                f"Не отправлено: {len(failed_post_ids)} ({failed_preview}{extra}). "
+                "Нажмите отправку ещё раз позже, чтобы дослать только оставшиеся.",
+            )
+        else:
+            notify_publish_status(
                 notify_chat_id,
                 f"✅ Все новые посты ({sent_count}) успешно отправлены в канал.",
             )
-        logger.info("Channel post publish completed: sent=%s source=%s", sent_count, source)
+        logger.info(
+            "Channel post publish completed: sent=%s failed=%s source=%s",
+            sent_count,
+            len(failed_post_ids),
+            source,
+        )
         return sent_count
     except Exception as exc:
         logger.exception("Channel post publish failed, source=%s: %s", source, exc)
-        if notify_chat_id:
-            bot.send_message(notify_chat_id, f"Ошибка при отправке постов: {exc}")
+        notify_publish_status(notify_chat_id, f"Ошибка при отправке постов: {exc}")
         return sent_count
     finally:
         channel_post_publish_lock.release()
