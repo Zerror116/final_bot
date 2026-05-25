@@ -59,6 +59,7 @@ DELIVERY_CLEANUP_HOUR = 22
 DELIVERY_CLEANUP_CHECK_SECONDS = 60
 RESERVED_GROUP_FLOW_STATE_KEY = 0
 RESERVED_GROUP_RESUME_BATCH_SIZE = 50
+RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -1138,14 +1139,8 @@ def get_reserved_group_queued_reservation_ids(limit=RESERVED_GROUP_RESUME_BATCH_
     return [row[0] for row in rows]
 
 
-def reserved_group_resume_delay(remaining_count):
-    if remaining_count > 50:
-        return 0.25
-    if remaining_count > 20:
-        return 0.45
-    if remaining_count > 5:
-        return 0.9
-    return 1.4
+def reserved_group_resume_delay(remaining_count=None):
+    return RESERVED_GROUP_SEND_INTERVAL_SECONDS
 
 
 def clear_reserved_group_delivery_pause(sent_count=0):
@@ -1278,19 +1273,39 @@ def edit_reserved_group_message(message_id, post, caption):
         return False
 
 
-def send_reserved_group_message(session, reservation, post, client, force=False):
+def send_reserved_group_message(session, reservation, post, client, force=False, attempts=3):
     if not force and is_reserved_group_delivery_paused():
         logger.debug("Reserved group message queued while delivery collection is active: reservation_id=%s", reservation.id)
         return False
 
     caption = build_reserved_group_caption(reservation, post, client)
-    try:
-        message = send_photo_or_text(bot, TARGET_GROUP_ID, post.photo if post else None, caption)
-    except Exception as exc:
-        logger.warning("Reserved group message send failed for reservation_id=%s: %s", reservation.id, exc)
-        return False
+    for attempt in range(1, attempts + 1):
+        try:
+            message = send_photo_or_text(bot, TARGET_GROUP_ID, post.photo if post else None, caption)
+            return store_reserved_group_message_id(reservation.id, message.message_id)
+        except Exception as exc:
+            retry_after = telegram_retry_after_seconds(exc)
+            if retry_after is not None and attempt < attempts:
+                wait_seconds = max(retry_after + 1, RESERVED_GROUP_SEND_INTERVAL_SECONDS)
+                logger.info(
+                    "Reserved group message rate-limited for reservation_id=%s retry_after=%ss wait=%ss",
+                    reservation.id,
+                    retry_after,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
 
-    return store_reserved_group_message_id(reservation.id, message.message_id)
+            logger.warning(
+                "Reserved group message send failed for reservation_id=%s attempt=%s/%s: %s",
+                reservation.id,
+                attempt,
+                attempts,
+                exc,
+            )
+            return False
+
+    return False
 
 
 def store_reserved_group_message_id(reservation_id, message_id, attempts=3):
@@ -5364,7 +5379,7 @@ def send_delivery_reserved_group_item(item):
 
 def send_delivery_reserved_group_snapshot():
     bot.send_message(TARGET_GROUP_ID, "Брони на доставку")
-    time.sleep(0.5)
+    time.sleep(RESERVED_GROUP_SEND_INTERVAL_SECONDS)
 
     items = get_delivery_collection_reserved_group_items()
     if not items:
@@ -5375,7 +5390,7 @@ def send_delivery_reserved_group_snapshot():
     for item in items:
         if send_delivery_reserved_group_item(item):
             sent_count += 1
-        time.sleep(0.35)
+        time.sleep(RESERVED_GROUP_SEND_INTERVAL_SECONDS)
 
     return sent_count
 
