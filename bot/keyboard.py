@@ -14,8 +14,11 @@ def supreme_leader_main_menu():
     manage_workers = KeyboardButton("👔 Назначить работника")
     audit_manage = KeyboardButton(" Ревизия")
     i_have_a_defect = KeyboardButton("😞 У меня брак")
+    phoenix_broadcast = KeyboardButton("Рассылка о Фениксе")
+    reservation_stats = KeyboardButton("БроньСтатистик")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        delivery_management,orders_in_delivery,manage_workers,audit_manage,i_have_a_defect)
+                        delivery_management, orders_in_delivery, manage_workers, audit_manage, i_have_a_defect,
+                        phoenix_broadcast, reservation_stats)
     return leader_keyboard
 
 def client_main_menu():
@@ -59,4 +62,3 @@ def unknown_main_menu():
     registration_button = KeyboardButton("Регистрация")
     unknown_keyboard.add(registration_button)
     return unknown_keyboard
-

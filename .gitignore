@@ -1,6 +1,8 @@
 .venv
 .idea
+__pycache__/
 */__pycache__/*
+.deploy_backups/
 .idea/*
 bot_database.db
 .env
