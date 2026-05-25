@@ -238,38 +238,26 @@ def disable_channel_post_reservation(post, reason="Товар снят с про
     return edit_channel_post_message(post, caption, markup, "disable")
 
 
-def delete_channel_post_if_fully_processed(post_id):
-    with Session(bind=engine) as session:
-        post = session.query(Posts).filter(Posts.id == post_id).first()
-        if not post or not post.message_id:
-            return False
-
-        if post.quantity > 0:
-            return False
-
-        pending_reservations = session.query(Reservations).filter(
-            Reservations.post_id == post_id,
-            Reservations.is_fulfilled == False,
-        ).all()
-        has_pending_current_reservation = any(
-            not reservation_is_stale_for_current_post(reservation, post)
-            for reservation in pending_reservations
-        )
-        if has_pending_current_reservation:
-            return False
-
-        message_id = post.message_id
-        try:
-            bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
-        except Exception as exc:
-            if "message to delete not found" not in str(exc).lower():
-                log_channel_sync_error("sold-out delete", post_id, exc)
-                return disable_channel_post_reservation(post, reason="Товар закончился")
-
-        post.message_id = None
-        session.commit()
-        logger.info("Deleted sold-out channel post for post_id=%s message_id=%s", post_id, message_id)
+def delete_delivered_channel_post_message(post, source="delivery_cleanup"):
+    if not post or not post.message_id:
         return True
+
+    message_id = post.message_id
+    try:
+        bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
+    except Exception as exc:
+        if "message to delete not found" not in str(exc).lower():
+            log_channel_sync_error("delivered delete", post.id, exc)
+            return disable_channel_post_reservation(post, reason="Товар уехал в доставку")
+
+    post.message_id = None
+    logger.info(
+        "Deleted delivered channel post for post_id=%s message_id=%s source=%s",
+        post.id,
+        message_id,
+        source,
+    )
+    return True
 
 
 def build_telegram_proxy_url():
@@ -1471,20 +1459,16 @@ def auto_fulfill_expired_reservations(now=None, older_than_seconds=RESERVATION_A
 
         fulfilled_count = 0
         fulfilled_ids = []
-        fulfilled_post_ids = set()
         for reservation in expired_reservations:
             if ensure_temp_fulfilled_for_reservation(session, reservation):
                 fulfilled_count += 1
                 fulfilled_ids.append(reservation.id)
-                fulfilled_post_ids.add(reservation.post_id)
 
         if fulfilled_count:
             session.commit()
 
         for reservation_id in fulfilled_ids:
             update_reserved_group_message_by_id(reservation_id)
-        for post_id in fulfilled_post_ids:
-            delete_channel_post_if_fully_processed(post_id)
 
         return fulfilled_count
 
@@ -2995,11 +2979,7 @@ def clear_client_cart(user_id, processed_only=False, reservation_id=None):
             post = Posts.get_row_by_id(post_id)
             if not post:
                 continue
-            if post.quantity <= 0:
-                delete_channel_post_if_fully_processed(post_id)
-                continue
             update_channel_post_message(post)
-            delete_channel_post_if_fully_processed(post_id)
     send_queue_transfer_notifications(queued_notifications)
     return stats
 
@@ -4612,11 +4592,11 @@ def cleanup_in_delivery_records(source="scheduled"):
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:
                 continue
-            if post.message_id is not None:
-                continue
             if post_has_active_links(session, post_id):
                 continue
             ensure_deleted_post_snapshot(session, post, f"delivery_cleanup:{source}")
+            if not delete_delivered_channel_post_message(post, source=source):
+                continue
             session.delete(post)
             stats["posts_deleted"] += 1
 

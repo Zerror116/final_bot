@@ -387,22 +387,29 @@ def test_cart_clear_processed_is_available():
         raise AssertionError("cart clear processed warning must not be shown")
 
 
-def test_sold_out_channel_delete_keeps_reserved_group():
+def test_channel_delete_happens_only_after_delivery_cleanup():
     text = MAIN.read_text(encoding="utf-8")
     required = [
-        "def delete_channel_post_if_fully_processed",
+        "def delete_delivered_channel_post_message",
         "bot.delete_message(chat_id=CHANNEL_ID",
-        "Reservations.is_fulfilled == False",
-        "fulfilled_post_ids.add(reservation.post_id)",
-        "delete_channel_post_if_fully_processed(post_id)",
+        "Товар уехал в доставку",
+        "Deleted delivered channel post",
+        "cleanup_in_delivery_records",
+        "delete_delivered_channel_post_message(post, source=source)",
     ]
     for marker in required:
         if marker not in text:
-            raise AssertionError(f"sold-out channel deletion missing {marker}")
+            raise AssertionError(f"delivery-only channel deletion missing {marker}")
 
-    helper = text.split("def delete_channel_post_if_fully_processed", 1)[1].split("def build_telegram_proxy_url", 1)[0]
+    auto_fulfill_block = text.split("def auto_fulfill_expired_reservations", 1)[1].split("def reservation_auto_fulfill_loop", 1)[0]
+    if "delete_delivered_channel_post_message" in auto_fulfill_block:
+        raise AssertionError("auto-fulfilled reservations must not delete channel posts")
+    if "delete_channel_post_if_fully_processed" in text:
+        raise AssertionError("sold-out channel deletion helper must not be used")
+
+    helper = text.split("def delete_delivered_channel_post_message", 1)[1].split("def build_telegram_proxy_url", 1)[0]
     if "TARGET_GROUP_ID" in helper:
-        raise AssertionError("sold-out channel deletion must not touch reserved group messages")
+        raise AssertionError("delivery channel deletion must not touch reserved group messages")
 
 
 def test_delivery_clients_summary_markers():
@@ -577,7 +584,7 @@ def main():
     test_delivery_cleanup_schedule_markers()
     test_midnight_posts_are_snapshotted_before_delete()
     test_cart_clear_processed_is_available()
-    test_sold_out_channel_delete_keeps_reserved_group()
+    test_channel_delete_happens_only_after_delivery_cleanup()
     test_delivery_clients_summary_markers()
     test_delivery_collection_pauses_reserved_group_flow()
     test_post_id_labels_for_new_posts_and_delivery_collection()
