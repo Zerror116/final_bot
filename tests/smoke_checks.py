@@ -201,6 +201,56 @@ def test_phoenix_broadcast_markers():
         raise AssertionError("Phoenix broadcast button missing from creator menu")
 
 
+def test_reservation_stats_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
+    event_text = (ROOT / "db" / "reservation_stat_events.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "class ReservationStatEvent",
+        "__tablename__ = \"reservation_stat_events\"",
+        "uq_reservation_stat_events_event_reservation",
+        "ix_reservation_stat_events_type_created",
+    ]:
+        if marker not in event_text:
+            raise AssertionError(f"reservation stat event model marker missing {marker}")
+
+    for marker in [
+        "ReservationStatEvent",
+        '"005_reservation_stat_events"',
+        "def ensure_reservation_stat_events():",
+        "INSERT INTO reservation_stat_events",
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"reservation stat migration marker missing {marker}")
+
+    for marker in [
+        "RESERVATION_STATS_REPORT_HOUR = 16",
+        "RESERVATION_STATS_REPORT_MINUTE = 10",
+        "def add_reservation_stat_event(session, event_type, reservation, event_time=None):",
+        "RESERVATION_STATS_EVENT_CREATED",
+        "RESERVATION_STATS_EVENT_CANCELED",
+        "RESERVATION_STATS_EVENT_FULFILLED",
+        "def send_daily_reservation_stats_report",
+        "def start_reservation_stats_daily_report_worker():",
+        "start_reservation_stats_daily_report_worker()",
+        "def show_live_reservation_stats(message):",
+        "message.text == \"БроньСтатистик\"",
+        "def close_live_reservation_stats(call):",
+        "time.sleep(10)",
+        "build_reservation_stats_close_markup(user_id)",
+        "add_reservation_stat_event(session, RESERVATION_STATS_EVENT_CREATED, reservation",
+        "record_reservation_stat_event(RESERVATION_STATS_EVENT_CANCELED, order)",
+        "add_reservation_stat_event(session, RESERVATION_STATS_EVENT_FULFILLED, reservation",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"reservation stat marker missing {marker}")
+
+    if "БроньСтатистик" not in keyboard_text:
+        raise AssertionError("reservation stats secret button missing from supreme leader menu")
+
+
 def test_channel_post_auto_publish_markers():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
@@ -583,6 +633,7 @@ def main():
     test_channel_post_updates_are_centralized()
     test_callback_answers_are_safe()
     test_phoenix_broadcast_markers()
+    test_reservation_stats_markers()
     test_channel_post_auto_publish_markers()
     test_post_management_only_shows_unpublished_posts()
     test_post_dates_use_samara_and_shift_sunday()

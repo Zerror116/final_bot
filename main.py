@@ -21,6 +21,7 @@ from db.temp_fulfilied import Temp_Fulfilled
 from db.deleted_post_snapshots import DeletedPostSnapshot
 from db.delivery_cleanup_runs import DeliveryCleanupRun
 from db.revision_logs import RevisionLog
+from db.reservation_stat_events import ReservationStatEvent
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -60,6 +61,13 @@ CHANNEL_POST_SEND_RETRY_SECONDS = 5
 DELIVERY_CLEANUP_WEEKDAYS = {0, 2, 4}
 DELIVERY_CLEANUP_HOUR = 22
 DELIVERY_CLEANUP_CHECK_SECONDS = 60
+RESERVATION_STATS_REPORT_HOUR = 16
+RESERVATION_STATS_REPORT_MINUTE = 10
+RESERVATION_STATS_CHECK_SECONDS = 30
+RESERVATION_STATS_EVENT_CREATED = "created"
+RESERVATION_STATS_EVENT_CANCELED = "canceled"
+RESERVATION_STATS_EVENT_FULFILLED = "fulfilled"
+RESERVATION_STATS_REPORT_STATE_KEY = 2
 RESERVED_GROUP_FLOW_STATE_KEY = 0
 RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
@@ -362,6 +370,10 @@ channel_post_auto_publish_stop_event = threading.Event()
 delivery_cleanup_started = False
 delivery_cleanup_stop_event = threading.Event()
 reserved_group_flow_lock = threading.Lock()
+reservation_stats_report_started = False
+reservation_stats_report_stop_event = threading.Event()
+reservation_stats_live_lock = threading.Lock()
+reservation_stats_live_sessions = {}
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -440,6 +452,259 @@ def get_related_clients_by_full_phone(user_id):
 
 def get_related_user_ids_by_phone(phone):
     return [client.user_id for client in Clients.get_rows_by_phone(phone)]
+
+
+def today_bounds(value=None):
+    current = value or now_local()
+    if current.tzinfo is not None:
+        current = current.astimezone(SAMARA_TZ).replace(tzinfo=None)
+    start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def add_reservation_stat_event(session, event_type, reservation, event_time=None):
+    if not reservation or not getattr(reservation, "id", None):
+        return False
+
+    exists = session.query(ReservationStatEvent.id).filter(
+        ReservationStatEvent.event_type == event_type,
+        ReservationStatEvent.reservation_id == reservation.id,
+    ).first()
+    if exists:
+        return False
+
+    session.add(ReservationStatEvent(
+        event_type=event_type,
+        reservation_id=reservation.id,
+        user_id=reservation.user_id,
+        post_id=reservation.post_id,
+        quantity=max(int(reservation.quantity or 0), 1),
+        created_at=event_time or now_local(),
+    ))
+    return True
+
+
+def record_reservation_stat_event(event_type, reservation, event_time=None):
+    try:
+        with Session(bind=engine) as session:
+            added = add_reservation_stat_event(session, event_type, reservation, event_time=event_time)
+            if added:
+                session.commit()
+            return added
+    except Exception as exc:
+        logger.warning(
+            "Reservation stat event failed type=%s reservation_id=%s: %s",
+            event_type,
+            getattr(reservation, "id", None),
+            exc,
+        )
+        return False
+
+
+def get_reservation_stats_snapshot(value=None):
+    start, end = today_bounds(value)
+    with Session(bind=engine) as session:
+        current_total = session.query(func.count(Reservations.id)).scalar() or 0
+        today_created = session.query(func.count(ReservationStatEvent.id)).filter(
+            ReservationStatEvent.event_type == RESERVATION_STATS_EVENT_CREATED,
+            ReservationStatEvent.created_at >= start,
+            ReservationStatEvent.created_at < end,
+        ).scalar() or 0
+        today_canceled = session.query(func.count(ReservationStatEvent.id)).filter(
+            ReservationStatEvent.event_type == RESERVATION_STATS_EVENT_CANCELED,
+            ReservationStatEvent.created_at >= start,
+            ReservationStatEvent.created_at < end,
+        ).scalar() or 0
+        today_fulfilled = session.query(func.count(ReservationStatEvent.id)).filter(
+            ReservationStatEvent.event_type == RESERVATION_STATS_EVENT_FULFILLED,
+            ReservationStatEvent.created_at >= start,
+            ReservationStatEvent.created_at < end,
+        ).scalar() or 0
+    return {
+        "current_total": int(current_total),
+        "today_created": int(today_created),
+        "today_canceled": int(today_canceled),
+        "today_fulfilled": int(today_fulfilled),
+        "updated_at": value or now_local(),
+    }
+
+
+def build_reservation_stats_text(snapshot=None, title="Статистика броней"):
+    snapshot = snapshot or get_reservation_stats_snapshot()
+    return (
+        f"{title}\n"
+        f"Дата: {snapshot['updated_at'].strftime('%d.%m.%Y')}\n"
+        f"Обновлено: {snapshot['updated_at'].strftime('%H:%M:%S')}\n\n"
+        f"Броней сейчас: {snapshot['current_total']}\n"
+        f"Броней сегодня всего: {snapshot['today_created']}\n"
+        f"Отказались сегодня: {snapshot['today_canceled']}\n"
+        f"Обработано сегодня: {snapshot['today_fulfilled']}"
+    )
+
+
+def build_reservation_stats_close_markup(user_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Закрыть", callback_data=f"reservation_stats_close_{user_id}"))
+    return markup
+
+
+def get_supreme_leader_user_ids():
+    with Session(bind=engine) as session:
+        rows = session.query(Clients.user_id).filter(Clients.role == "supreme_leader").all()
+    return [row[0] for row in rows]
+
+
+def send_daily_reservation_stats_report(target_date=None):
+    snapshot = get_reservation_stats_snapshot(target_date or now_local())
+    text = build_reservation_stats_text(snapshot, title="Ежедневная статистика броней")
+    sent_count = 0
+    for user_id in get_supreme_leader_user_ids():
+        try:
+            bot.send_message(user_id, text)
+            sent_count += 1
+            time.sleep(0.3)
+        except Exception as exc:
+            logger.warning("Daily reservation stats report failed for user_id=%s: %s", user_id, exc)
+    logger.info("Daily reservation stats report sent to supreme leaders: %s", sent_count)
+    return sent_count
+
+
+def get_reservation_stats_report_state():
+    state = user_data.get(RESERVATION_STATS_REPORT_STATE_KEY, {})
+    return state if isinstance(state, dict) else {}
+
+
+def save_reservation_stats_report_state(state):
+    user_data[RESERVATION_STATS_REPORT_STATE_KEY] = state
+
+
+def should_send_reservation_stats_report(value):
+    value = value.astimezone(SAMARA_TZ) if value.tzinfo else value.replace(tzinfo=SAMARA_TZ)
+    return value.hour == RESERVATION_STATS_REPORT_HOUR and value.minute == RESERVATION_STATS_REPORT_MINUTE
+
+
+def run_reservation_stats_daily_report(current=None):
+    current = current or now_samara()
+    if not should_send_reservation_stats_report(current):
+        return False
+
+    slot_key = current.date().isoformat()
+    state = get_reservation_stats_report_state()
+    if state.get("last_daily_report_date") == slot_key:
+        return False
+
+    send_daily_reservation_stats_report(current.replace(tzinfo=None))
+    state["last_daily_report_date"] = slot_key
+    state["last_daily_report_sent_at"] = serialize_datetime(now_local())
+    save_reservation_stats_report_state(state)
+    return True
+
+
+def reservation_stats_daily_report_loop():
+    while True:
+        try:
+            run_reservation_stats_daily_report()
+        except Exception:
+            logger.exception("Reservation stats daily report loop failed")
+
+        if reservation_stats_report_stop_event.wait(RESERVATION_STATS_CHECK_SECONDS):
+            return
+
+
+def start_reservation_stats_daily_report_worker():
+    global reservation_stats_report_started
+    if reservation_stats_report_started:
+        return
+
+    reservation_stats_report_started = True
+    thread = threading.Thread(
+        target=reservation_stats_daily_report_loop,
+        name="reservation-stats-daily-report",
+        daemon=True,
+    )
+    thread.start()
+
+
+def update_live_reservation_stats(user_id, chat_id, message_id):
+    while True:
+        time.sleep(10)
+        with reservation_stats_live_lock:
+            session_info = reservation_stats_live_sessions.get(user_id)
+            if not session_info or session_info.get("message_id") != message_id:
+                return
+
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=build_reservation_stats_text(title="Живая статистика броней"),
+                reply_markup=build_reservation_stats_close_markup(user_id),
+            )
+        except Exception as exc:
+            if is_message_not_modified_error(exc):
+                continue
+            logger.warning("Live reservation stats update failed user_id=%s message_id=%s: %s", user_id, message_id, exc)
+
+
+@bot.message_handler(func=lambda message: message.text == "БроньСтатистик")
+def show_live_reservation_stats(message):
+    user_id = message.from_user.id
+    if get_client_role(user_id) != "supreme_leader":
+        bot.send_message(message.chat.id, "У вас нет прав доступа к этой функции.")
+        return
+
+    sent_message = bot.send_message(
+        message.chat.id,
+        build_reservation_stats_text(title="Живая статистика броней"),
+        reply_markup=build_reservation_stats_close_markup(user_id),
+    )
+    with reservation_stats_live_lock:
+        reservation_stats_live_sessions[user_id] = {
+            "chat_id": message.chat.id,
+            "message_id": sent_message.message_id,
+        }
+
+    thread = threading.Thread(
+        target=update_live_reservation_stats,
+        args=(user_id, message.chat.id, sent_message.message_id),
+        name=f"reservation-stats-live-{user_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("reservation_stats_close_"))
+def close_live_reservation_stats(call):
+    try:
+        target_user_id = int(call.data.rsplit("_", 1)[1])
+    except ValueError:
+        safe_answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
+        return
+
+    if call.from_user.id != target_user_id or get_client_role(call.from_user.id) != "supreme_leader":
+        safe_answer_callback_query(call.id, "У вас нет прав доступа.", show_alert=True)
+        return
+
+    with reservation_stats_live_lock:
+        reservation_stats_live_sessions.pop(target_user_id, None)
+
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="Статистика броней закрыта.",
+            reply_markup=None,
+        )
+    except Exception as exc:
+        if not is_message_not_modified_error(exc):
+            logger.warning("Live reservation stats close edit failed: %s", exc)
+
+    bot.send_message(
+        call.message.chat.id,
+        "Главное меню",
+        reply_markup=supreme_leader_main_menu(),
+    )
+    safe_answer_callback_query(call.id)
 
 # Получение неотправленных постов
 @bot.message_handler(commands=["unsent_posts"])
@@ -899,6 +1164,7 @@ def handle_reservation(call):
             session.add(reservation)
             session.flush()
             reservation_id = reservation.id
+            add_reservation_stat_event(session, RESERVATION_STATS_EVENT_CREATED, reservation, event_time=reservation.created_at)
             session.commit()
 
             update_channel_post_message(post)
@@ -1461,6 +1727,7 @@ def ensure_temp_fulfilled_for_reservation(session, reservation):
 
     reservation.is_fulfilled = True
     reservation.fulfilled_at = fulfilled_at
+    add_reservation_stat_event(session, RESERVATION_STATS_EVENT_FULFILLED, reservation, event_time=fulfilled_at)
     return True
 
 
@@ -1838,6 +2105,7 @@ def cancel_reservation(call):
         if not success:
             safe_answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
             return
+        record_reservation_stat_event(RESERVATION_STATS_EVENT_CANCELED, order)
 
         with Session(bind=engine) as session:
             next_in_queue = session.query(TempReservations).filter(
@@ -1862,6 +2130,12 @@ def cancel_reservation(call):
                 session.add(queued_reservation)
                 session.flush()
                 queued_reservation_id = queued_reservation.id
+                add_reservation_stat_event(
+                    session,
+                    RESERVATION_STATS_EVENT_CREATED,
+                    queued_reservation,
+                    event_time=queued_reservation.created_at,
+                )
                 next_in_queue.temp_fulfilled = True
                 session.commit()
                 if queued_post and queued_client:
@@ -2827,6 +3101,12 @@ def create_reservation_from_queue(session, queued_entry, post):
     )
     session.add(queued_reservation)
     session.flush()
+    add_reservation_stat_event(
+        session,
+        RESERVATION_STATS_EVENT_CREATED,
+        queued_reservation,
+        event_time=queued_reservation.created_at,
+    )
     queued_entry.temp_fulfilled = True
     return {
         "reservation_id": queued_reservation.id,
@@ -6498,6 +6778,7 @@ def run_bot():
     start_reservation_auto_fulfill_worker()
     start_channel_post_auto_publish_worker()
     start_delivery_cleanup_worker()
+    start_reservation_stats_daily_report_worker()
     start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)
     retry_delay = 5
 

@@ -11,6 +11,7 @@ from .revision_logs import RevisionLog
 from .deleted_post_snapshots import DeletedPostSnapshot
 from .delivery_cleanup_runs import DeliveryCleanupRun
 from .post_id_reservations import PostIdReservation
+from .reservation_stat_events import ReservationStatEvent
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -29,6 +30,7 @@ def run_schema_migrations():
     run_migration("002_delivery_cutoff_metadata", ensure_delivery_cutoff_metadata)
     run_migration("003_revision_delivery_cleanup_tables", ensure_revision_delivery_cleanup_tables)
     run_migration("004_post_id_reservations", ensure_post_id_reservations)
+    run_migration("005_reservation_stat_events", ensure_reservation_stat_events)
 
 
 def ensure_schema_migrations():
@@ -289,6 +291,51 @@ def ensure_post_id_reservations():
             "ON post_id_reservations (reserved_at)"
         ))
 
+
+def ensure_reservation_stat_events():
+    AbstractModel.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_reservation_stat_events_event_reservation "
+            "ON reservation_stat_events (event_type, reservation_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_reservation_stat_events_type_created "
+            "ON reservation_stat_events (event_type, created_at)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_reservation_stat_events_reservation_id "
+            "ON reservation_stat_events (reservation_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_reservation_stat_events_user_id "
+            "ON reservation_stat_events (user_id)"
+        ))
+        connection.execute(text(
+            "INSERT INTO reservation_stat_events "
+            "(event_type, reservation_id, user_id, post_id, quantity, created_at) "
+            "SELECT 'created', r.id, r.user_id, r.post_id, r.quantity, "
+            "COALESCE(r.created_at, CURRENT_TIMESTAMP) "
+            "FROM reservations r "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM reservation_stat_events e "
+            "WHERE e.event_type = 'created' AND e.reservation_id = r.id"
+            ")"
+        ))
+        connection.execute(text(
+            "INSERT INTO reservation_stat_events "
+            "(event_type, reservation_id, user_id, post_id, quantity, created_at) "
+            "SELECT 'fulfilled', r.id, r.user_id, r.post_id, r.quantity, r.fulfilled_at "
+            "FROM reservations r "
+            "WHERE r.is_fulfilled = TRUE "
+            "AND r.fulfilled_at IS NOT NULL "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM reservation_stat_events e "
+            "WHERE e.event_type = 'fulfilled' AND e.reservation_id = r.id"
+            ")"
+        ))
+
 __all__ = {
     "Posts",
     "Clients",
@@ -303,5 +350,6 @@ __all__ = {
     "DeletedPostSnapshot",
     "DeliveryCleanupRun",
     "PostIdReservation",
+    "ReservationStatEvent",
     "init_db",
 }
