@@ -451,8 +451,11 @@ def test_delivery_collection_pauses_reserved_group_flow():
         "time.sleep(RESERVED_GROUP_SEND_INTERVAL_SECONDS)",
         "send_reserved_group_message(session, reservation, post, client, force=True)",
         "if not force and is_reserved_group_delivery_paused():",
+        "recover_stale=False",
+        "Recovering stale reserved group resume flag after process start",
+        "state[\"resume_flush_started_at\"]",
         "start_reserved_group_resume_flush_if_delivery_done(message.chat.id)",
-        "start_reserved_group_resume_flush_if_delivery_done()",
+        "start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)",
     ]:
         if marker not in text:
             raise AssertionError(f"delivery reserved group pause marker missing {marker}")

@@ -1241,7 +1241,7 @@ def flush_reserved_group_queue_after_delivery(admin_chat_id=None):
                 logger.exception("Reserved group resume failure notification failed")
 
 
-def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None):
+def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None, recover_stale=False):
     with Session(bind=engine) as session:
         remaining_delivery_count = session.query(func.count(ForDelivery.id)).scalar() or 0
     if remaining_delivery_count > 0:
@@ -1252,9 +1252,12 @@ def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None):
         if not state.get("delivery_collection_paused"):
             return False
         if state.get("resume_flush_running"):
-            return False
+            if not recover_stale:
+                return False
+            logger.warning("Recovering stale reserved group resume flag after process start")
 
         state["resume_flush_running"] = True
+        state["resume_flush_started_at"] = serialize_datetime(now_local())
         save_reserved_group_flow_state(state)
 
     thread = threading.Thread(
@@ -6432,7 +6435,7 @@ def run_bot():
     start_reservation_auto_fulfill_worker()
     start_channel_post_auto_publish_worker()
     start_delivery_cleanup_worker()
-    start_reserved_group_resume_flush_if_delivery_done()
+    start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)
     retry_delay = 5
 
     while True:
