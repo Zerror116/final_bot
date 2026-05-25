@@ -228,6 +228,13 @@ def test_reservation_stats_markers():
     for marker in [
         "RESERVATION_STATS_REPORT_HOUR = 16",
         "RESERVATION_STATS_REPORT_MINUTE = 10",
+        "RESERVATION_STATS_DAY_START_HOUR = 6",
+        "RESERVATION_STATS_DAY_END_HOUR = 23",
+        "current.replace(hour=RESERVATION_STATS_DAY_START_HOUR",
+        "current.replace(hour=RESERVATION_STATS_DAY_END_HOUR",
+        "\"period_start\": start",
+        "\"period_end\": end",
+        "Период: {snapshot['period_start'].strftime('%H:%M')}-{snapshot['period_end'].strftime('%H:%M')} по Самаре",
         "def add_reservation_stat_event(session, event_type, reservation, event_time=None):",
         "RESERVATION_STATS_EVENT_CREATED",
         "RESERVATION_STATS_EVENT_CANCELED",

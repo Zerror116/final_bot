@@ -64,6 +64,8 @@ DELIVERY_CLEANUP_CHECK_SECONDS = 60
 RESERVATION_STATS_REPORT_HOUR = 16
 RESERVATION_STATS_REPORT_MINUTE = 10
 RESERVATION_STATS_CHECK_SECONDS = 30
+RESERVATION_STATS_DAY_START_HOUR = 6
+RESERVATION_STATS_DAY_END_HOUR = 23
 RESERVATION_STATS_EVENT_CREATED = "created"
 RESERVATION_STATS_EVENT_CANCELED = "canceled"
 RESERVATION_STATS_EVENT_FULFILLED = "fulfilled"
@@ -458,8 +460,9 @@ def today_bounds(value=None):
     current = value or now_local()
     if current.tzinfo is not None:
         current = current.astimezone(SAMARA_TZ).replace(tzinfo=None)
-    start = current.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start, start + timedelta(days=1)
+    start = current.replace(hour=RESERVATION_STATS_DAY_START_HOUR, minute=0, second=0, microsecond=0)
+    end = current.replace(hour=RESERVATION_STATS_DAY_END_HOUR, minute=0, second=0, microsecond=0)
+    return start, end
 
 
 def add_reservation_stat_event(session, event_type, reservation, event_time=None):
@@ -525,6 +528,8 @@ def get_reservation_stats_snapshot(value=None):
         "today_created": int(today_created),
         "today_canceled": int(today_canceled),
         "today_fulfilled": int(today_fulfilled),
+        "period_start": start,
+        "period_end": end,
         "updated_at": value or now_local(),
     }
 
@@ -534,6 +539,7 @@ def build_reservation_stats_text(snapshot=None, title="Статистика бр
     return (
         f"{title}\n"
         f"Дата: {snapshot['updated_at'].strftime('%d.%m.%Y')}\n"
+        f"Период: {snapshot['period_start'].strftime('%H:%M')}-{snapshot['period_end'].strftime('%H:%M')} по Самаре\n"
         f"Обновлено: {snapshot['updated_at'].strftime('%H:%M:%S')}\n\n"
         f"Броней сейчас: {snapshot['current_total']}\n"
         f"Броней сегодня всего: {snapshot['today_created']}\n"
