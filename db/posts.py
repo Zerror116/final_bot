@@ -1,9 +1,10 @@
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
@@ -71,19 +72,11 @@ class Posts(AbstractModel):
     @staticmethod
     def reserve_next_id(chat_id=None, max_attempts=POST_ID_RESERVATION_ATTEMPTS):
         owner_chat_id = int(chat_id or 0)
+        Posts.cleanup_post_id_reservations(owner_chat_id)
+
         for attempt in range(1, max_attempts + 1):
             now = samara_now_naive()
-            expires_before = now - POST_ID_RESERVATION_TTL
             with Session(bind=engine) as session:
-                session.query(PostIdReservation).filter(
-                    PostIdReservation.reserved_at < expires_before
-                ).delete(synchronize_session=False)
-                if owner_chat_id:
-                    session.query(PostIdReservation).filter(
-                        PostIdReservation.chat_id == owner_chat_id
-                    ).delete(synchronize_session=False)
-                session.flush()
-
                 reserved_post_id = session.execute(text("""
                     WITH used_ids AS (
                         SELECT id FROM posts WHERE id > 0
@@ -126,8 +119,31 @@ class Posts(AbstractModel):
                     session.rollback()
                     if attempt == max_attempts:
                         raise
+                except SQLAlchemyError:
+                    session.rollback()
+                    if attempt == max_attempts:
+                        raise
+                    time.sleep(0.2 * attempt)
 
         raise RuntimeError("Не удалось зарезервировать свободный ID товара.")
+
+    @staticmethod
+    def cleanup_post_id_reservations(owner_chat_id=0):
+        now = samara_now_naive()
+        expires_before = now - POST_ID_RESERVATION_TTL
+        try:
+            with Session(bind=engine) as session:
+                session.query(PostIdReservation).filter(
+                    PostIdReservation.reserved_at < expires_before
+                ).delete(synchronize_session=False)
+                if owner_chat_id:
+                    session.query(PostIdReservation).filter(
+                        PostIdReservation.chat_id == int(owner_chat_id)
+                    ).delete(synchronize_session=False)
+                session.commit()
+        except SQLAlchemyError:
+            return False
+        return True
 
     @staticmethod
     def post_id_has_any_links(session, post_id):
