@@ -456,12 +456,15 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
     reservation_text = (ROOT / "db" / "post_id_reservations.py").read_text(encoding="utf-8")
 
     for marker in [
-        "def reserve_next_id(chat_id=None):",
+        "def reserve_next_id(chat_id=None, max_attempts=POST_ID_RESERVATION_ATTEMPTS):",
+        "POST_ID_RESERVATION_ATTEMPTS = 10",
+        "for attempt in range(1, max_attempts + 1):",
         "post_id_reservations",
         "SELECT 1 AS id",
         "SELECT id + 1 FROM posts WHERE id > 0",
         "SELECT post_id + 1 FROM post_id_reservations WHERE post_id > 0",
         "PostIdReservation(",
+        "except IntegrityError:",
         "def release_reserved_id(post_id, chat_id=None):",
         "post_id: int = None",
         "id=post_id",
@@ -469,6 +472,8 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
     ]:
         if marker not in posts_text:
             raise AssertionError(f"post id reservation marker missing {marker}")
+    if "pg_advisory_xact_lock" in posts_text:
+        raise AssertionError("post id reservation must not use advisory locks")
 
     for marker in [
         "class PostIdReservation",
