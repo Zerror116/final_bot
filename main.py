@@ -49,6 +49,7 @@ DELIVERY_ROLES = {"admin", "supreme_leader"}
 DELIVERY_THRESHOLD = 1500
 RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
+POST_ID_REUSE_STALE_GRACE = timedelta(days=2)
 DELIVERY_COLLECTION_PAGE_SIZE = 8
 LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
@@ -60,6 +61,7 @@ DELIVERY_CLEANUP_CHECK_SECONDS = 60
 RESERVED_GROUP_FLOW_STATE_KEY = 0
 RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
+RESERVED_GROUP_MESSAGE_SKIPPED = -1
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -245,11 +247,15 @@ def delete_channel_post_if_fully_processed(post_id):
         if post.quantity > 0:
             return False
 
-        pending_reservation = session.query(Reservations.id).filter(
+        pending_reservations = session.query(Reservations).filter(
             Reservations.post_id == post_id,
             Reservations.is_fulfilled == False,
-        ).first()
-        if pending_reservation:
+        ).all()
+        has_pending_current_reservation = any(
+            not reservation_is_stale_for_current_post(reservation, post)
+            for reservation in pending_reservations
+        )
+        if has_pending_current_reservation:
             return False
 
         message_id = post.message_id
@@ -1092,6 +1098,16 @@ def build_reserved_group_caption(reservation, post, client):
     return "\n".join(lines)
 
 
+def reservation_is_stale_for_current_post(reservation, post):
+    if not reservation or not post:
+        return False
+    if not isinstance(post, Posts):
+        return False
+    if not reservation.created_at or not post.created_at:
+        return False
+    return reservation.created_at < post.created_at - POST_ID_REUSE_STALE_GRACE
+
+
 def get_reserved_group_flow_state():
     state = user_data.get(RESERVED_GROUP_FLOW_STATE_KEY, {})
     return state if isinstance(state, dict) else {}
@@ -1137,6 +1153,22 @@ def get_reserved_group_queued_reservation_ids(limit=RESERVED_GROUP_RESUME_BATCH_
             Reservations.id,
         ).limit(limit).all()
     return [row[0] for row in rows]
+
+
+def has_reserved_group_message(reservation):
+    message_id = getattr(reservation, "reserved_group_message_id", None)
+    return bool(message_id and message_id > 0)
+
+
+def mark_reserved_group_message_skipped(session, reservation, reason):
+    reservation.reserved_group_message_id = RESERVED_GROUP_MESSAGE_SKIPPED
+    session.commit()
+    logger.warning(
+        "Reserved group message skipped for reservation_id=%s post_id=%s: %s",
+        reservation.id,
+        reservation.post_id,
+        reason,
+    )
 
 
 def reserved_group_resume_delay(remaining_count=None):
@@ -1186,6 +1218,20 @@ def flush_reserved_group_queue_after_delivery(admin_chat_id=None):
 
                     post = get_post_or_snapshot(session, reservation.post_id)
                     client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+                    if not post:
+                        mark_reserved_group_message_skipped(
+                            session,
+                            reservation,
+                            "post and deleted snapshot are missing",
+                        )
+                        continue
+                    if reservation_is_stale_for_current_post(reservation, post):
+                        mark_reserved_group_message_skipped(
+                            session,
+                            reservation,
+                            "reservation predates the current post with the same ID",
+                        )
+                        continue
                     if not send_reserved_group_message(session, reservation, post, client, force=True):
                         raise RuntimeError(f"queued reserved message send failed for reservation_id={reservation_id}")
                     sent_count += 1
@@ -1334,7 +1380,7 @@ def store_reserved_group_message_id(reservation_id, message_id, attempts=3):
 def update_reserved_group_message_by_id(reservation_id):
     with Session(bind=engine) as session:
         reservation = session.query(Reservations).filter(Reservations.id == reservation_id).first()
-        if not reservation or not reservation.reserved_group_message_id:
+        if not reservation or not has_reserved_group_message(reservation):
             return False
         post = get_post_or_snapshot(session, reservation.post_id)
         client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
@@ -1343,7 +1389,7 @@ def update_reserved_group_message_by_id(reservation_id):
 
 
 def mark_reserved_group_message_canceled(reservation, post, client):
-    if not reservation.reserved_group_message_id:
+    if not has_reserved_group_message(reservation):
         return False
     caption = (
         f"{build_reserved_group_caption(reservation, post, client)}\n"
@@ -1365,6 +1411,16 @@ def ensure_temp_fulfilled_for_reservation(session, reservation):
     post = get_post_or_snapshot(session, reservation.post_id)
     client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
     if not post or not client:
+        return False
+    if reservation_is_stale_for_current_post(reservation, post):
+        reservation.reserved_group_message_id = RESERVED_GROUP_MESSAGE_SKIPPED
+        logger.warning(
+            "Auto-fulfill skipped stale reservation_id=%s post_id=%s reservation_created_at=%s post_created_at=%s",
+            reservation.id,
+            reservation.post_id,
+            reservation.created_at,
+            post.created_at,
+        )
         return False
 
     amount = calculate_order_amount(reservation, post)
@@ -1403,6 +1459,10 @@ def auto_fulfill_expired_reservations(now=None, older_than_seconds=RESERVATION_A
     with Session(bind=engine) as session:
         expired_reservations = session.query(Reservations).filter(
             Reservations.is_fulfilled == False,
+            or_(
+                Reservations.reserved_group_message_id == None,
+                Reservations.reserved_group_message_id != RESERVED_GROUP_MESSAGE_SKIPPED,
+            ),
             or_(
                 Reservations.created_at == None,
                 Reservations.created_at <= deadline,
@@ -2736,7 +2796,7 @@ def delete_temp_fulfilled_for_reservation(session, reservation):
 
 
 def mark_reserved_group_message_removed_by_admin(reservation, post, client):
-    if not reservation.reserved_group_message_id:
+    if not has_reserved_group_message(reservation):
         return False
     caption = (
         f"{build_reserved_group_caption(reservation, post, client)}\n"

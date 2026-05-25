@@ -15,6 +15,19 @@ POST_ID_RESERVATION_TTL = timedelta(hours=6)
 POST_ID_RESERVATION_ATTEMPTS = 10
 
 
+USED_POST_ID_TABLES = (
+    ("posts", "id"),
+    ("post_id_reservations", "post_id"),
+    ("reservations", "post_id"),
+    ("temp_fulfilled", "post_id"),
+    ("in_delivery", "post_id"),
+    ("temp_reservations", "post_id"),
+    ("deleted_post_snapshots", "post_id"),
+    ("revision_logs", "post_id"),
+)
+HISTORICAL_POST_ID_TABLES = USED_POST_ID_TABLES[2:]
+
+
 def samara_now_naive():
     return datetime.now(SAMARA_TZ).replace(tzinfo=None)
 
@@ -72,21 +85,32 @@ class Posts(AbstractModel):
                 session.flush()
 
                 reserved_post_id = session.execute(text("""
-                    WITH candidates AS (
+                    WITH used_ids AS (
+                        SELECT id FROM posts WHERE id > 0
+                        UNION
+                        SELECT post_id AS id FROM post_id_reservations WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM reservations WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM temp_fulfilled WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM in_delivery WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM temp_reservations WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM deleted_post_snapshots WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM revision_logs WHERE post_id > 0
+                    ),
+                    candidates AS (
                         SELECT 1 AS id
                         UNION
-                        SELECT id + 1 FROM posts WHERE id > 0
-                        UNION
-                        SELECT post_id + 1 FROM post_id_reservations WHERE post_id > 0
+                        SELECT id + 1 FROM used_ids
                     )
                     SELECT MIN(c.id)
                     FROM candidates c
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM posts p WHERE p.id = c.id
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM post_id_reservations r WHERE r.post_id = c.id
-                    )
+                    WHERE c.id > 0
+                    AND NOT EXISTS (SELECT 1 FROM used_ids u WHERE u.id = c.id)
                 """)).scalar()
 
                 reserved_post_id = int(reserved_post_id or 1)
@@ -104,6 +128,18 @@ class Posts(AbstractModel):
                         raise
 
         raise RuntimeError("Не удалось зарезервировать свободный ID товара.")
+
+    @staticmethod
+    def post_id_has_any_links(session, post_id):
+        post_id = int(post_id)
+        for table_name, column_name in HISTORICAL_POST_ID_TABLES:
+            exists = session.execute(
+                text(f"SELECT 1 FROM {table_name} WHERE {column_name} = :post_id LIMIT 1"),
+                {"post_id": post_id},
+            ).first()
+            if exists:
+                return True
+        return False
 
     @staticmethod
     def release_reserved_id(post_id, chat_id=None):
@@ -135,6 +171,8 @@ class Posts(AbstractModel):
                 raise ValueError(f"ID {post_id} уже зарезервирован для другого поста.")
             if session.query(Posts.id).filter(Posts.id == post_id).first():
                 raise ValueError(f"ID {post_id} уже занят другим товаром.")
+            if Posts.post_id_has_any_links(session, post_id):
+                raise ValueError(f"ID {post_id} уже используется в истории товара.")
 
             posts = Posts(
                 id=post_id,
