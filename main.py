@@ -1256,8 +1256,11 @@ def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None, recov
                 return False
             logger.warning("Recovering stale reserved group resume flag after process start")
 
+        resumed_at = serialize_datetime(now_local())
+        state["delivery_collection_paused"] = False
         state["resume_flush_running"] = True
-        state["resume_flush_started_at"] = serialize_datetime(now_local())
+        state["resume_flush_started_at"] = resumed_at
+        state["resumed_at"] = resumed_at
         save_reserved_group_flow_state(state)
 
     thread = threading.Thread(

@@ -453,6 +453,7 @@ def test_delivery_collection_pauses_reserved_group_flow():
         "if not force and is_reserved_group_delivery_paused():",
         "recover_stale=False",
         "Recovering stale reserved group resume flag after process start",
+        "state[\"delivery_collection_paused\"] = False",
         "state[\"resume_flush_started_at\"]",
         "start_reserved_group_resume_flush_if_delivery_done(message.chat.id)",
         "start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)",
