@@ -164,6 +164,29 @@ def test_channel_post_updates_are_centralized():
             raise AssertionError(f"channel post update helper missing {marker}")
 
 
+def test_cancel_reservation_returns_stock_and_refreshes_channel():
+    text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "def cancel_unfulfilled_reservation(reservation_id, related_user_ids):",
+        "post.quantity = int(post.quantity or 0) + quantity_to_release",
+        "updated_post = Posts.get_row_by_id(post_id)",
+        "update_channel_post_message(updated_post)",
+        "send_queue_transfer_notifications(queued_notifications)",
+        "cancel_result = cancel_unfulfilled_reservation(reservation_id, related_user_ids)",
+    ]:
+        if marker not in text:
+            raise AssertionError(f"cancel reservation stock return marker missing {marker}")
+
+    cancel_block = text.split("def cancel_reservation(call):", 1)[1].split(
+        '@bot.callback_query_handler(func=lambda call: call.data.startswith("enqueue_"))',
+        1,
+    )[0]
+    if "Posts.increment_quantity_by_id" in cancel_block:
+        raise AssertionError("cancel flow must refresh stock and channel through the atomic helper")
+    if "Reservations.cancel_order_by_id" in cancel_block:
+        raise AssertionError("cancel flow must not delete reservation before stock/queue handling")
+
+
 def test_callback_answers_are_safe():
     text = MAIN.read_text(encoding="utf-8")
     if "def safe_answer_callback_query" not in text:
@@ -248,7 +271,7 @@ def test_reservation_stats_markers():
         "time.sleep(10)",
         "build_reservation_stats_close_markup(user_id)",
         "add_reservation_stat_event(session, RESERVATION_STATS_EVENT_CREATED, reservation",
-        "record_reservation_stat_event(RESERVATION_STATS_EVENT_CANCELED, order)",
+        "add_reservation_stat_event(\n            session,\n            RESERVATION_STATS_EVENT_CANCELED,\n            reservation",
         "add_reservation_stat_event(session, RESERVATION_STATS_EVENT_FULFILLED, reservation",
     ]:
         if marker not in main_text:
@@ -718,6 +741,7 @@ def main():
     test_reserved_group_flow_markers()
     test_reservation_auto_fulfill_uses_local_time()
     test_channel_post_updates_are_centralized()
+    test_cancel_reservation_returns_stock_and_refreshes_channel()
     test_callback_answers_are_safe()
     test_phoenix_broadcast_markers()
     test_reservation_stats_markers()

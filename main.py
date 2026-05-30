@@ -1950,6 +1950,86 @@ def order_details(call):
         print(f"Ошибка отображения деталей заказа: {e}")
         safe_answer_callback_query(call.id, "Произошла ошибка.", show_alert=True)
 
+
+def cancel_unfulfilled_reservation(reservation_id, related_user_ids):
+    related_user_ids = set(related_user_ids or [])
+    queued_notifications = []
+    canceled_group_update = None
+    post_id = None
+    channel_update_needed = False
+
+    with Session(bind=engine) as session:
+        reservation = session.query(Reservations).filter(
+            Reservations.id == reservation_id,
+        ).with_for_update().first()
+        if not reservation:
+            return {"status": "not_found"}
+        if reservation.user_id not in related_user_ids:
+            return {"status": "forbidden"}
+        if reservation.is_fulfilled:
+            return {"status": "fulfilled"}
+
+        post = session.query(Posts).filter(
+            Posts.id == reservation.post_id,
+        ).with_for_update().first()
+        if not post:
+            return {"status": "post_missing"}
+
+        post_id = reservation.post_id
+        post_photo = post.photo
+        quantity_to_release = max(int(reservation.quantity or 0), 1)
+        order_client = session.query(Clients).filter(
+            Clients.user_id == reservation.user_id,
+        ).first()
+
+        if has_reserved_group_message(reservation):
+            canceled_group_update = (
+                reservation.reserved_group_message_id,
+                post_photo,
+                (
+                    f"{build_reserved_group_caption(reservation, post, order_client)}\n"
+                    f"❌ Заказ отменён клиентом: {format_datetime(now_local())}"
+                ),
+            )
+
+        add_reservation_stat_event(
+            session,
+            RESERVATION_STATS_EVENT_CANCELED,
+            reservation,
+            event_time=now_local(),
+        )
+
+        next_in_queue = session.query(TempReservations).filter(
+            TempReservations.post_id == post_id,
+            TempReservations.temp_fulfilled == False,
+        ).order_by(TempReservations.created_at).with_for_update().first()
+
+        session.delete(reservation)
+
+        if next_in_queue:
+            queued_notifications.append(create_reservation_from_queue(session, next_in_queue, post))
+            result_status = "queued"
+        else:
+            post.quantity = int(post.quantity or 0) + quantity_to_release
+            channel_update_needed = True
+            result_status = "returned"
+
+        session.commit()
+
+    if canceled_group_update:
+        message_id, post_photo, caption = canceled_group_update
+        edit_reserved_group_message(message_id, SimpleNamespace(photo=post_photo), caption)
+
+    if channel_update_needed and post_id:
+        updated_post = Posts.get_row_by_id(post_id)
+        if not update_channel_post_message(updated_post):
+            logger.warning("Channel post was not refreshed after cancellation for post_id=%s", post_id)
+
+    if queued_notifications:
+        send_queue_transfer_notifications(queued_notifications)
+
+    return {"status": result_status, "post_id": post_id}
+
 # Отображает список заказов
 @bot.callback_query_handler(func=lambda call: call.data == "my_orders")
 def show_my_orders(call):
@@ -2141,71 +2221,30 @@ def cancel_reservation(call):
             safe_answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
             return
 
-        post = Posts.get_row_by_id(order.post_id)
-        if not post:
+        cancel_result = cancel_unfulfilled_reservation(reservation_id, related_user_ids)
+        if cancel_result["status"] in {"not_found", "forbidden"}:
+            safe_answer_callback_query(call.id, "Резерв не найден или не принадлежит вам.", show_alert=True)
+            return
+        if cancel_result["status"] == "fulfilled":
+            safe_answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
+            return
+        if cancel_result["status"] == "post_missing":
             safe_answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
             return
-
-        order_client = Clients.get_row_by_user_id(order.user_id)
-        mark_reserved_group_message_canceled(order, post, order_client)
-
-        success = Reservations.cancel_order_by_id(reservation_id)
-        if not success:
-            safe_answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
+        if cancel_result["status"] == "queued":
+            safe_answer_callback_query(
+                call.id,
+                "Вы успешно отказались от товара. Он передан следующему в очереди.",
+                show_alert=False,
+            )
+            my_orders(call.message)
             return
-        record_reservation_stat_event(RESERVATION_STATS_EVENT_CANCELED, order)
 
-        with Session(bind=engine) as session:
-            next_in_queue = session.query(TempReservations).filter(
-                TempReservations.post_id == order.post_id,
-                TempReservations.temp_fulfilled == False
-            ).order_by(TempReservations.created_at).first()
-
-            if next_in_queue:
-                queued_user_id = next_in_queue.user_id
-                queued_post = session.query(Posts).filter(Posts.id == order.post_id).first()
-                queued_client = session.query(Clients).filter(
-                    Clients.user_id == queued_user_id
-                ).first()
-                queued_reservation = Reservations(
-                    user_id=queued_user_id,
-                    post_id=order.post_id,
-                    quantity=1,
-                    is_fulfilled=False,
-                    old_price=queued_post.price if queued_post else post.price,
-                    created_at=now_local(),
-                )
-                session.add(queued_reservation)
-                session.flush()
-                queued_reservation_id = queued_reservation.id
-                add_reservation_stat_event(
-                    session,
-                    RESERVATION_STATS_EVENT_CREATED,
-                    queued_reservation,
-                    event_time=queued_reservation.created_at,
-                )
-                next_in_queue.temp_fulfilled = True
-                session.commit()
-                if queued_post and queued_client:
-                    queued_reservation.id = queued_reservation_id
-                    send_reserved_group_message(session, queued_reservation, queued_post, queued_client)
-
-                bot.send_message(
-                    chat_id=queued_user_id,
-                    text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
-                )
-
-                safe_answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
-                                          show_alert=False)
-                my_orders(call.message)
-                return
-
-        Posts.increment_quantity_by_id(order.post_id)
-
-        update_channel_post_message(Posts.get_row_by_id(order.post_id))
-
-        safe_answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.",
-                                  show_alert=False)
+        safe_answer_callback_query(
+            call.id,
+            "Вы успешно отказались от товара. Товар доступен в канале.",
+            show_alert=False,
+        )
         my_orders(call.message)
 
     except ValueError as ve:
