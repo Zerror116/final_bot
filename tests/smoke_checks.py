@@ -576,6 +576,27 @@ def test_delivery_collection_pauses_reserved_group_flow():
             raise AssertionError(f"delivery reserved group pause marker missing {marker}")
 
 
+def test_audit_can_collect_delivery_only():
+    main_text = MAIN.read_text(encoding="utf-8")
+    keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
+
+    for marker in [
+        'DELIVERY_ROLES = {"admin", "supreme_leader"}',
+        'DELIVERY_COLLECTION_ROLES = DELIVERY_ROLES | {"audit"}',
+        'if not require_role(message, DELIVERY_COLLECTION_ROLES):',
+        'if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):',
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"audit delivery collection marker missing {marker}")
+
+    if 'collect_delivery = KeyboardButton("🧺 Собрать доставку")' not in keyboard_text:
+        raise AssertionError("audit menu must expose collect delivery button")
+
+    audit_menu = keyboard_text.split("def audit_main_menu():", 1)[1].split("def admin_main_menu():", 1)[0]
+    if "collect_delivery" not in audit_menu:
+        raise AssertionError("collect delivery button must be inside audit menu")
+
+
 def test_post_id_labels_for_new_posts_and_delivery_collection():
     main_text = MAIN.read_text(encoding="utf-8")
     posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
@@ -707,6 +728,7 @@ def main():
     test_channel_delete_happens_only_after_delivery_cleanup()
     test_delivery_clients_summary_markers()
     test_delivery_collection_pauses_reserved_group_flow()
+    test_audit_can_collect_delivery_only()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
     print("smoke checks ok")

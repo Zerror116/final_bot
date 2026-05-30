@@ -42,8 +42,9 @@ def audit_main_menu():
     create_new_post = KeyboardButton("➕ Новый пост")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
+    collect_delivery = KeyboardButton("🧺 Собрать доставку")
     audit_manage = KeyboardButton(" Ревизия")
-    audit_keydoard.add(create_new_post, my_orders, manage_posts, audit_manage)
+    audit_keydoard.add(create_new_post, my_orders, manage_posts, collect_delivery, audit_manage)
     return audit_keydoard
 
 def admin_main_menu():

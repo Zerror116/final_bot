@@ -49,6 +49,7 @@ from services.telegram_safe import (
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ADMIN_ROLES = {"admin", "supreme_leader"}
 DELIVERY_ROLES = {"admin", "supreme_leader"}
+DELIVERY_COLLECTION_ROLES = DELIVERY_ROLES | {"audit"}
 DELIVERY_THRESHOLD = 1500
 RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
@@ -6280,7 +6281,7 @@ def show_delivery_collection_list(chat_id, message_id=None, page=0):
 
 @bot.message_handler(func=lambda message: message.text == "🧺 Собрать доставку")
 def collect_delivery(message):
-    if not require_role(message, DELIVERY_ROLES):
+    if not require_role(message, DELIVERY_COLLECTION_ROLES):
         return
     auto_fulfill_expired_reservations()
     started_snapshot, snapshot_count = start_delivery_reserved_group_pause_and_snapshot()
@@ -6300,7 +6301,7 @@ def collect_delivery(message):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("collect_delivery_page_"))
 def paginate_delivery_collection(call):
-    if not has_role(call.from_user.id, DELIVERY_ROLES):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
         safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
@@ -6314,7 +6315,7 @@ def paginate_delivery_collection(call):
     and not call.data.startswith("collect_delivery_page_")
 )
 def show_delivery_collection_client(call):
-    if not has_role(call.from_user.id, DELIVERY_ROLES):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
         safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
@@ -6450,7 +6451,7 @@ def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delivery_collected_"))
 def mark_delivery_collected(call):
-    if not has_role(call.from_user.id, DELIVERY_ROLES):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
         safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
@@ -6478,7 +6479,7 @@ def mark_delivery_collected(call):
 
 @bot.message_handler(func=lambda message: get_state_action(message.chat.id) == "AWAITING_DELIVERY_COLLECTED_SUM")
 def handle_delivery_collected_sum(message):
-    if not require_role(message, DELIVERY_ROLES):
+    if not require_role(message, DELIVERY_COLLECTION_ROLES):
         clear_user_state(message.chat.id)
         return
 
