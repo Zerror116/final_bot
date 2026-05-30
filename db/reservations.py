@@ -22,6 +22,7 @@ class Reservations(AbstractModel):
         Index("ix_reservations_post_id", "post_id"),
         Index("ix_reservations_user_fulfilled", "user_id", "is_fulfilled"),
         Index("ix_reservations_fulfilled_created_at", "is_fulfilled", "created_at"),
+        Index("ix_reservations_fulfilled_at", "is_fulfilled", "fulfilled_at"),
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -32,9 +33,17 @@ class Reservations(AbstractModel):
     return_order = mapped_column(Integer, default=0)
     old_price = mapped_column(Integer, nullable=False)
     created_at = mapped_column(DateTime, nullable=True, default=utcnow_naive)
+    fulfilled_at = mapped_column(DateTime, nullable=True)
 
     @staticmethod
-    def insert(user_id: int, quantity: int, post_id: int, is_fulfilled: bool = False, old_price: int = None):
+    def insert(
+        user_id: int,
+        quantity: int,
+        post_id: int,
+        is_fulfilled: bool = False,
+        old_price: int = None,
+        fulfilled_at=None,
+    ):
         with Session(bind=engine) as session:
             if old_price is None:
                 post = session.query(Posts).filter(Posts.id == post_id).first()
@@ -45,6 +54,7 @@ class Reservations(AbstractModel):
                 post_id=post_id,
                 is_fulfilled=is_fulfilled,
                 old_price=old_price,
+                fulfilled_at=fulfilled_at,
             )
             session.add(reservations)
             session.commit()

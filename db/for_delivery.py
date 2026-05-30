@@ -1,4 +1,4 @@
-from sqlalchemy import BIGINT, Index, Integer, String
+from sqlalchemy import BIGINT, DateTime, Index, Integer, String
 from sqlalchemy.orm import mapped_column, Session
 from .db import AbstractModel, engine
 
@@ -15,9 +15,10 @@ class ForDelivery(AbstractModel):
     total_sum = mapped_column(Integer, nullable=False)
     address = mapped_column(String, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
+    delivery_cutoff_at = mapped_column(DateTime, nullable=True)
 
     @staticmethod
-    def insert(user_id, name, phone, address, total_sum):
+    def insert(user_id, name, phone, address, total_sum, delivery_cutoff_at=None):
         with Session(bind=engine) as session:
             try:
                 new_entry = ForDelivery(
@@ -25,7 +26,8 @@ class ForDelivery(AbstractModel):
                     name=name,
                     phone=phone,
                     address=address,
-                    total_sum=total_sum
+                    total_sum=total_sum,
+                    delivery_cutoff_at=delivery_cutoff_at,
                 )
                 session.add(new_entry)
                 session.commit()  # Подтверждаем изменения

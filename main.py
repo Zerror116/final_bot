@@ -7,6 +7,7 @@ import time
 import telebot
 import locale
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
@@ -17,6 +18,8 @@ from db.for_delivery import ForDelivery
 from db.temp_reservations import TempReservations
 from db.in_delivery import InDelivery
 from db.temp_fulfilied import Temp_Fulfilled
+from db.delivery_broadcast_campaigns import DeliveryBroadcastCampaign
+from db.delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -27,7 +30,7 @@ from handlers.reservations_manage import calculate_total_sum, calculate_processe
 from handlers.classess import *
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from db.bot_session import BotSession
 from services.pricing import calculate_audit_price
 from services.session_store import PersistentBucket
@@ -46,6 +49,16 @@ DELIVERY_THRESHOLD = 1500
 RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
 DELIVERY_COLLECTION_PAGE_SIZE = 8
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+DELIVERY_BROADCAST_CUTOFF_HOUR = 14
+DELIVERY_BROADCAST_CHECK_SECONDS = 60
+DELIVERY_BROADCAST_STALE_SENDING_MINUTES = 5
+DELIVERY_BROADCAST_STATUS_ACTIVE = "active"
+DELIVERY_BROADCAST_STATUS_FINISHED = "finished"
+DELIVERY_RECIPIENT_STATUS_SENDING = "sending"
+DELIVERY_RECIPIENT_STATUS_SENT = "sent"
+DELIVERY_RECIPIENT_STATUS_FAILED = "failed"
+DELIVERY_RECIPIENT_STATUS_UNKNOWN = "unknown"
 
 
 logging.basicConfig(
@@ -132,6 +145,9 @@ configure_locale()
 active_audit = {}
 reservation_auto_fulfill_started = False
 reservation_auto_fulfill_stop_event = threading.Event()
+delivery_broadcast_monitor_started = False
+delivery_broadcast_monitor_stop_event = threading.Event()
+delivery_broadcast_scan_lock = threading.Lock()
 
 
 def normalize_phone(phone):
@@ -177,6 +193,207 @@ def get_related_clients_by_full_phone(user_id):
 
 def get_related_user_ids_by_phone(phone):
     return [client.user_id for client in Clients.get_rows_by_phone(phone)]
+
+
+def now_samara():
+    return datetime.now(SAMARA_TZ)
+
+
+def now_samara_naive():
+    return now_samara().replace(tzinfo=None)
+
+
+def delivery_campaign_date(value=None):
+    current = value or now_samara()
+    if current.tzinfo is not None:
+        current = current.astimezone(SAMARA_TZ)
+    return current.date()
+
+
+def delivery_campaign_cutoff_at(value=None):
+    return datetime.combine(
+        delivery_campaign_date(value),
+        datetime_time(hour=DELIVERY_BROADCAST_CUTOFF_HOUR, minute=0),
+    )
+
+
+def parse_datetime_value(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def is_before_delivery_broadcast_cutoff(value=None, cutoff_at=None):
+    current = value or now_samara_naive()
+    if current.tzinfo is not None:
+        current = current.astimezone(SAMARA_TZ).replace(tzinfo=None)
+    return current < (cutoff_at or delivery_campaign_cutoff_at(current))
+
+
+def reservation_is_allowed_for_delivery_cutoff(reservation, cutoff_at):
+    if not reservation.is_fulfilled:
+        return False
+    if cutoff_at is None:
+        return True
+    # Legacy processed rows may not have fulfilled_at; keep them eligible so old carts are not lost.
+    if getattr(reservation, "fulfilled_at", None) is None:
+        return True
+    return reservation.fulfilled_at <= cutoff_at
+
+
+def build_channel_post_caption(post):
+    return f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
+
+
+def build_channel_post_markup(post):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}"),
+        InlineKeyboardButton("В Бота", url=f"{bot_link}?start=start"),
+    )
+    return markup
+
+
+def update_channel_post_message(post):
+    if not post or not post.message_id:
+        return False
+    try:
+        bot.edit_message_caption(
+            chat_id=CHANNEL_ID,
+            message_id=post.message_id,
+            caption=build_channel_post_caption(post),
+            reply_markup=build_channel_post_markup(post),
+        )
+        return True
+    except Exception as exc:
+        if is_message_not_modified_error(exc):
+            return True
+        logger.warning("Channel post update failed post_id=%s: %s", getattr(post, "id", None), exc)
+        return False
+
+
+def adjust_temp_fulfilled_for_released_reservation(session, reservation, post):
+    if not reservation.is_fulfilled:
+        return
+
+    amount = calculate_order_amount(reservation, post)
+    temp_row = session.query(Temp_Fulfilled).filter(
+        Temp_Fulfilled.user_id == reservation.user_id,
+        Temp_Fulfilled.post_id == reservation.post_id,
+        Temp_Fulfilled.in_delivery == False,
+    ).first()
+    if not temp_row:
+        return
+
+    if temp_row.quantity <= reservation.quantity:
+        session.delete(temp_row)
+        return
+
+    temp_row.quantity -= reservation.quantity
+    temp_row.price = max((temp_row.price or 0) - amount, 0)
+
+
+def release_reservation_safely(reservation_id):
+    notification = None
+    channel_post_id = None
+    result = {
+        "released": False,
+        "action": None,
+        "message": "Бронь не найдена.",
+    }
+
+    with Session(bind=engine) as session:
+        reservation = session.query(Reservations).filter(
+            Reservations.id == reservation_id
+        ).with_for_update().first()
+        if not reservation:
+            return result
+
+        post = session.query(Posts).filter(Posts.id == reservation.post_id).with_for_update().first()
+        if not post:
+            result["message"] = f"Товар {reservation.post_id} не найден, бронь не удалена."
+            return result
+
+        adjust_temp_fulfilled_for_released_reservation(session, reservation, post)
+        next_in_queue = session.query(TempReservations).filter(
+            TempReservations.post_id == reservation.post_id,
+            TempReservations.temp_fulfilled == False,
+        ).order_by(TempReservations.created_at).with_for_update().first()
+
+        session.delete(reservation)
+        if next_in_queue:
+            queued_quantity = max(int(next_in_queue.quantity or 1), 1)
+            queued_reservation = Reservations(
+                user_id=next_in_queue.user_id,
+                post_id=post.id,
+                quantity=queued_quantity,
+                is_fulfilled=False,
+                old_price=post.price,
+                created_at=now_samara_naive(),
+            )
+            session.add(queued_reservation)
+            next_in_queue.temp_fulfilled = True
+            notification = next_in_queue.user_id
+            result.update({
+                "released": True,
+                "action": "queued",
+                "message": "Товар передан следующему клиенту из очереди.",
+            })
+        else:
+            post.quantity += reservation.quantity
+            channel_post_id = post.id
+            result.update({
+                "released": True,
+                "action": "restored",
+                "message": "Товар возвращен на канал.",
+            })
+
+        session.commit()
+
+    if channel_post_id:
+        update_channel_post_message(Posts.get_row_by_id(channel_post_id))
+    if notification:
+        try:
+            bot.send_message(
+                chat_id=notification,
+                text="Ваш товар в очереди стал доступен и добавлен в вашу корзину.",
+            )
+        except Exception as exc:
+            logger.warning("Queue notification failed user_id=%s: %s", notification, exc)
+    return result
+
+
+def release_reservations_for_users(user_ids, only_fulfilled=None):
+    with Session(bind=engine) as session:
+        query = session.query(Reservations.id).filter(Reservations.user_id.in_(user_ids))
+        if only_fulfilled is not None:
+            query = query.filter(Reservations.is_fulfilled == only_fulfilled)
+        reservation_ids = [row[0] for row in query.order_by(Reservations.id).all()]
+
+    summary = {
+        "total": 0,
+        "restored": 0,
+        "queued": 0,
+        "failed": 0,
+        "errors": [],
+    }
+    for reservation_id in reservation_ids:
+        result = release_reservation_safely(reservation_id)
+        if result.get("released"):
+            summary["total"] += 1
+            if result.get("action") == "queued":
+                summary["queued"] += 1
+            elif result.get("action") == "restored":
+                summary["restored"] += 1
+        else:
+            summary["failed"] += 1
+            summary["errors"].append(result.get("message") or f"Бронь {reservation_id} не обработана")
+    return summary
 
 # Получение неотправленных постов
 @bot.message_handler(commands=["unsent_posts"])
@@ -623,25 +840,12 @@ def handle_reservation(call):
                 post_id=post_id,
                 quantity=1,
                 is_fulfilled=False,
-                old_price=post.price
+                old_price=post.price,
+                created_at=now_samara_naive(),
             )
             session.add(reservation)
             session.commit()
-            # Обновляем сообщение в канале
-            new_caption = (
-                f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
-            )
-            try:
-                bot.edit_message_caption(
-                    chat_id=CHANNEL_ID,
-                    message_id=post.message_id,
-                    caption=new_caption,
-                    reply_markup=call.message.reply_markup,
-                )
-            except Exception as e:
-                bot.send_message(
-                    user_id, f"Не удалось обновить сообщение в канале. Ошибка: {e}"
-                )
+            update_channel_post_message(post)
 
             # Отправляем личное сообщение с фото товара, описанием и кнопкой отмены
             cancel_button = InlineKeyboardMarkup()
@@ -762,11 +966,13 @@ def ensure_temp_fulfilled_for_reservation(session, reservation):
         ))
 
     reservation.is_fulfilled = True
+    if not reservation.fulfilled_at:
+        reservation.fulfilled_at = now_samara_naive()
     return True
 
 
 def auto_fulfill_expired_reservations(now=None, older_than_seconds=RESERVATION_AUTO_FULFILL_SECONDS):
-    now = now or datetime.now()
+    now = now or now_samara_naive()
     deadline = now - timedelta(seconds=older_than_seconds)
 
     with Session(bind=engine) as session:
@@ -1101,68 +1307,23 @@ def cancel_reservation(call):
             bot.answer_callback_query(call.id, "Невозможно отказаться от уже обработанного заказа.", show_alert=True)
             return
 
-        post = Posts.get_row_by_id(order.post_id)
-        if not post:
-            bot.answer_callback_query(call.id, "Товар для отмены не найден.", show_alert=True)
+        result = release_reservation_safely(reservation_id)
+        if not result.get("released"):
+            bot.answer_callback_query(call.id, result.get("message") or "Ошибка отмены заказа.", show_alert=True)
             return
 
-        success = Reservations.cancel_order_by_id(reservation_id)
-        if not success:
-            bot.answer_callback_query(call.id, "Ошибка отмены заказа.", show_alert=True)
-            return
-
-        with Session(bind=engine) as session:
-            next_in_queue = session.query(TempReservations).filter(
-                TempReservations.post_id == order.post_id,
-                TempReservations.temp_fulfilled == False
-            ).order_by(TempReservations.created_at).first()
-
-            if next_in_queue:
-                Reservations.insert(
-                    user_id=next_in_queue.user_id,
-                    post_id=order.post_id,
-                    quantity=1,
-                    is_fulfilled=False
-                )
-                next_in_queue.temp_fulfilled = True
-                session.commit()
-
-                bot.send_message(
-                    chat_id=next_in_queue.user_id,
-                    text="Ваш товар в очереди стал доступен и добавлен в вашу корзину."
-                )
-
-                bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Он передан следующему в очереди.",
-                                          show_alert=False)
-                my_orders(call.message)
-                return
-
-        Posts.increment_quantity_by_id(order.post_id)
-
-        if post.message_id:
-            new_quantity = post.quantity + 1
-            updated_caption = (
-                f"Цена: {post.price} ₽\n"
-                f"Описание: {post.description}\n"
-                f"Остаток: {new_quantity}"
+        if result.get("action") == "queued":
+            bot.answer_callback_query(
+                call.id,
+                "Вы успешно отказались от товара. Он передан следующему в очереди.",
+                show_alert=False,
             )
-            markup = InlineKeyboardMarkup()
-            reserve_button = InlineKeyboardButton("🛒 Забронировать", callback_data=f"reserve_{post.id}")
-            to_bot_button = InlineKeyboardButton("В Бота", url=f"{bot_link}?start=start")
-            markup.add(reserve_button, to_bot_button)
-
-            try:
-                bot.edit_message_caption(
-                    chat_id=CHANNEL_ID,
-                    message_id=post.message_id,
-                    caption=updated_caption,
-                    reply_markup=markup,
-                )
-            except Exception as e:
-                print(f"Ошибка обновления поста на канале: {e}")
-
-        bot.answer_callback_query(call.id, "Вы успешно отказались от товара. Товар доступен в канале.",
-                                  show_alert=False)
+        else:
+            bot.answer_callback_query(
+                call.id,
+                "Вы успешно отказались от товара. Товар доступен в канале.",
+                show_alert=False,
+            )
         my_orders(call.message)
 
     except ValueError as ve:
@@ -1600,15 +1761,18 @@ def handle_clear_cart(call):
         return
 
     related_clients = Clients.get_rows_by_phone(client.phone)
-    deleted_count = sum(
-        Reservations.delete_rows_by_user_id(related_client.user_id)
-        for related_client in related_clients
-    )
+    related_user_ids = [related_client.user_id for related_client in related_clients]
+    summary = release_reservations_for_users(related_user_ids)
 
-    bot.send_message(
-        call.message.chat.id,
-        f"Корзина клиента успешно расформирована. Удалено позиций: {deleted_count}.",
+    text = (
+        "Корзина клиента расформирована безопасно.\n"
+        f"Обработано позиций: {summary['total']}\n"
+        f"Вернулось на канал: {summary['restored']}\n"
+        f"Передано очереди: {summary['queued']}"
     )
+    if summary["failed"]:
+        text += f"\nНе обработано: {summary['failed']}"
+    bot.send_message(call.message.chat.id, text)
 
 # Проверка на регистрацию(стэйты статуса)
 def is_registered(user_id):
@@ -1986,29 +2150,22 @@ def handle_clear_processed(call):
         return
     user_id = int(call.data.split("_")[2])  # Извлекаем ID пользователя из callback_data
 
-    # Удаляем только обработанные товары пользователя
-    cleared_items = clear_processed(user_id)
+    summary = clear_processed(user_id)
 
-    if cleared_items > 0:
-        bot.send_message(call.message.chat.id,
-                         f"Все обработанные товары (количество: {cleared_items}) были удалены из корзины.")
+    if summary["total"] > 0:
+        bot.send_message(
+            call.message.chat.id,
+            "Обработанные товары расформированы безопасно.\n"
+            f"Обработано позиций: {summary['total']}\n"
+            f"Вернулось на канал: {summary['restored']}\n"
+            f"Передано очереди: {summary['queued']}",
+        )
     else:
         bot.send_message(call.message.chat.id, "У пользователя нет обработанных товаров для удаления.")
 
 # Удаляет обработанные товары из корзины пользователя
 def clear_processed(user_id):
-    # Получаем содержимое корзины пользователя
-    reservations = Reservations.get_row_by_user_id(user_id)
-
-    # Фильтруем только выполненные (обработанные) товары
-    processed_items = [item for item in reservations if item.is_fulfilled]
-
-    # Удаляем обработанные товары из БД
-    for item in processed_items:
-        Reservations.delete_row(item.id)
-
-    # Возвращаем количество удаленных товаров
-    return len(processed_items)
+    return release_reservations_for_users([user_id], only_fulfilled=True)
 
 # Callback для инлайн-кнопок "Просмотреть корзину"
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_cart_"))
@@ -2686,30 +2843,288 @@ def handle_statistic(message):
 
     bot.send_message(message.chat.id, response)
 
+def close_expired_delivery_broadcast_campaigns(session, current=None):
+    current = current or now_samara_naive()
+    expired = session.query(DeliveryBroadcastCampaign).filter(
+        DeliveryBroadcastCampaign.status == DELIVERY_BROADCAST_STATUS_ACTIVE,
+        DeliveryBroadcastCampaign.cutoff_at <= current,
+    ).all()
+    for campaign in expired:
+        campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+        campaign.finished_at = current
+    return len(expired)
+
+
+def get_or_create_delivery_broadcast_campaign(started_by_user_id, current=None):
+    current = current or now_samara_naive()
+    cutoff_at = delivery_campaign_cutoff_at(current)
+    if current >= cutoff_at:
+        with Session(bind=engine) as session:
+            close_expired_delivery_broadcast_campaigns(session, current)
+            session.commit()
+        return None, False, "Рассылку доставки можно запускать только до 14:00 по Самаре."
+
+    with Session(bind=engine) as session:
+        campaign = session.query(DeliveryBroadcastCampaign).filter(
+            DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(current)
+        ).first()
+        created = False
+        if campaign:
+            if campaign.status != DELIVERY_BROADCAST_STATUS_ACTIVE:
+                campaign.status = DELIVERY_BROADCAST_STATUS_ACTIVE
+                campaign.finished_at = None
+            if not campaign.cutoff_at:
+                campaign.cutoff_at = cutoff_at
+        else:
+            campaign = DeliveryBroadcastCampaign(
+                campaign_date=delivery_campaign_date(current),
+                started_at=current,
+                cutoff_at=cutoff_at,
+                status=DELIVERY_BROADCAST_STATUS_ACTIVE,
+                started_by_user_id=started_by_user_id,
+            )
+            session.add(campaign)
+            session.flush()
+            created = True
+        campaign_id = campaign.id
+        session.commit()
+        return campaign_id, created, None
+
+
+def get_active_delivery_broadcast_campaign_id(current=None):
+    current = current or now_samara_naive()
+    with Session(bind=engine) as session:
+        close_expired_delivery_broadcast_campaigns(session, current)
+        campaign = session.query(DeliveryBroadcastCampaign).filter(
+            DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(current),
+            DeliveryBroadcastCampaign.status == DELIVERY_BROADCAST_STATUS_ACTIVE,
+        ).first()
+        campaign_id = campaign.id if campaign and current < campaign.cutoff_at else None
+        session.commit()
+        return campaign_id
+
+
+def mark_stale_delivery_broadcast_recipients_unknown(session, campaign_id, current=None):
+    current = current or now_samara_naive()
+    stale_before = current - timedelta(minutes=DELIVERY_BROADCAST_STALE_SENDING_MINUTES)
+    return session.query(DeliveryBroadcastRecipient).filter(
+        DeliveryBroadcastRecipient.campaign_id == campaign_id,
+        DeliveryBroadcastRecipient.status == DELIVERY_RECIPIENT_STATUS_SENDING,
+        DeliveryBroadcastRecipient.attempted_at < stale_before,
+    ).update(
+        {
+            "status": DELIVERY_RECIPIENT_STATUS_UNKNOWN,
+            "error": "Бот перезапустился или не получил ответ Telegram после начала отправки.",
+        },
+        synchronize_session=False,
+    )
+
+
+def reserve_delivery_broadcast_recipient(campaign_id, user):
+    current = now_samara_naive()
+    with Session(bind=engine) as session:
+        existing = session.query(DeliveryBroadcastRecipient).filter(
+            DeliveryBroadcastRecipient.campaign_id == campaign_id,
+            DeliveryBroadcastRecipient.phone == user["phone"],
+        ).first()
+        if existing:
+            return None, existing.status
+
+        recipient = DeliveryBroadcastRecipient(
+            campaign_id=campaign_id,
+            phone=user["phone"],
+            user_id=user["user_id"],
+            name=user.get("name"),
+            total_sum=int(user.get("total_amount") or 0),
+            status=DELIVERY_RECIPIENT_STATUS_SENDING,
+            attempted_at=current,
+        )
+        session.add(recipient)
+        try:
+            session.commit()
+            return recipient.id, DELIVERY_RECIPIENT_STATUS_SENDING
+        except IntegrityError:
+            session.rollback()
+            return None, "reserved"
+
+
+def finalize_delivery_broadcast_recipient(recipient_id, status, message_id=None, error=None):
+    with Session(bind=engine) as session:
+        recipient = session.query(DeliveryBroadcastRecipient).filter(
+            DeliveryBroadcastRecipient.id == recipient_id
+        ).first()
+        if not recipient:
+            return
+        recipient.status = status
+        recipient.telegram_message_id = message_id
+        recipient.error = str(error)[:2000] if error else None
+        if status == DELIVERY_RECIPIENT_STATUS_SENT:
+            recipient.sent_at = now_samara_naive()
+        session.commit()
+
+
+def send_delivery_campaign_offer(campaign_id, user):
+    recipient_id, reservation_status = reserve_delivery_broadcast_recipient(campaign_id, user)
+    if not recipient_id:
+        return "skipped"
+
+    try:
+        sent_message = send_delivery_offer_message(user["user_id"], user["name"])
+        finalize_delivery_broadcast_recipient(
+            recipient_id,
+            DELIVERY_RECIPIENT_STATUS_SENT,
+            message_id=getattr(sent_message, "message_id", None),
+        )
+        return "sent"
+    except Exception as exc:
+        finalize_delivery_broadcast_recipient(
+            recipient_id,
+            DELIVERY_RECIPIENT_STATUS_FAILED,
+            error=exc,
+        )
+        logger.warning("Delivery offer failed for user_id=%s: %s", user["user_id"], exc)
+        return "failed"
+
+
+def get_delivery_broadcast_status_counts(session, campaign_id):
+    rows = session.query(
+        DeliveryBroadcastRecipient.status,
+        func.count(DeliveryBroadcastRecipient.id),
+    ).filter(
+        DeliveryBroadcastRecipient.campaign_id == campaign_id,
+    ).group_by(DeliveryBroadcastRecipient.status).all()
+    return {status: int(count) for status, count in rows}
+
+
+def scan_delivery_broadcast_campaign(campaign_id):
+    with delivery_broadcast_scan_lock:
+        current = now_samara_naive()
+        with Session(bind=engine) as session:
+            campaign = session.query(DeliveryBroadcastCampaign).filter(
+                DeliveryBroadcastCampaign.id == campaign_id
+            ).first()
+            if not campaign:
+                return {"status": "missing", "eligible_users": []}
+            if campaign.status != DELIVERY_BROADCAST_STATUS_ACTIVE or current >= campaign.cutoff_at:
+                campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+                campaign.finished_at = current
+                session.commit()
+                return {"status": "finished", "eligible_users": []}
+            mark_stale_delivery_broadcast_recipients_unknown(session, campaign.id, current)
+            campaign.last_scan_at = current
+            cutoff_at = campaign.cutoff_at
+            session.commit()
+
+        auto_fulfill_expired_reservations()
+        eligible_users = calculate_for_delivery(cutoff_at=cutoff_at)
+        sent_count = 0
+        skipped_count = 0
+        failed_count = 0
+        stopped_by_cutoff = False
+        for user in eligible_users:
+            if now_samara_naive() >= cutoff_at:
+                stopped_by_cutoff = True
+                break
+            result = send_delivery_campaign_offer(campaign_id, user)
+            if result == "sent":
+                sent_count += 1
+                time.sleep(1)
+            elif result == "failed":
+                failed_count += 1
+                time.sleep(1)
+            else:
+                skipped_count += 1
+
+        with Session(bind=engine) as session:
+            campaign = session.query(DeliveryBroadcastCampaign).filter(
+                DeliveryBroadcastCampaign.id == campaign_id
+            ).first()
+            if campaign:
+                campaign.last_scan_at = now_samara_naive()
+                if stopped_by_cutoff:
+                    campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+                    campaign.finished_at = campaign.last_scan_at
+            status_counts = get_delivery_broadcast_status_counts(session, campaign_id)
+            session.commit()
+
+        return {
+            "status": "finished" if stopped_by_cutoff else "active",
+            "eligible_users": eligible_users,
+            "sent_count": sent_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "status_counts": status_counts,
+        }
+
+
+def build_delivery_broadcast_result_text(result):
+    if result.get("status") == "finished":
+        return "Кампания доставки уже завершена: сейчас 14:00 или позже по Самаре."
+    if result.get("status") == "missing":
+        return "Кампания доставки не найдена."
+
+    status_counts = result.get("status_counts") or {}
+    needs_check = (
+        status_counts.get(DELIVERY_RECIPIENT_STATUS_SENDING, 0)
+        + status_counts.get(DELIVERY_RECIPIENT_STATUS_UNKNOWN, 0)
+        + status_counts.get(DELIVERY_RECIPIENT_STATUS_FAILED, 0)
+    )
+    return (
+        "Рассылка доставки проверена.\n"
+        f"Подходящих телефонов сейчас: {len(result.get('eligible_users') or [])}\n"
+        f"Новых отправлено: {result.get('sent_count', 0)}\n"
+        f"Уже были в кампании: {result.get('skipped_count', 0)}\n"
+        f"Ошибок новых отправок: {result.get('failed_count', 0)}\n"
+        f"Требуют проверки: {needs_check}"
+    )
+
+
+def delivery_broadcast_monitor_loop():
+    while True:
+        try:
+            campaign_id = get_active_delivery_broadcast_campaign_id()
+            if campaign_id:
+                result = scan_delivery_broadcast_campaign(campaign_id)
+                logger.info("Delivery broadcast monitor scan: %s", build_delivery_broadcast_result_text(result))
+        except Exception:
+            logger.exception("Delivery broadcast monitor failed")
+
+        if delivery_broadcast_monitor_stop_event.wait(DELIVERY_BROADCAST_CHECK_SECONDS):
+            return
+
+
+def start_delivery_broadcast_monitor_worker():
+    global delivery_broadcast_monitor_started
+    if delivery_broadcast_monitor_started:
+        return
+    delivery_broadcast_monitor_started = True
+    thread = threading.Thread(
+        target=delivery_broadcast_monitor_loop,
+        name="delivery-broadcast-monitor",
+        daemon=True,
+    )
+    thread.start()
+
+
 # Обработчик для кнопки 'Отправить рассылку'.
 @bot.message_handler(func=lambda message: message.text == "📤 Отправить рассылку")
 def send_broadcast(message):
     if not require_role(message, DELIVERY_ROLES):
         return
     user_id = message.from_user.id
-    bot.send_message(chat_id=user_id, text="Начинаю рассылку подходящим клиентам...")
+    bot.send_message(chat_id=user_id, text="Запускаю кампанию доставки до 14:00 по Самаре...")
     try:
-        auto_fulfill_expired_reservations()
-        eligible_users = calculate_for_delivery()
-        send_delivery_candidates_summary(eligible_users)
-        logger.info("Delivery broadcast candidates: %s", len(eligible_users))
+        campaign_id, created, error_text = get_or_create_delivery_broadcast_campaign(user_id)
+        if error_text:
+            bot.send_message(chat_id=user_id, text=error_text)
+            return
 
-        if eligible_users:
-            for user in eligible_users:
-                try:
-                    send_delivery_offer(bot, user["user_id"], user["name"])
-                    time.sleep(1)
-                except Exception as e:
-                    logger.warning("Delivery offer failed for user_id=%s: %s", user["user_id"], e)
-            bot.send_message(chat_id=user_id, text=f"Рассылка отправлена. Клиентов: {len(eligible_users)}.")
-        else:
-            bot.send_message(chat_id=user_id, text="Подходящих клиентов для рассылки не найдено.")
+        result = scan_delivery_broadcast_campaign(campaign_id)
+        send_delivery_candidates_summary(result.get("eligible_users") or [], result)
+        prefix = "Кампания создана." if created else "Кампания уже была активна, сделал внеочередной пересчет."
+        bot.send_message(chat_id=user_id, text=f"{prefix}\n{build_delivery_broadcast_result_text(result)}")
     except Exception as e:
+        logger.exception("Delivery broadcast failed")
         bot.send_message(chat_id=user_id, text=f"Ошибка при выполнении рассылки: {str(e)}")
 
 def is_legacy_delivery_callback(call):
@@ -2734,7 +3149,7 @@ def handle_delivery_response_callback(call):
         response = "delivery_no"
 
     # Проверяем текущее время
-    current_time = datetime.now().time()  # Текущее локальное время
+    current_time = now_samara().time()  # Текущее время Самары
 
     if response == "delivery_yes" and current_time.hour >= 16:
         # Если нажато "Да" после 14:00 — удаляем сообщение с кнопками
@@ -2770,13 +3185,14 @@ def handle_address_input(message):
     name = user_data.name
     phone = user_data.phone
     logger.debug("Delivery user data loaded for user_id=%s", user_id)
-    # Вычисление суммы заказов пользователя
-    user_orders_sum = calculate_sum_for_user(user_id)
-    logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     # Поиск всех пользователей с таким же телефоном
     from db import Session, engine
     with Session(bind=engine) as session:
         same_phone_users = session.query(Clients).filter(Clients.phone == phone).all()
+        delivery_cutoff_at = get_delivery_cutoff_for_user(session, user_id) or delivery_campaign_cutoff_at()
+    # Вычисление суммы заказов пользователя
+    user_orders_sum = calculate_sum_for_user(user_id, cutoff_at=delivery_cutoff_at)
+    logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     if not same_phone_users:
         logger.warning("No related delivery users found for user_id=%s", user_id)
         bot.send_message(chat_id=user_id, text="Ошибка! Не удалось найти других заказов с данным номером телефона.")
@@ -2785,7 +3201,7 @@ def handle_address_input(message):
     total_sum_by_phone = user_orders_sum
     all_user_orders_details = []
     for client in same_phone_users:
-        client_sum = calculate_sum_for_user(client.user_id)
+        client_sum = calculate_sum_for_user(client.user_id, cutoff_at=delivery_cutoff_at)
         all_user_orders_details.append({
             "name": client.name,
             "orders_sum": client_sum
@@ -2811,7 +3227,8 @@ def handle_address_input(message):
         "phone": phone,
         "final_sum": user_orders_sum,
         "total_sum_by_phone": total_sum_by_phone,
-        "address": address
+        "address": address,
+        "delivery_cutoff_at": delivery_cutoff_at.isoformat(),
     }
     logger.info("Temporary delivery data saved for user_id=%s", user_id)
     # Устанавливаем состояние
@@ -2832,9 +3249,9 @@ def handle_empty_delivery_command(message):
         bot.send_message(chat_id=user_id, text="Нет данных для удаления.")
 
 # Рассчитывает общую сумму заказов для указанного пользователя.
-def calculate_sum_for_user(user_id):
+def calculate_sum_for_user(user_id, cutoff_at=None):
     with Session(bind=engine) as session:
-        result = session.query(
+        query = session.query(
             func.sum(
                 (Posts.price * Reservations.quantity) - func.coalesce(Reservations.return_order, 0)
             ).label("final_sum")
@@ -2842,23 +3259,37 @@ def calculate_sum_for_user(user_id):
             Reservations, Posts.id == Reservations.post_id
         ).filter(
             Reservations.user_id == user_id, Reservations.is_fulfilled == True
-        ).first()
+        )
+        if cutoff_at is not None:
+            query = query.filter(or_(Reservations.fulfilled_at == None, Reservations.fulfilled_at <= cutoff_at))
+
+        result = query.first()
 
         return result.final_sum if result.final_sum else 0
 
 
 def delivery_target_label(now=None):
-    now = now or datetime.now()
+    now = now or now_samara_naive()
     return "Доставка на понедельник" if now.weekday() == 5 else "Доставка на завтра"
 
 
-def send_delivery_candidates_summary(eligible_users):
+def send_delivery_candidates_summary(eligible_users, scan_result=None):
     if not eligible_users:
         text = "📤 Рассылка доставки: подходящих клиентов с суммой 1500+ не найдено."
     else:
+        scan_result = scan_result or {}
+        status_counts = scan_result.get("status_counts") or {}
+        needs_check = (
+            status_counts.get(DELIVERY_RECIPIENT_STATUS_SENDING, 0)
+            + status_counts.get(DELIVERY_RECIPIENT_STATUS_UNKNOWN, 0)
+            + status_counts.get(DELIVERY_RECIPIENT_STATUS_FAILED, 0)
+        )
         lines = [
             "📤 Клиенты для рассылки доставки",
             f"Всего клиентов: {len(eligible_users)}",
+            f"Новых отправлено сейчас: {scan_result.get('sent_count', 0)}",
+            f"Уже были в кампании: {scan_result.get('skipped_count', 0)}",
+            f"Требуют проверки: {needs_check}",
             "",
         ]
         for index, user in enumerate(eligible_users, start=1):
@@ -2875,7 +3306,25 @@ def send_delivery_candidates_summary(eligible_users):
         print(f"[ERROR] Ошибка отправки списка клиентов для рассылки: {e}")
 
 
-def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum):
+def get_delivery_cutoff_for_user(session, user_id):
+    client = session.query(Clients).filter(Clients.user_id == user_id).first()
+    if not client:
+        return None
+    phone = normalize_phone(client.phone)
+    if not phone:
+        return None
+
+    row = session.query(DeliveryBroadcastCampaign.cutoff_at).join(
+        DeliveryBroadcastRecipient,
+        DeliveryBroadcastRecipient.campaign_id == DeliveryBroadcastCampaign.id,
+    ).filter(
+        DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(),
+        DeliveryBroadcastRecipient.phone == phone,
+    ).order_by(DeliveryBroadcastCampaign.id.desc()).first()
+    return row[0] if row else None
+
+
+def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum, delivery_cutoff_at=None):
     deduplicate_for_delivery_entries(session)
     normalized_phone = normalize_phone(phone)
     delivery_entry = session.query(ForDelivery).filter(ForDelivery.phone == normalized_phone).first()
@@ -2889,6 +3338,8 @@ def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum)
         elif delivery_entry.address is None:
             delivery_entry.address = ""
         delivery_entry.total_sum = total_sum
+        if delivery_cutoff_at and not delivery_entry.delivery_cutoff_at:
+            delivery_entry.delivery_cutoff_at = delivery_cutoff_at
         return delivery_entry
 
     delivery_entry = ForDelivery(
@@ -2897,6 +3348,7 @@ def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum)
         phone=normalized_phone or phone,
         address=address or "",
         total_sum=total_sum,
+        delivery_cutoff_at=delivery_cutoff_at or now_samara_naive(),
     )
     session.add(delivery_entry)
     return delivery_entry
@@ -2922,6 +3374,8 @@ def deduplicate_for_delivery_entries(session):
             existing.total_sum = entry.total_sum
             existing.user_id = entry.user_id
             existing.name = entry.name
+        if entry.delivery_cutoff_at and not existing.delivery_cutoff_at:
+            existing.delivery_cutoff_at = entry.delivery_cutoff_at
         session.delete(entry)
 
 @bot.message_handler(func=lambda message: message.text == "👨‍🦯 Засунуть в доставку")
@@ -2963,9 +3417,11 @@ def process_numbers(message):
 
                 # Найти выполненные заказы клиента
                 related_user_ids = [client_row.user_id for client_row in clients]
+                manual_cutoff_at = now_samara_naive()
                 reservations = session.query(Reservations).filter(
                     Reservations.user_id.in_(related_user_ids),
-                    Reservations.is_fulfilled == True
+                    Reservations.is_fulfilled == True,
+                    or_(Reservations.fulfilled_at == None, Reservations.fulfilled_at <= manual_cutoff_at),
                 ).all()
 
                 if not reservations:
@@ -2982,7 +3438,15 @@ def process_numbers(message):
                 # Добавление данных в таблицу ForDelivery
                 if total_sum > 0:
                     try:
-                        upsert_for_delivery_entry(session, client.user_id, client.name, phone, "", total_sum)
+                        upsert_for_delivery_entry(
+                            session,
+                            client.user_id,
+                            client.name,
+                            phone,
+                            "",
+                            total_sum,
+                            delivery_cutoff_at=manual_cutoff_at,
+                        )
                         session.commit()
                         successful_deliveries.append(phone)
                     except Exception as e:
@@ -3124,6 +3588,7 @@ def handle_new_address(message):
     name = temp_user_data[user_id].get("name", "Не указано")
     phone = temp_user_data[user_id].get("phone", "Не указан")
     final_sum = temp_user_data[user_id].get("final_sum", 0)
+    delivery_cutoff_at = parse_datetime_value(temp_user_data[user_id].get("delivery_cutoff_at")) or delivery_campaign_cutoff_at()
 
     # Получаем всех клиентов с таким же номером телефона
     from db import Session, engine
@@ -3136,7 +3601,7 @@ def handle_new_address(message):
     for client in same_phone_users:
         if client.user_id != user_id:  # Пропускаем текущего клиента
             all_names.append(client.name)
-            total_sum_by_phone += calculate_sum_for_user(client.user_id)
+            total_sum_by_phone += calculate_sum_for_user(client.user_id, cutoff_at=delivery_cutoff_at)
 
     # Формируем строку с именами всех клиентов
     all_names_str = ", ".join(all_names)
@@ -3172,6 +3637,7 @@ def handle_new_phone(message):
     current_phone = temp_user_data[user_id].get("phone", "Не указан")  # Это старый номер телефона
     address = temp_user_data[user_id].get("address", "Не указан")
     final_sum = temp_user_data[user_id].get("final_sum", 0)
+    delivery_cutoff_at = parse_datetime_value(temp_user_data[user_id].get("delivery_cutoff_at")) or delivery_campaign_cutoff_at()
 
 
     # Подключаемся к базе данных, чтобы найти тех, у кого такой же старый номер телефона (current_phone)
@@ -3192,7 +3658,7 @@ def handle_new_phone(message):
     for client in same_phone_users:
         if client.user_id != user_id:  # Избегаем дублирования текущего пользователя
             all_names.append(client.name)
-            order_sum = calculate_sum_for_user(client.user_id)  # Посчитать сумму заказов клиента
+            order_sum = calculate_sum_for_user(client.user_id, cutoff_at=delivery_cutoff_at)  # Посчитать сумму заказов клиента
             total_sum_by_phone += order_sum
 
     # Формируем строку с именами всех клиентов
@@ -3256,6 +3722,7 @@ def handle_confirmation(call):
         phone = user_temp_data.get("phone", "Не указан")  # Новый телефон
         address = user_temp_data.get("address", "Не указан")
         final_sum = user_temp_data.get("final_sum", 0)  # Сумма текущего заказа
+        delivery_cutoff_at = parse_datetime_value(user_temp_data.get("delivery_cutoff_at")) or delivery_campaign_cutoff_at()
 
 
         from db import Session, engine, Clients, ForDelivery
@@ -3295,7 +3762,7 @@ def handle_confirmation(call):
                     for other_client in same_phone_users:
                         if other_client.user_id != user_id:  # Исключаем текущего клиента
                             all_names.append(other_client.name)
-                            order_sum = calculate_sum_for_user(other_client.user_id)
+                            order_sum = calculate_sum_for_user(other_client.user_id, cutoff_at=delivery_cutoff_at)
                             total_sum_by_phone += order_sum
                 else:
                     logger.debug("Delivery confirmation related clients not found for user_id=%s", user_id)
@@ -3314,7 +3781,15 @@ def handle_confirmation(call):
         # Сохраняем новые данные в таблицу ForDelivery
         with Session(bind=engine) as session:
             try:
-                upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum_by_phone)
+                upsert_for_delivery_entry(
+                    session,
+                    user_id,
+                    name,
+                    phone,
+                    address,
+                    total_sum_by_phone,
+                    delivery_cutoff_at=delivery_cutoff_at,
+                )
                 session.commit()
             except Exception as e:
                 session.rollback()
@@ -3382,19 +3857,23 @@ def keyboard_for_delivery():
     keyboard.add(yes_button, no_button)  # Добавляем кнопки в клавиатуру
     return keyboard
 
-def calculate_for_delivery():
+def calculate_for_delivery(cutoff_at=None):
     """
     Вычисляет общую сумму обработанных заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
     Сообщение отправляется одному клиенту с минимальным ID. Логи содержат индивидуальную сумму, суммы других клиентов, и итоговую сумму.
     """
+    cutoff_at = cutoff_at or delivery_campaign_cutoff_at()
     with Session(bind=engine) as session:
-        rows = session.query(Reservations, Posts, Clients).join(
+        query = session.query(Reservations, Posts, Clients).join(
             Posts, Posts.id == Reservations.post_id
         ).join(
             Clients, Clients.user_id == Reservations.user_id
         ).filter(
             Reservations.is_fulfilled == True
-        ).all()
+        )
+        if cutoff_at is not None:
+            query = query.filter(or_(Reservations.fulfilled_at == None, Reservations.fulfilled_at <= cutoff_at))
+        rows = query.all()
 
     if not rows:
         logger.info("Delivery broadcast: no fulfilled reservations found.")
@@ -3436,16 +3915,23 @@ def calculate_for_delivery():
     return delivery_users
 
 # Отправка рассылки
-def send_delivery_offer(bot, user_id, user_name):
+def send_delivery_offer_message(user_id, user_name, bot_instance=None):
+    bot_instance = bot_instance or bot
+    sent_message = bot_instance.send_message(
+        chat_id=user_id,
+        text=f"{user_name}, {delivery_target_label()}. Готовы принять доставку с 10:00 до 16:00?",
+        reply_markup=keyboard_for_delivery()
+    )
+    logger.debug("Delivery offer sent to user_id=%s", user_id)
+    return sent_message
+
+
+def send_delivery_offer(bot_instance, user_id, user_name):
     try:
-        bot.send_message(
-            chat_id=user_id,
-            text=f"{user_name}, {delivery_target_label()}. Готовы принять доставку с 10:00 до 16:00?",
-            reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
-        )
-        logger.debug("Delivery offer sent to user_id=%s", user_id)
+        return send_delivery_offer_message(user_id, user_name, bot_instance=bot_instance)
     except Exception as e:
         logger.warning("Delivery offer send failed for user_id=%s: %s", user_id, e)
+        raise
 
 
 def get_related_delivery_user_ids(session, delivery_entry):
@@ -3464,14 +3950,20 @@ def get_related_delivery_user_ids(session, delivery_entry):
 
 def get_delivery_entry_cart_items(session, delivery_entry):
     related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
-    rows = session.query(Reservations, Posts, Clients).join(
+    query = session.query(Reservations, Posts, Clients).join(
         Posts, Posts.id == Reservations.post_id
     ).outerjoin(
         Clients, Clients.user_id == Reservations.user_id
     ).filter(
         Reservations.user_id.in_(related_user_ids),
         Reservations.is_fulfilled == True,
-    ).order_by(Posts.description).all()
+    )
+    if delivery_entry.delivery_cutoff_at is not None:
+        query = query.filter(or_(
+            Reservations.fulfilled_at == None,
+            Reservations.fulfilled_at <= delivery_entry.delivery_cutoff_at,
+        ))
+    rows = query.order_by(Posts.description).all()
 
     grouped_items = {}
     for reservation, post, client in rows:
@@ -3626,10 +4118,16 @@ def move_for_delivery_to_in_delivery(delivery_id):
             return False, "Клиент уже обработан или удалён из списка.", 0
 
         related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
-        reservations = session.query(Reservations).filter(
+        query = session.query(Reservations).filter(
             Reservations.user_id.in_(related_user_ids),
             Reservations.is_fulfilled == True,
-        ).all()
+        )
+        if delivery_entry.delivery_cutoff_at is not None:
+            query = query.filter(or_(
+                Reservations.fulfilled_at == None,
+                Reservations.fulfilled_at <= delivery_entry.delivery_cutoff_at,
+            ))
+        reservations = query.all()
 
         if not reservations:
             return False, "У клиента нет обработанных товаров для переноса в доставку.", 0
@@ -4273,6 +4771,7 @@ def contact_client(call, user_id):
 # Запуск бота
 def run_bot():
     start_reservation_auto_fulfill_worker()
+    start_delivery_broadcast_monitor_worker()
     retry_delay = 5
 
     while True:
