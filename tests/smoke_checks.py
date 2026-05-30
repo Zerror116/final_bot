@@ -597,6 +597,13 @@ def test_audit_can_collect_delivery_only():
         raise AssertionError("collect delivery button must be inside audit menu")
 
 
+def test_client_menu_hides_orders_in_delivery():
+    keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
+    client_menu = keyboard_text.split("def client_main_menu():", 1)[1].split("def worker_main_menu():", 1)[0]
+    if "🚗 Заказы в доставке" in client_menu:
+        raise AssertionError("client menu must not show orders in delivery button")
+
+
 def test_post_id_labels_for_new_posts_and_delivery_collection():
     main_text = MAIN.read_text(encoding="utf-8")
     posts_text = (ROOT / "db" / "posts.py").read_text(encoding="utf-8")
@@ -729,6 +736,7 @@ def main():
     test_delivery_clients_summary_markers()
     test_delivery_collection_pauses_reserved_group_flow()
     test_audit_can_collect_delivery_only()
+    test_client_menu_hides_orders_in_delivery()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
     print("smoke checks ok")
