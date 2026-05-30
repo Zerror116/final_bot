@@ -258,6 +258,58 @@ def test_reservation_stats_markers():
         raise AssertionError("reservation stats secret button missing from supreme leader menu")
 
 
+def test_delivery_broadcast_campaign_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    campaign_text = (ROOT / "db" / "delivery_broadcast_campaigns.py").read_text(encoding="utf-8")
+    recipient_text = (ROOT / "db" / "delivery_broadcast_recipients.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "class DeliveryBroadcastCampaign",
+        "__tablename__ = \"delivery_broadcast_campaigns\"",
+        "campaign_date",
+        "cutoff_at",
+        "last_scan_at",
+    ]:
+        if marker not in campaign_text:
+            raise AssertionError(f"delivery broadcast campaign marker missing {marker}")
+
+    for marker in [
+        "class DeliveryBroadcastRecipient",
+        "__tablename__ = \"delivery_broadcast_recipients\"",
+        "uq_delivery_broadcast_recipients_campaign_phone",
+        "telegram_message_id",
+        "status",
+    ]:
+        if marker not in recipient_text:
+            raise AssertionError(f"delivery broadcast recipient marker missing {marker}")
+
+    for marker in [
+        '"006_delivery_broadcast_campaigns"',
+        "ensure_delivery_broadcast_campaigns",
+        "DeliveryBroadcastCampaign",
+        "DeliveryBroadcastRecipient",
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"delivery broadcast migration marker missing {marker}")
+
+    for marker in [
+        "DELIVERY_BROADCAST_CUTOFF_HOUR = 14",
+        "def get_or_create_delivery_broadcast_campaign",
+        "def scan_delivery_broadcast_campaign",
+        "def start_delivery_broadcast_monitor_worker",
+        "start_delivery_broadcast_monitor_worker()",
+        "DeliveryBroadcastRecipient(",
+        "DELIVERY_RECIPIENT_STATUS_SENDING",
+        "DELIVERY_RECIPIENT_STATUS_UNKNOWN",
+        "send_delivery_offer_message",
+        "Reservations.fulfilled_at == None",
+        "Reservations.fulfilled_at <= cutoff_at",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"delivery broadcast main marker missing {marker}")
+
+
 def test_channel_post_auto_publish_markers():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
@@ -641,6 +693,7 @@ def main():
     test_callback_answers_are_safe()
     test_phoenix_broadcast_markers()
     test_reservation_stats_markers()
+    test_delivery_broadcast_campaign_markers()
     test_channel_post_auto_publish_markers()
     test_post_management_only_shows_unpublished_posts()
     test_post_dates_use_samara_and_shift_sunday()

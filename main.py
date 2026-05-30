@@ -22,6 +22,8 @@ from db.deleted_post_snapshots import DeletedPostSnapshot
 from db.delivery_cleanup_runs import DeliveryCleanupRun
 from db.revision_logs import RevisionLog
 from db.reservation_stat_events import ReservationStatEvent
+from db.delivery_broadcast_campaigns import DeliveryBroadcastCampaign
+from db.delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -32,7 +34,7 @@ from handlers.reservations_manage import calculate_total_sum, calculate_processe
 from handlers.classess import *
 from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time
 from db.bot_session import BotSession
 from services.pricing import calculate_audit_price
 from services.session_store import PersistentBucket
@@ -54,6 +56,15 @@ POST_ID_REUSE_STALE_GRACE = timedelta(days=2)
 DELIVERY_COLLECTION_PAGE_SIZE = 8
 LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
+DELIVERY_BROADCAST_CUTOFF_HOUR = 14
+DELIVERY_BROADCAST_CHECK_SECONDS = 60
+DELIVERY_BROADCAST_STALE_SENDING_MINUTES = 5
+DELIVERY_BROADCAST_STATUS_ACTIVE = "active"
+DELIVERY_BROADCAST_STATUS_FINISHED = "finished"
+DELIVERY_RECIPIENT_STATUS_SENDING = "sending"
+DELIVERY_RECIPIENT_STATUS_SENT = "sent"
+DELIVERY_RECIPIENT_STATUS_FAILED = "failed"
+DELIVERY_RECIPIENT_STATUS_UNKNOWN = "unknown"
 AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
 AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 CHANNEL_POST_SEND_ATTEMPTS = 3
@@ -376,6 +387,9 @@ reservation_stats_report_started = False
 reservation_stats_report_stop_event = threading.Event()
 reservation_stats_live_lock = threading.Lock()
 reservation_stats_live_sessions = {}
+delivery_broadcast_monitor_started = False
+delivery_broadcast_monitor_stop_event = threading.Event()
+delivery_broadcast_scan_lock = threading.Lock()
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -463,6 +477,27 @@ def today_bounds(value=None):
     start = current.replace(hour=RESERVATION_STATS_DAY_START_HOUR, minute=0, second=0, microsecond=0)
     end = current.replace(hour=RESERVATION_STATS_DAY_END_HOUR, minute=0, second=0, microsecond=0)
     return start, end
+
+
+def delivery_campaign_date(value=None):
+    current = value or now_samara()
+    if current.tzinfo is not None:
+        current = current.astimezone(SAMARA_TZ)
+    return current.date()
+
+
+def delivery_campaign_cutoff_at(value=None):
+    return datetime.combine(
+        delivery_campaign_date(value),
+        datetime_time(hour=DELIVERY_BROADCAST_CUTOFF_HOUR, minute=0),
+    )
+
+
+def is_delivery_campaign_before_cutoff(value=None, cutoff_at=None):
+    current = value or now_local()
+    if current.tzinfo is not None:
+        current = current.astimezone(SAMARA_TZ).replace(tzinfo=None)
+    return current < (cutoff_at or delivery_campaign_cutoff_at(current))
 
 
 def add_reservation_stat_event(session, event_type, reservation, event_time=None):
@@ -3231,20 +3266,42 @@ def remove_unprocessed_reservation_from_cart(session, reservation, post, stats, 
     return post_id
 
 
-def remove_processed_reservation_from_cart(session, reservation, stats):
-    stats["temp_deleted"] += delete_temp_fulfilled_for_reservation(session, reservation)
-    if not session.query(Posts.id).filter(Posts.id == reservation.post_id).first():
+def remove_processed_reservation_from_cart(session, reservation, post, stats, queued_notifications):
+    client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+    if post:
+        mark_reserved_group_message_removed_by_admin(reservation, post, client)
+    else:
         stats["missing_posts"] += 1
+
+    stats["temp_deleted"] += delete_temp_fulfilled_for_reservation(session, reservation)
+    quantity_to_release = max(int(reservation.quantity or 0), 1)
+    post_id = reservation.post_id
     session.delete(reservation)
     stats["deleted"] += 1
     stats["processed_deleted"] += 1
-    return reservation.post_id
+
+    for _ in range(quantity_to_release):
+        next_in_queue = session.query(TempReservations).filter(
+            TempReservations.post_id == post_id,
+            TempReservations.temp_fulfilled == False,
+        ).order_by(TempReservations.created_at).first()
+
+        if next_in_queue and post:
+            queued_notifications.append(create_reservation_from_queue(session, next_in_queue, post))
+            stats["queued"] += 1
+            continue
+
+        if post:
+            post.quantity += 1
+            stats["returned"] += 1
+
+    return post_id
 
 
 def remove_reservation_from_cart(session, reservation, stats, queued_notifications):
     post = session.query(Posts).filter(Posts.id == reservation.post_id).first()
     if reservation.is_fulfilled:
-        return remove_processed_reservation_from_cart(session, reservation, stats)
+        return remove_processed_reservation_from_cart(session, reservation, post, stats, queued_notifications)
     return remove_unprocessed_reservation_from_cart(session, reservation, post, stats, queued_notifications)
 
 
@@ -4307,30 +4364,288 @@ def handle_statistic(message):
 
     bot.send_message(message.chat.id, response)
 
+def close_expired_delivery_broadcast_campaigns(session, current=None):
+    current = current or now_local()
+    expired = session.query(DeliveryBroadcastCampaign).filter(
+        DeliveryBroadcastCampaign.status == DELIVERY_BROADCAST_STATUS_ACTIVE,
+        DeliveryBroadcastCampaign.cutoff_at <= current,
+    ).all()
+    for campaign in expired:
+        campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+        campaign.finished_at = current
+    return len(expired)
+
+
+def get_or_create_delivery_broadcast_campaign(started_by_user_id, current=None):
+    current = current or now_local()
+    cutoff_at = delivery_campaign_cutoff_at(current)
+    if current >= cutoff_at:
+        with Session(bind=engine) as session:
+            close_expired_delivery_broadcast_campaigns(session, current)
+            session.commit()
+        return None, False, "Рассылку доставки можно запускать только до 14:00 по Самаре."
+
+    with Session(bind=engine) as session:
+        campaign = session.query(DeliveryBroadcastCampaign).filter(
+            DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(current)
+        ).first()
+        created = False
+        if campaign:
+            if campaign.status != DELIVERY_BROADCAST_STATUS_ACTIVE:
+                campaign.status = DELIVERY_BROADCAST_STATUS_ACTIVE
+                campaign.finished_at = None
+            if not campaign.cutoff_at:
+                campaign.cutoff_at = cutoff_at
+        else:
+            campaign = DeliveryBroadcastCampaign(
+                campaign_date=delivery_campaign_date(current),
+                started_at=current,
+                cutoff_at=cutoff_at,
+                status=DELIVERY_BROADCAST_STATUS_ACTIVE,
+                started_by_user_id=started_by_user_id,
+            )
+            session.add(campaign)
+            session.flush()
+            created = True
+        campaign_id = campaign.id
+        session.commit()
+        return campaign_id, created, None
+
+
+def get_active_delivery_broadcast_campaign_id(current=None):
+    current = current or now_local()
+    with Session(bind=engine) as session:
+        close_expired_delivery_broadcast_campaigns(session, current)
+        campaign = session.query(DeliveryBroadcastCampaign).filter(
+            DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(current),
+            DeliveryBroadcastCampaign.status == DELIVERY_BROADCAST_STATUS_ACTIVE,
+        ).first()
+        campaign_id = campaign.id if campaign and current < campaign.cutoff_at else None
+        session.commit()
+        return campaign_id
+
+
+def mark_stale_delivery_broadcast_recipients_unknown(session, campaign_id, current=None):
+    current = current or now_local()
+    stale_before = current - timedelta(minutes=DELIVERY_BROADCAST_STALE_SENDING_MINUTES)
+    return session.query(DeliveryBroadcastRecipient).filter(
+        DeliveryBroadcastRecipient.campaign_id == campaign_id,
+        DeliveryBroadcastRecipient.status == DELIVERY_RECIPIENT_STATUS_SENDING,
+        DeliveryBroadcastRecipient.attempted_at < stale_before,
+    ).update(
+        {
+            "status": DELIVERY_RECIPIENT_STATUS_UNKNOWN,
+            "error": "Бот перезапустился или не получил ответ Telegram после начала отправки.",
+        },
+        synchronize_session=False,
+    )
+
+
+def reserve_delivery_broadcast_recipient(campaign_id, user):
+    current = now_local()
+    with Session(bind=engine) as session:
+        existing = session.query(DeliveryBroadcastRecipient).filter(
+            DeliveryBroadcastRecipient.campaign_id == campaign_id,
+            DeliveryBroadcastRecipient.phone == user["phone"],
+        ).first()
+        if existing:
+            return None, existing.status
+
+        recipient = DeliveryBroadcastRecipient(
+            campaign_id=campaign_id,
+            phone=user["phone"],
+            user_id=user["user_id"],
+            name=user.get("name"),
+            total_sum=int(user.get("total_amount") or 0),
+            status=DELIVERY_RECIPIENT_STATUS_SENDING,
+            attempted_at=current,
+        )
+        session.add(recipient)
+        try:
+            session.commit()
+            return recipient.id, DELIVERY_RECIPIENT_STATUS_SENDING
+        except IntegrityError:
+            session.rollback()
+            return None, "reserved"
+
+
+def finalize_delivery_broadcast_recipient(recipient_id, status, message_id=None, error=None):
+    with Session(bind=engine) as session:
+        recipient = session.query(DeliveryBroadcastRecipient).filter(
+            DeliveryBroadcastRecipient.id == recipient_id
+        ).first()
+        if not recipient:
+            return
+        recipient.status = status
+        recipient.telegram_message_id = message_id
+        recipient.error = str(error)[:2000] if error else None
+        if status == DELIVERY_RECIPIENT_STATUS_SENT:
+            recipient.sent_at = now_local()
+        session.commit()
+
+
+def send_delivery_campaign_offer(campaign_id, user):
+    recipient_id, _ = reserve_delivery_broadcast_recipient(campaign_id, user)
+    if not recipient_id:
+        return "skipped"
+
+    try:
+        sent_message = send_delivery_offer_message(user["user_id"], user["name"])
+        finalize_delivery_broadcast_recipient(
+            recipient_id,
+            DELIVERY_RECIPIENT_STATUS_SENT,
+            message_id=getattr(sent_message, "message_id", None),
+        )
+        return "sent"
+    except Exception as exc:
+        finalize_delivery_broadcast_recipient(
+            recipient_id,
+            DELIVERY_RECIPIENT_STATUS_FAILED,
+            error=exc,
+        )
+        logger.warning("Delivery offer failed for user_id=%s: %s", user["user_id"], exc)
+        return "failed"
+
+
+def get_delivery_broadcast_status_counts(session, campaign_id):
+    rows = session.query(
+        DeliveryBroadcastRecipient.status,
+        func.count(DeliveryBroadcastRecipient.id),
+    ).filter(
+        DeliveryBroadcastRecipient.campaign_id == campaign_id,
+    ).group_by(DeliveryBroadcastRecipient.status).all()
+    return {status: int(count) for status, count in rows}
+
+
+def scan_delivery_broadcast_campaign(campaign_id):
+    with delivery_broadcast_scan_lock:
+        current = now_local()
+        with Session(bind=engine) as session:
+            campaign = session.query(DeliveryBroadcastCampaign).filter(
+                DeliveryBroadcastCampaign.id == campaign_id
+            ).first()
+            if not campaign:
+                return {"status": "missing", "eligible_users": []}
+            if campaign.status != DELIVERY_BROADCAST_STATUS_ACTIVE or current >= campaign.cutoff_at:
+                campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+                campaign.finished_at = current
+                session.commit()
+                return {"status": "finished", "eligible_users": []}
+            mark_stale_delivery_broadcast_recipients_unknown(session, campaign.id, current)
+            campaign.last_scan_at = current
+            cutoff_at = campaign.cutoff_at
+            session.commit()
+
+        auto_fulfill_expired_reservations()
+        eligible_users = calculate_for_delivery(cutoff_at=cutoff_at)
+        sent_count = 0
+        skipped_count = 0
+        failed_count = 0
+        stopped_by_cutoff = False
+        for user in eligible_users:
+            if now_local() >= cutoff_at:
+                stopped_by_cutoff = True
+                break
+            result = send_delivery_campaign_offer(campaign_id, user)
+            if result == "sent":
+                sent_count += 1
+                time.sleep(1)
+            elif result == "failed":
+                failed_count += 1
+                time.sleep(1)
+            else:
+                skipped_count += 1
+
+        with Session(bind=engine) as session:
+            campaign = session.query(DeliveryBroadcastCampaign).filter(
+                DeliveryBroadcastCampaign.id == campaign_id
+            ).first()
+            if campaign:
+                campaign.last_scan_at = now_local()
+                if stopped_by_cutoff:
+                    campaign.status = DELIVERY_BROADCAST_STATUS_FINISHED
+                    campaign.finished_at = campaign.last_scan_at
+            status_counts = get_delivery_broadcast_status_counts(session, campaign_id)
+            session.commit()
+
+        return {
+            "status": "finished" if stopped_by_cutoff else "active",
+            "eligible_users": eligible_users,
+            "sent_count": sent_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "status_counts": status_counts,
+        }
+
+
+def build_delivery_broadcast_result_text(result):
+    if result.get("status") == "finished":
+        return "Кампания доставки уже завершена: сейчас 14:00 или позже по Самаре."
+    if result.get("status") == "missing":
+        return "Кампания доставки не найдена."
+
+    status_counts = result.get("status_counts") or {}
+    needs_check = (
+        status_counts.get(DELIVERY_RECIPIENT_STATUS_SENDING, 0)
+        + status_counts.get(DELIVERY_RECIPIENT_STATUS_UNKNOWN, 0)
+        + status_counts.get(DELIVERY_RECIPIENT_STATUS_FAILED, 0)
+    )
+    return (
+        "Рассылка доставки проверена.\n"
+        f"Подходящих телефонов сейчас: {len(result.get('eligible_users') or [])}\n"
+        f"Новых отправлено: {result.get('sent_count', 0)}\n"
+        f"Уже были в кампании: {result.get('skipped_count', 0)}\n"
+        f"Ошибок новых отправок: {result.get('failed_count', 0)}\n"
+        f"Требуют проверки: {needs_check}"
+    )
+
+
+def delivery_broadcast_monitor_loop():
+    while True:
+        try:
+            campaign_id = get_active_delivery_broadcast_campaign_id()
+            if campaign_id:
+                result = scan_delivery_broadcast_campaign(campaign_id)
+                logger.info("Delivery broadcast monitor scan: %s", build_delivery_broadcast_result_text(result))
+        except Exception:
+            logger.exception("Delivery broadcast monitor failed")
+
+        if delivery_broadcast_monitor_stop_event.wait(DELIVERY_BROADCAST_CHECK_SECONDS):
+            return
+
+
+def start_delivery_broadcast_monitor_worker():
+    global delivery_broadcast_monitor_started
+    if delivery_broadcast_monitor_started:
+        return
+    delivery_broadcast_monitor_started = True
+    thread = threading.Thread(
+        target=delivery_broadcast_monitor_loop,
+        name="delivery-broadcast-monitor",
+        daemon=True,
+    )
+    thread.start()
+
+
 # Обработчик для кнопки 'Отправить рассылку'.
 @bot.message_handler(func=lambda message: message.text == "📤 Отправить рассылку")
 def send_broadcast(message):
     if not require_role(message, DELIVERY_ROLES):
         return
     user_id = message.from_user.id
-    bot.send_message(chat_id=user_id, text="Начинаю рассылку подходящим клиентам...")
+    bot.send_message(chat_id=user_id, text="Запускаю кампанию доставки до 14:00 по Самаре...")
     try:
-        auto_fulfill_expired_reservations()
-        eligible_users = calculate_for_delivery()
-        send_delivery_candidates_summary(eligible_users)
-        logger.info("Delivery broadcast candidates: %s", len(eligible_users))
+        campaign_id, created, error_text = get_or_create_delivery_broadcast_campaign(user_id)
+        if error_text:
+            bot.send_message(chat_id=user_id, text=error_text)
+            return
 
-        if eligible_users:
-            for user in eligible_users:
-                try:
-                    send_delivery_offer(bot, user["user_id"], user["name"])
-                    time.sleep(1)
-                except Exception as e:
-                    logger.warning("Delivery offer failed for user_id=%s: %s", user["user_id"], e)
-            bot.send_message(chat_id=user_id, text=f"Рассылка отправлена. Клиентов: {len(eligible_users)}.")
-        else:
-            bot.send_message(chat_id=user_id, text="Подходящих клиентов для рассылки не найдено.")
+        result = scan_delivery_broadcast_campaign(campaign_id)
+        send_delivery_candidates_summary(result.get("eligible_users") or [], result)
+        prefix = "Кампания создана." if created else "Кампания уже была активна, сделал внеочередной пересчет."
+        bot.send_message(chat_id=user_id, text=f"{prefix}\n{build_delivery_broadcast_result_text(result)}")
     except Exception as e:
+        logger.exception("Delivery broadcast failed")
         bot.send_message(chat_id=user_id, text=f"Ошибка при выполнении рассылки: {str(e)}")
 
 
@@ -4467,10 +4782,12 @@ def handle_delivery_response_callback(call):
             "WAITING_FOR_NEW_PHONE",
         }
         existing_cutoff = parse_datetime(existing_temp.get("delivery_cutoff_at"))
+        with Session(bind=engine) as session:
+            campaign_cutoff = get_delivery_cutoff_for_user(session, user_id)
         delivery_cutoff_at = (
             existing_cutoff
             if current_state in active_delivery_states and existing_cutoff
-            else now_local()
+            else (campaign_cutoff or now_local())
         )
         temp_user_data[user_id] = {
             **existing_temp,
@@ -4588,8 +4905,7 @@ def calculate_sum_for_user(user_id, cutoff_at=None):
         )
         if cutoff_at:
             query = query.filter(
-                Reservations.fulfilled_at != None,
-                Reservations.fulfilled_at <= cutoff_at,
+                or_(Reservations.fulfilled_at == None, Reservations.fulfilled_at <= cutoff_at),
             )
         result = query.first()
 
@@ -4601,13 +4917,23 @@ def delivery_target_label(now=None):
     return "Доставка на понедельник" if now.weekday() == 5 else "Доставка на завтра"
 
 
-def send_delivery_candidates_summary(eligible_users):
+def send_delivery_candidates_summary(eligible_users, scan_result=None):
     if not eligible_users:
         text = "📤 Рассылка доставки: подходящих клиентов с суммой 1500+ не найдено."
     else:
+        scan_result = scan_result or {}
+        status_counts = scan_result.get("status_counts") or {}
+        needs_check = (
+            status_counts.get(DELIVERY_RECIPIENT_STATUS_SENDING, 0)
+            + status_counts.get(DELIVERY_RECIPIENT_STATUS_UNKNOWN, 0)
+            + status_counts.get(DELIVERY_RECIPIENT_STATUS_FAILED, 0)
+        )
         lines = [
             "📤 Клиенты для рассылки доставки",
             f"Всего клиентов: {len(eligible_users)}",
+            f"Новых отправлено сейчас: {scan_result.get('sent_count', 0)}",
+            f"Уже были в кампании: {scan_result.get('skipped_count', 0)}",
+            f"Требуют проверки: {needs_check}",
             "",
         ]
         for index, user in enumerate(eligible_users, start=1):
@@ -4622,6 +4948,24 @@ def send_delivery_candidates_summary(eligible_users):
         bot.send_message(chat_id=delivery_channel, text=text)
     except Exception as e:
         print(f"[ERROR] Ошибка отправки списка клиентов для рассылки: {e}")
+
+
+def get_delivery_cutoff_for_user(session, user_id):
+    client = session.query(Clients).filter(Clients.user_id == user_id).first()
+    if not client:
+        return None
+    phone = normalize_phone(client.phone)
+    if not phone:
+        return None
+
+    row = session.query(DeliveryBroadcastCampaign.cutoff_at).join(
+        DeliveryBroadcastRecipient,
+        DeliveryBroadcastRecipient.campaign_id == DeliveryBroadcastCampaign.id,
+    ).filter(
+        DeliveryBroadcastCampaign.campaign_date == delivery_campaign_date(),
+        DeliveryBroadcastRecipient.phone == phone,
+    ).order_by(DeliveryBroadcastCampaign.id.desc()).first()
+    return row[0] if row else None
 
 
 def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum, delivery_cutoff_at=None):
@@ -5433,20 +5777,23 @@ def keyboard_for_delivery():
     keyboard.add(yes_button, no_button)  # Добавляем кнопки в клавиатуру
     return keyboard
 
-def calculate_for_delivery():
+def calculate_for_delivery(cutoff_at=None):
     """
     Вычисляет общую сумму обработанных заказов клиентов, объединяет заказы для клиентов с одинаковым номером телефона.
     Сообщение отправляется одному клиенту с минимальным ID. Логи содержат индивидуальную сумму, суммы других клиентов, и итоговую сумму.
     """
+    cutoff_at = cutoff_at or delivery_campaign_cutoff_at()
     with Session(bind=engine) as session:
-        rows = session.query(Reservations, Posts, Clients).join(
+        query = session.query(Reservations, Posts, Clients).join(
             Posts, Posts.id == Reservations.post_id
         ).join(
             Clients, Clients.user_id == Reservations.user_id
         ).filter(
             Reservations.is_fulfilled == True,
-            Reservations.fulfilled_at != None,
-        ).all()
+        )
+        if cutoff_at:
+            query = query.filter(or_(Reservations.fulfilled_at == None, Reservations.fulfilled_at <= cutoff_at))
+        rows = query.all()
 
     if not rows:
         logger.info("Delivery broadcast: no fulfilled reservations found.")
@@ -5561,16 +5908,23 @@ def build_delivery_clients_summary_messages(clients, max_length=3500):
 
 
 # Отправка рассылки
-def send_delivery_offer(bot, user_id, user_name):
+def send_delivery_offer_message(user_id, user_name, bot_instance=None):
+    bot_instance = bot_instance or bot
+    sent_message = bot_instance.send_message(
+        chat_id=user_id,
+        text=f"{user_name}, {delivery_target_label()}. Готовы принять доставку с 10:00 до 16:00?",
+        reply_markup=keyboard_for_delivery()
+    )
+    logger.debug("Delivery offer sent to user_id=%s", user_id)
+    return sent_message
+
+
+def send_delivery_offer(bot_instance, user_id, user_name):
     try:
-        bot.send_message(
-            chat_id=user_id,
-            text=f"{user_name}, {delivery_target_label()}. Готовы принять доставку с 10:00 до 16:00?",
-            reply_markup=keyboard_for_delivery()  # Используем новую клавиатуру
-        )
-        logger.debug("Delivery offer sent to user_id=%s", user_id)
+        return send_delivery_offer_message(user_id, user_name, bot_instance=bot_instance)
     except Exception as e:
         logger.warning("Delivery offer send failed for user_id=%s: %s", user_id, e)
+        raise
 
 
 def get_related_delivery_user_ids(session, delivery_entry):
@@ -6791,6 +7145,7 @@ def run_bot():
     start_channel_post_auto_publish_worker()
     start_delivery_cleanup_worker()
     start_reservation_stats_daily_report_worker()
+    start_delivery_broadcast_monitor_worker()
     start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)
     retry_delay = 5
 

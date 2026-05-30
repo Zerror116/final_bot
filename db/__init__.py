@@ -12,6 +12,8 @@ from .deleted_post_snapshots import DeletedPostSnapshot
 from .delivery_cleanup_runs import DeliveryCleanupRun
 from .post_id_reservations import PostIdReservation
 from .reservation_stat_events import ReservationStatEvent
+from .delivery_broadcast_campaigns import DeliveryBroadcastCampaign
+from .delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -31,6 +33,7 @@ def run_schema_migrations():
     run_migration("003_revision_delivery_cleanup_tables", ensure_revision_delivery_cleanup_tables)
     run_migration("004_post_id_reservations", ensure_post_id_reservations)
     run_migration("005_reservation_stat_events", ensure_reservation_stat_events)
+    run_migration("006_delivery_broadcast_campaigns", ensure_delivery_broadcast_campaigns)
 
 
 def ensure_schema_migrations():
@@ -336,6 +339,24 @@ def ensure_reservation_stat_events():
             ")"
         ))
 
+
+def ensure_delivery_broadcast_campaigns():
+    AbstractModel.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_broadcast_campaigns_date "
+            "ON delivery_broadcast_campaigns (campaign_date)"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_broadcast_recipients_campaign_phone "
+            "ON delivery_broadcast_recipients (campaign_id, phone)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_delivery_broadcast_recipients_status "
+            "ON delivery_broadcast_recipients (status)"
+        ))
+
 __all__ = {
     "Posts",
     "Clients",
@@ -351,5 +372,7 @@ __all__ = {
     "DeliveryCleanupRun",
     "PostIdReservation",
     "ReservationStatEvent",
+    "DeliveryBroadcastCampaign",
+    "DeliveryBroadcastRecipient",
     "init_db",
 }
