@@ -517,11 +517,31 @@ def test_cart_clear_processed_is_available():
         "cleanup_or_refresh_for_delivery_by_phone",
         "Reservations.is_fulfilled == True",
         "def handle_clear_full_cart",
+        "def build_cart_item_caption(post, reservation):",
+        "post_id=reservation.post_id",
+        "Удалить без отправки на канал",
+        "clear_no_channel_",
+        "def clear_client_cart_without_channel_return(user_id):",
+        "def remove_reservation_without_channel_return(session, reservation, stats):",
+        "not_returned_to_channel",
     ]:
         if marker not in text:
             raise AssertionError(f"cart clear processed marker missing {marker}")
     if "Обработанные товары удаляются только через" in text:
         raise AssertionError("cart clear processed warning must not be shown")
+    no_channel_block = text.split("def clear_client_cart_without_channel_return(user_id):", 1)[1].split(
+        "# Отображает содержимое корзины",
+        1,
+    )[0]
+    forbidden = [
+        "update_channel_post_message",
+        "send_queue_transfer_notifications",
+        "create_reservation_from_queue",
+        "post.quantity +=",
+    ]
+    for marker in forbidden:
+        if marker in no_channel_block:
+            raise AssertionError(f"cart no-channel delete must not use {marker}")
 
 
 def test_channel_delete_happens_only_after_delivery_cleanup():

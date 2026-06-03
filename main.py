@@ -3097,6 +3097,7 @@ def build_cart_item_caption(post, reservation):
         price=unit_price,
         quantity=reservation.quantity,
         created_at=post.created_at,
+        post_id=reservation.post_id,
     )
 
 
@@ -3108,6 +3109,7 @@ def empty_cart_cleanup_stats():
         "temp_deleted": 0,
         "returned": 0,
         "queued": 0,
+        "not_returned_to_channel": 0,
         "for_delivery_removed": 0,
         "for_delivery_updated": 0,
         "missing_posts": 0,
@@ -3135,6 +3137,8 @@ def format_cart_cleanup_result(stats):
         parts.append(f"возвращено в остаток: {stats['returned']}")
     if stats.get("queued"):
         parts.append(f"передано очереди: {stats['queued']}")
+    if stats.get("not_returned_to_channel"):
+        parts.append(f"без возврата на канал: {stats['not_returned_to_channel']}")
     if stats.get("for_delivery_removed"):
         parts.append(f"удалено заявок доставки: {stats['for_delivery_removed']}")
     if stats.get("for_delivery_updated"):
@@ -3345,6 +3349,25 @@ def remove_reservation_from_cart(session, reservation, stats, queued_notificatio
     return remove_unprocessed_reservation_from_cart(session, reservation, post, stats, queued_notifications)
 
 
+def remove_reservation_without_channel_return(session, reservation, stats):
+    post = get_post_or_snapshot(session, reservation.post_id)
+    client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+    if post:
+        mark_reserved_group_message_removed_by_admin(reservation, post, client)
+    else:
+        stats["missing_posts"] += 1
+
+    if reservation.is_fulfilled:
+        stats["temp_deleted"] += delete_temp_fulfilled_for_reservation(session, reservation)
+        stats["processed_deleted"] += 1
+    else:
+        stats["unprocessed_deleted"] += 1
+
+    stats["not_returned_to_channel"] += max(int(reservation.quantity or 0), 1)
+    session.delete(reservation)
+    stats["deleted"] += 1
+
+
 def clear_client_cart(user_id, processed_only=False, reservation_id=None):
     stats = empty_cart_cleanup_stats()
     queued_notifications = []
@@ -3397,6 +3420,31 @@ def clear_client_cart(user_id, processed_only=False, reservation_id=None):
     return stats
 
 
+def clear_client_cart_without_channel_return(user_id):
+    stats = empty_cart_cleanup_stats()
+
+    with Session(bind=engine) as session:
+        source_client = session.query(Clients).filter(Clients.user_id == user_id).first()
+        if not source_client:
+            return stats
+
+        related_clients = session.query(Clients).filter(
+            Clients.phone.in_(phone_variants(source_client.phone))
+        ).all()
+        related_user_ids = [client.user_id for client in related_clients] or [user_id]
+        reservations = session.query(Reservations).filter(
+            Reservations.user_id.in_(related_user_ids),
+        ).order_by(Reservations.id).all()
+
+        for reservation in reservations:
+            remove_reservation_without_channel_return(session, reservation, stats)
+
+        merge_cart_cleanup_stats(stats, cleanup_or_refresh_for_delivery_by_phone(session, source_client.phone))
+        session.commit()
+
+    return stats
+
+
 # Отображает содержимое корзины и добавляет кнопку для расформирования обработанных товаров
 def send_cart_content(chat_id, reservations, user_id):
     with Session(bind=engine) as session:
@@ -3428,6 +3476,7 @@ def send_cart_content(chat_id, reservations, user_id):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
     markup.add(types.InlineKeyboardButton("Расформировать полностью", callback_data=f"clear_full_cart_{user_id}"))
+    markup.add(types.InlineKeyboardButton("Удалить без отправки на канал", callback_data=f"clear_no_channel_{user_id}"))
     bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
 
 
@@ -3511,6 +3560,36 @@ def handle_clear_full_cart(call):
         bot.send_message(
             call.message.chat.id,
             f"Корзина полностью расформирована. {format_cart_cleanup_result(stats)}",
+        )
+    else:
+        safe_answer_callback_query(call.id, "Корзина уже пуста.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("clear_no_channel_"))
+def handle_clear_without_channel_return(call):
+    if not has_role(call.from_user.id, ADMIN_ROLES):
+        safe_answer_callback_query(call.id, "У вас недостаточно прав.", show_alert=True)
+        return
+
+    try:
+        user_id = int(call.data.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        safe_answer_callback_query(call.id, "Некорректный клиент.", show_alert=True)
+        return
+
+    try:
+        stats = clear_client_cart_without_channel_return(user_id)
+    except Exception as exc:
+        logger.exception("Clear cart without channel return failed for user_id=%s", user_id)
+        safe_answer_callback_query(call.id, "Ошибка при удалении без возврата на канал.", show_alert=True)
+        bot.send_message(call.message.chat.id, f"Ошибка при удалении без возврата на канал: {exc}")
+        return
+
+    if stats.get("deleted", 0) > 0:
+        safe_answer_callback_query(call.id, f"Корзина удалена. Позиций: {stats['deleted']}.", show_alert=True)
+        bot.send_message(
+            call.message.chat.id,
+            f"Корзина удалена без возврата товара на канал. {format_cart_cleanup_result(stats)}",
         )
     else:
         safe_answer_callback_query(call.id, "Корзина уже пуста.", show_alert=True)
