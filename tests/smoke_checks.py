@@ -355,6 +355,7 @@ def test_channel_post_auto_publish_markers():
         'if source == "auto" and sent_count and not failed_post_ids:',
         "send_phoenix_channel_footer()",
         "Phoenix footer sent to channel after post publish",
+        "group_caption = f\"Id товара: {post_id}\\nПост был создан пользователем: {creator_name}",
     ]:
         if marker not in text:
             raise AssertionError(f"channel post auto publish marker missing {marker}")
@@ -519,7 +520,9 @@ def test_cart_clear_processed_is_available():
         "def handle_clear_full_cart",
         "def build_cart_item_caption(post, reservation):",
         "post_id=reservation.post_id",
-        "Удалить без отправки на канал",
+        "author=format_post_author(post)",
+        "Выложил: {author}",
+        "Прикарманить",
         "clear_no_channel_",
         "def clear_client_cart_without_channel_return(user_id):",
         "def remove_reservation_without_channel_return(session, reservation, stats):",
@@ -593,6 +596,8 @@ def test_delivery_collection_pauses_reserved_group_flow():
         "def send_delivery_reserved_group_snapshot():",
         "bot.send_message(TARGET_GROUP_ID, \"Брони на доставку\")",
         "f\"Id товара: {item['post_id']}\"",
+        "f\"Выложил: {item.get('author') or 'неизвестно'}\"",
+        '"author": format_post_author(post)',
         "def start_delivery_reserved_group_pause_and_snapshot():",
         "start_delivery_reserved_group_pause_and_snapshot()",
         "def flush_reserved_group_queue_after_delivery(",
@@ -713,9 +718,10 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
         "Posts.release_reserved_id(data.get(\"post_id\"), chat_id=chat_id)",
         "Id товара: {created_post_id}",
         "Ваш пост успешно создан!",
-        "def build_item_list_caption(description, price, quantity, created_at, post_id=None):",
+        "def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None):",
         "Id товара: {post_id}",
         'post_id=item["post_id"]',
+        "author=item.get(\"author\")",
     ]:
         if marker not in main_text:
             raise AssertionError(f"post id display marker missing {marker}")

@@ -3056,7 +3056,14 @@ def format_cart_date(value):
     return str(value)
 
 
-def build_item_list_caption(description, price, quantity, created_at, post_id=None):
+def format_post_author(post):
+    if not post or not getattr(post, "chat_id", None):
+        return "неизвестно"
+    author_name = Clients.get_name_by_user_id(post.chat_id)
+    return author_name or f"user_id {post.chat_id}"
+
+
+def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None):
     lines = []
     if post_id is not None:
         lines.append(f"Id товара: {post_id}")
@@ -3066,6 +3073,8 @@ def build_item_list_caption(description, price, quantity, created_at, post_id=No
         f"Количество: {quantity}",
         f"Дата создания: {format_cart_date(created_at)}",
     ])
+    if author:
+        lines.append(f"Выложил: {author}")
     return "\n".join(lines)
 
 
@@ -3098,6 +3107,7 @@ def build_cart_item_caption(post, reservation):
         quantity=reservation.quantity,
         created_at=post.created_at,
         post_id=reservation.post_id,
+        author=format_post_author(post),
     )
 
 
@@ -3476,7 +3486,7 @@ def send_cart_content(chat_id, reservations, user_id):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("Расформировать обработанные", callback_data=f"clear_processed_{user_id}"))
     markup.add(types.InlineKeyboardButton("Расформировать полностью", callback_data=f"clear_full_cart_{user_id}"))
-    markup.add(types.InlineKeyboardButton("Удалить без отправки на канал", callback_data=f"clear_no_channel_{user_id}"))
+    markup.add(types.InlineKeyboardButton("Прикарманить", callback_data=f"clear_no_channel_{user_id}"))
     bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
 
 
@@ -4260,7 +4270,7 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
             Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
             sent_count += 1
 
-            group_caption = f"Пост был создан пользователем: {creator_name}\n\n{caption}"
+            group_caption = f"Id товара: {post_id}\nПост был создан пользователем: {creator_name}\n\n{caption}"
             try:
                 bot.send_photo(ARCHIVE, photo=photo, caption=group_caption)
             except Exception as exc:
@@ -6199,6 +6209,7 @@ def get_delivery_collection_reserved_group_items():
                     "reserved_at": reservation.created_at,
                     "fulfilled_at": reservation.fulfilled_at,
                     "cutoff_at": get_delivery_cutoff_at(delivery_entry),
+                    "author": format_post_author(post),
                 })
 
         session.commit()
@@ -6228,6 +6239,7 @@ def build_delivery_reserved_group_item_caption(item):
         f"Обработано: {format_datetime(item.get('fulfilled_at'))}",
         f"Срез доставки: {format_datetime(item.get('cutoff_at'))}",
         f"Адрес: {item['address'] or 'адрес не указан'}",
+        f"Выложил: {item.get('author') or 'неизвестно'}",
     ])
 
 
@@ -6332,6 +6344,7 @@ def get_delivery_entry_cart_items(session, delivery_entry):
                 "total_price": 0,
                 "names": set(),
                 "created_at": get_delivery_row_created_at(reservation, post=post, temp_item=temp_item),
+                "author": format_post_author(post),
             }
         item = grouped_items[item_key]
         item["quantity"] += reservation.quantity
@@ -6467,6 +6480,7 @@ def show_delivery_collection_client(call):
             quantity=item["quantity"],
             created_at=item.get("created_at"),
             post_id=item["post_id"],
+            author=item.get("author"),
         )
         try:
             send_photo_or_text(bot, call.message.chat.id, item["photo"], caption)
