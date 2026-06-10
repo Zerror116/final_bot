@@ -17,10 +17,12 @@ def assert_equal(actual, expected, label):
 
 def test_audit_prices():
     examples = {
-        1: 50,
-        49: 50,
-        50: 50,
-        100: 50,
+        1: 100,
+        49: 100,
+        50: 100,
+        100: 100,
+        150: 100,
+        200: 150,
         500: 450,
         1200: 1100,
         3450: 3100,
@@ -444,6 +446,7 @@ def test_delivery_move_and_archive_are_loss_safe():
 
 def test_revision_excludes_linked_posts_and_logs_work():
     text = MAIN.read_text(encoding="utf-8")
+    pricing_text = (ROOT / "services" / "pricing.py").read_text(encoding="utf-8")
     db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
     for marker in [
         "def get_revision_blocked_post_ids(session):",
@@ -454,9 +457,25 @@ def test_revision_excludes_linked_posts_and_logs_work():
         "Posts.quantity > 0",
         "session.add(RevisionLog(",
         "Исключено из-за корзины/доставки/очереди",
+        "new_price = calculate_audit_price(old_price)",
+        "post.price = new_price",
     ]:
         if marker not in text:
             raise AssertionError(f"revision safety marker missing {marker}")
+
+    for marker in [
+        "AUDIT_MIN_PRICE = 100",
+        "return max(AUDIT_MIN_PRICE, int(rounded_price))",
+    ]:
+        if marker not in pricing_text:
+            raise AssertionError(f"audit minimum price marker missing {marker}")
+
+    for marker in [
+        "def sync_existing_posts_to_audit_min_price",
+        "start_audit_min_price_sync_worker()",
+    ]:
+        if marker in text:
+            raise AssertionError(f"audit minimum price must be applied only during selected-date revision, found {marker}")
 
     revision_block = text.split("def apply_auto_audit_for_date", 1)[1].split("def answer_manual_audit_disabled", 1)[0]
     if "today_start" in revision_block:
