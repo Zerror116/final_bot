@@ -776,6 +776,60 @@ def test_telegram_safe_helpers():
     )
 
 
+def test_silent_blacklist_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    black_list_text = (ROOT / "db" / "black_list.py").read_text(encoding="utf-8")
+    handler_text = (ROOT / "handlers" / "black_list.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "silent_block = mapped_column(Boolean",
+        "def set_silent_block",
+        "def is_silent_blocked",
+    ]:
+        if marker not in black_list_text:
+            raise AssertionError(f"silent blacklist model marker missing {marker}")
+
+    for marker in [
+        '"007_black_list_silent_block"',
+        'add_column_if_missing("black_list", "silent_block"',
+        "ix_black_list_silent_block",
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"silent blacklist migration marker missing {marker}")
+
+    if "def is_user_silent_blocked" not in handler_text:
+        raise AssertionError("silent blacklist handler helper missing")
+
+    for marker in [
+        "def ignore_silent_blocked_message",
+        "def ignore_silent_blocked_callback",
+        "def handle_reservation(call):",
+        "def my_orders(message):",
+        "def cancel_reservation(call):",
+        "def handle_delivery_response_callback(call):",
+        "def defect(message):",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"silent blacklist main marker missing {marker}")
+
+    for handler_signature in [
+        "def handle_reservation(",
+        "def show_my_orders(",
+        "def my_orders(",
+        "def paginate_orders(",
+        "def cancel_reservation(",
+        "def handle_enqueue(",
+        "def handle_delivery_response_callback(",
+        "def handle_address_input(",
+        "def handle_confirmation(",
+        "def defect(",
+    ]:
+        block = main_text.split(handler_signature, 1)[1].split("\n@bot.", 1)[0]
+        if "ignore_silent_blocked_" not in block:
+            raise AssertionError(f"silent blacklist guard missing in {handler_signature}")
+
+
 def main():
     test_audit_prices()
     test_delivery_callbacks_are_namespaced()
@@ -808,6 +862,7 @@ def main():
     test_client_menu_hides_orders_in_delivery()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
+    test_silent_blacklist_markers()
     print("smoke checks ok")
 
 

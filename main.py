@@ -405,6 +405,40 @@ def safe_answer_callback_query(*args, **kwargs):
         return None
 
 
+def is_silent_blocked_user(user_id):
+    if user_id is None:
+        return False
+
+    try:
+        return is_user_silent_blocked(int(user_id))
+    except Exception as exc:
+        logger.warning("Silent blacklist check failed for user_id=%s: %s", user_id, exc)
+        return False
+
+
+def ignore_silent_blocked_message(message):
+    user_id = getattr(getattr(message, "chat", None), "id", None)
+    if not is_silent_blocked_user(user_id):
+        return False
+
+    logger.info("Silent blocked message ignored for user_id=%s", user_id)
+    return True
+
+
+def ignore_silent_blocked_callback(call):
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if not is_silent_blocked_user(user_id):
+        return False
+
+    logger.info(
+        "Silent blocked callback ignored for user_id=%s data=%s",
+        user_id,
+        getattr(call, "data", None),
+    )
+    safe_answer_callback_query(call.id)
+    return True
+
+
 def normalize_phone(phone):
     digits = re.sub(r"\D", "", str(phone or ""))
     if len(digits) == 10:
@@ -937,6 +971,8 @@ def back_to_start(call):
 @bot.message_handler(func=lambda message: message.text == "Регистрация")
 def handle_registration(message):
     chat_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
 
     # Проверяем, находится ли пользователь в черном списке
     if is_user_blacklisted(chat_id):
@@ -957,6 +993,8 @@ def handle_registration(message):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.REGISTERING_NAME)
 def handle_name_registration(message):
     chat_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
     user_name = message.text.strip()
 
     # Проверяем валидность имени
@@ -977,6 +1015,8 @@ def handle_name_registration(message):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.STARTED_REGISTRATION)
 def handle_phone_registration(message):
     chat_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
     raw_phone = message.text.strip()
     cleaned_phone = normalize_phone(raw_phone)
 
@@ -1012,6 +1052,8 @@ def is_phone_valid(phone):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == Registration.REGISTERING_PHONE)
 def confirm_phone_registration(message):
     chat_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
     response = message.text.strip().lower()
 
     # Проверка временных данных (подстраховка)
@@ -1144,8 +1186,11 @@ def create_yes_no_keyboard():
 # Обработчик запроса бронирования
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reserve_"))
 def handle_reservation(call):
-    post_id = int(call.data.split("_", 1)[1])
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
+    post_id = int(call.data.split("_", 1)[1])
     if is_user_blacklisted(user_id):
         return "Вы не можете бронировать товары, так как вы были заблокированы"
     if not is_registered(user_id):
@@ -1842,6 +1887,9 @@ def start_reservation_auto_fulfill_worker():
 @bot.message_handler(commands=["my_reservations"])
 def show_reservations(message):
     user_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
+
     query = Clients.get_row(user_id=user_id)
     # Проверка регистрации пользователя
     # if not is_registered(user_id):
@@ -1891,6 +1939,9 @@ def show_reservations(message):
 # Хэндлер для обработки нажатий на заказ
 @bot.callback_query_handler(func=lambda call: call.data.startswith("order_"))
 def order_details(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     reservation_id = int(call.data.split("_")[1])
 
     try:
@@ -2033,6 +2084,9 @@ def cancel_unfulfilled_reservation(reservation_id, related_user_ids):
 # Отображает список заказов
 @bot.callback_query_handler(func=lambda call: call.data == "my_orders")
 def show_my_orders(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     message = call.message
     my_orders(message)  # Вызываем my_orders, передаём исходное сообщение
     safe_answer_callback_query(call.id)  # Подтверждаем обработку нажатия
@@ -2041,6 +2095,8 @@ def show_my_orders(call):
 @bot.message_handler(func=lambda message: message.text == "🛒 Мои заказы")
 def my_orders(message):
     user_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
 
     # Сначала удаляем сообщение пользователя
     try:
@@ -2160,6 +2216,9 @@ def send_order_page(user_id, message_id, orders, page):
 # Обработчик навигации между страницами
 @bot.callback_query_handler(func=lambda call: call.data.startswith("orders_page_"))
 def paginate_orders(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     user_id = call.message.chat.id
     message_id = call.message.message_id
     page = int(call.data.split("_")[2])
@@ -2181,6 +2240,9 @@ def paginate_orders(call):
     func=lambda call: call.data.startswith(("cancel_order_", "cancel_reservation_"))
 )
 def cancel_reservation(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     if call.data.startswith("cancel_order_"):
         call.data = call.data.replace("cancel_order_", "cancel_reservation_", 1)
     logger.debug("Cancel reservation callback received: %s", call.data)
@@ -2257,6 +2319,9 @@ def cancel_reservation(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("enqueue_"))
 def handle_enqueue(call):
     user_id = call.message.chat.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     post_id = int(call.data.split("_")[1])
 
     # Проверяем, существует ли запись уже в TempReservations
@@ -2290,6 +2355,11 @@ def handle_enqueue(call):
 # Возврат в меню заказов
 @bot.callback_query_handler(func=lambda call: call.data == "go_back")
 def go_back_to_menu(call):
+    if not isinstance(call, telebot.types.Message) and ignore_silent_blocked_callback(call):
+        return
+    if isinstance(call, telebot.types.Message) and ignore_silent_blocked_message(call):
+        return
+
     # Если объект — сообщение (Message), то работаем с ним напрямую
     if isinstance(call, telebot.types.Message):
         chat_id = call.chat.id
@@ -2312,6 +2382,8 @@ def go_back_to_menu(call):
 @bot.message_handler(func=lambda message: message.text == "🚗 Заказы в доставке")
 def show_delivery_orders(message):
     user_id = message.chat.id  # Получаем ID текущего пользователя
+    if ignore_silent_blocked_message(message):
+        return
 
     try:
         related_user_ids = get_related_user_ids_by_full_phone(user_id)
@@ -2637,6 +2709,9 @@ def find_user_by_name_and_last_digits(name, last_digits):
 # Обработчик навигации между страницами для заказов в доставке
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delivery_page_"))
 def paginate_delivery_orders(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     user_id = call.message.chat.id
     message_id = call.message.message_id
     page = int(call.data.split("_")[2])
@@ -4881,6 +4956,9 @@ def is_legacy_delivery_callback(call):
 def handle_delivery_response_callback(call):
     # Получаем данные пользователя
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     message_id = call.message.message_id  # ID сообщения с кнопками
     response = call.data
     if response == "yes":
@@ -4939,6 +5017,9 @@ def handle_delivery_response_callback(call):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "WAITING_FOR_ADDRESS")
 def handle_address_input(message):
     user_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
+
     address = message.text
     logger.info("Delivery address received for user_id=%s", user_id)
     # Проверяем наличие данных о пользователе
@@ -5578,6 +5659,9 @@ def keyboard_for_editing():
 
 @bot.callback_query_handler(func=lambda call: call.data == "delivery_otmena")
 def handle_delivery_otmena(call):
+    if ignore_silent_blocked_callback(call):
+        return
+
     try:
         # Удаляем сообщение рассылки
         safe_delete_message(bot, call.message.chat.id, call.message.message_id, logger=logger)
@@ -5594,6 +5678,9 @@ def handle_delivery_otmena(call):
 @bot.callback_query_handler(func=lambda call: get_user_state(call.from_user.id) == "WAITING_FOR_DATA_EDIT")
 def handle_data_editing(call):
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     action = call.data
 
 
@@ -5624,6 +5711,9 @@ def handle_new_address(message):
     Обработка нового адреса от пользователя.
     """
     user_id = message.from_user.id
+    if ignore_silent_blocked_message(message):
+        return
+
     new_address = message.text
     temp_user_data[user_id]["address"] = new_address  # Сохранение нового адреса
 
@@ -5672,6 +5762,9 @@ def handle_new_phone(message):
     Должен учитывать информацию по старому номеру телефона и временно сохранять новый номер.
     """
     user_id = message.from_user.id
+    if ignore_silent_blocked_message(message):
+        return
+
     new_phone = normalize_phone(message.text)  # Убираем лишние пробелы
     if not is_phone_valid(new_phone):
         bot.send_message(user_id, "Введите корректный номер телефона.")
@@ -5750,6 +5843,9 @@ def handle_confirmation(call):
     - Новые данные (телефон, адрес) — из temp_user_data.
     """
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     confirmation = call.data  # "confirm_yes" или "confirm_no"
 
     if confirmation == "confirm_yes":
@@ -6914,6 +7010,8 @@ def disabled_manual_audit_message(message):
 @bot.message_handler(func=lambda message: message.text == "😞 У меня брак")
 def defect(message):
     user_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
 
     with Session(bind=engine) as session:
         related_user_ids = get_related_user_ids_by_full_phone(user_id)
@@ -6948,6 +7046,9 @@ def defect(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("select_defective_"))
 def select_defective_order(call):
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     item_id = int(call.data.split("_")[2])  # ID записи в Temp_Fulfilled
 
     # Сохраняем состояние, чтобы отследить следующий шаг (ввод причины)
@@ -6969,6 +7070,9 @@ def select_defective_order(call):
 @bot.callback_query_handler(func=lambda call: call.data == "enter_defect_reason")
 def request_defect_reason(call):
     user_id = call.from_user.id
+    if ignore_silent_blocked_callback(call):
+        return
+
     state = get_user_state(user_id)
 
     if not isinstance(state, dict) or state.get("action") != "defect_reason":
@@ -6987,6 +7091,9 @@ def request_defect_reason(call):
 )
 def handle_defect_reason(message):
     user_id = message.chat.id
+    if ignore_silent_blocked_message(message):
+        return
+
     state = get_user_state(user_id)
 
     if not state or "item_id" not in state:

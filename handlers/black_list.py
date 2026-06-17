@@ -4,3 +4,7 @@ from db import BlackList
 def is_user_blacklisted(user_id: int) -> bool:
     blacklisted_user = BlackList.get_row(user_id)
     return bool(blacklisted_user)
+
+
+def is_user_silent_blocked(user_id: int) -> bool:
+    return BlackList.is_silent_blocked(user_id)
