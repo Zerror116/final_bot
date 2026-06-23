@@ -35,6 +35,7 @@ def run_schema_migrations():
     run_migration("005_reservation_stat_events", ensure_reservation_stat_events)
     run_migration("006_delivery_broadcast_campaigns", ensure_delivery_broadcast_campaigns)
     run_migration("007_black_list_silent_block", ensure_black_list_silent_block)
+    run_migration("008_for_delivery_collection_claim", ensure_for_delivery_collection_claim)
 
 
 def ensure_schema_migrations():
@@ -367,6 +368,24 @@ def ensure_black_list_silent_block():
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_black_list_silent_block "
             "ON black_list (silent_block)"
+        ))
+
+
+def ensure_for_delivery_collection_claim():
+    AbstractModel.metadata.create_all(engine)
+    timestamp_type = (
+        "TIMESTAMP WITHOUT TIME ZONE"
+        if engine.dialect.name == "postgresql"
+        else "DATETIME"
+    )
+
+    add_column_if_missing("for_delivery", "collector_user_id", "BIGINT")
+    add_column_if_missing("for_delivery", "collector_name", "VARCHAR")
+    add_column_if_missing("for_delivery", "collection_started_at", timestamp_type)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_for_delivery_collector_user_id "
+            "ON for_delivery (collector_user_id)"
         ))
 
 __all__ = {

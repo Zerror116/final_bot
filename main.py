@@ -5234,6 +5234,10 @@ def deduplicate_for_delivery_entries(session):
             or entry.delivery_cutoff_at < existing.delivery_cutoff_at
         ):
             existing.delivery_cutoff_at = entry.delivery_cutoff_at
+        if entry.collector_user_id and not existing.collector_user_id:
+            existing.collector_user_id = entry.collector_user_id
+            existing.collector_name = entry.collector_name
+            existing.collection_started_at = entry.collection_started_at
         session.delete(entry)
 
 @bot.message_handler(func=lambda message: message.text == "👨‍🦯 Засунуть в доставку")
@@ -6453,6 +6457,78 @@ def get_delivery_entry_cart_items(session, delivery_entry):
     return list(grouped_items.values())
 
 
+def get_delivery_collector_name(session, telegram_user):
+    user_id = getattr(telegram_user, "id", None)
+    if user_id:
+        client = session.query(Clients).filter(Clients.user_id == user_id).first()
+        if client and client.name:
+            return client.name
+
+    first_name = (getattr(telegram_user, "first_name", "") or "").strip()
+    last_name = (getattr(telegram_user, "last_name", "") or "").strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+    if full_name:
+        return full_name
+
+    username = (getattr(telegram_user, "username", "") or "").strip()
+    if username:
+        return f"@{username}"
+
+    return f"ID {user_id}"
+
+
+def claim_delivery_collection_entry(session, delivery_entry, telegram_user):
+    collector_user_id = getattr(telegram_user, "id", None)
+    if not collector_user_id:
+        return False, "неизвестный пользователь"
+
+    if delivery_entry.collector_user_id and int(delivery_entry.collector_user_id) != int(collector_user_id):
+        return False, delivery_entry.collector_name or f"ID {delivery_entry.collector_user_id}"
+
+    collector_name = get_delivery_collector_name(session, telegram_user)
+    delivery_entry.collector_user_id = collector_user_id
+    delivery_entry.collector_name = collector_name
+    delivery_entry.collection_started_at = delivery_entry.collection_started_at or now_local()
+    session.flush()
+    return True, collector_name
+
+
+def release_delivery_collection_entry(session, delivery_entry, telegram_user):
+    collector_user_id = getattr(telegram_user, "id", None)
+    if not collector_user_id or not delivery_entry.collector_user_id:
+        return True, None
+
+    if int(delivery_entry.collector_user_id) != int(collector_user_id):
+        return False, delivery_entry.collector_name or f"ID {delivery_entry.collector_user_id}"
+
+    delivery_entry.collector_user_id = None
+    delivery_entry.collector_name = None
+    delivery_entry.collection_started_at = None
+    session.flush()
+    return True, None
+
+
+def parse_delivery_collection_callback(data, prefix):
+    tail = str(data or "").replace(prefix, "", 1).strip("_")
+    parts = tail.split("_") if tail else []
+    if not parts or not parts[0].isdigit():
+        raise ValueError(f"Bad delivery collection callback: {data}")
+
+    delivery_id = int(parts[0])
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return delivery_id, page
+
+
+def build_delivery_collection_button_text(row):
+    base_text = f"{row.name} | {row.phone} | {row.total_sum} ₽"
+    if not row.collector_name:
+        return base_text[:64]
+
+    suffix = f" 👷 {row.collector_name}"
+    max_base_length = max(0, 64 - len(suffix))
+    return f"{base_text[:max_base_length]}{suffix}"
+
+
 def build_delivery_collection_keyboard(session, page=0):
     deduplicate_for_delivery_entries(session)
     session.flush()
@@ -6465,8 +6541,8 @@ def build_delivery_collection_keyboard(session, page=0):
 
     keyboard = InlineKeyboardMarkup()
     for row in rows:
-        button_text = f"{row.name} | {row.phone} | {row.total_sum} ₽"
-        keyboard.add(InlineKeyboardButton(button_text[:64], callback_data=f"collect_delivery_{row.id}"))
+        button_text = build_delivery_collection_button_text(row)
+        keyboard.add(InlineKeyboardButton(button_text, callback_data=f"collect_delivery_{row.id}_{page}"))
 
     nav_buttons = []
     if page > 0:
@@ -6537,37 +6613,96 @@ def paginate_delivery_collection(call):
     safe_answer_callback_query(call.id)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("collect_delivery_release_"))
+def release_delivery_collection_client(call):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+
+    try:
+        delivery_id, page = parse_delivery_collection_callback(call.data, "collect_delivery_release_")
+    except ValueError:
+        safe_answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
+        return
+
+    with Session(bind=engine) as session:
+        delivery_entry = session.query(ForDelivery).filter(
+            ForDelivery.id == delivery_id,
+        ).with_for_update().first()
+        if delivery_entry:
+            released, collector_name = release_delivery_collection_entry(session, delivery_entry, call.from_user)
+            session.commit()
+        else:
+            released, collector_name = True, None
+
+    show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
+    if released:
+        safe_answer_callback_query(call.id)
+    else:
+        safe_answer_callback_query(
+            call.id,
+            f"Эту корзину сейчас собирает {collector_name}.",
+            show_alert=True,
+        )
+
+
 @bot.callback_query_handler(
     func=lambda call: call.data.startswith("collect_delivery_")
     and not call.data.startswith("collect_delivery_page_")
+    and not call.data.startswith("collect_delivery_release_")
 )
 def show_delivery_collection_client(call):
     if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
         safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
 
-    delivery_id = int(call.data.rsplit("_", 1)[1])
+    try:
+        delivery_id, page = parse_delivery_collection_callback(call.data, "collect_delivery_")
+    except ValueError:
+        safe_answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
+        return
+
     with Session(bind=engine) as session:
-        delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
+        delivery_entry = session.query(ForDelivery).filter(
+            ForDelivery.id == delivery_id,
+        ).with_for_update().first()
         if not delivery_entry:
             safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
             return
 
+        claimed, collector_name = claim_delivery_collection_entry(session, delivery_entry, call.from_user)
+        if not claimed:
+            session.commit()
+            show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
+            safe_answer_callback_query(
+                call.id,
+                f"Эту корзину сейчас собирает {collector_name}.",
+                show_alert=True,
+            )
+            return
+
         items = get_delivery_entry_cart_items(session, delivery_entry)
+        if not items:
+            release_delivery_collection_entry(session, delivery_entry, call.from_user)
+            session.commit()
+            show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
+            bot.send_message(call.message.chat.id, "У клиента нет обработанных товаров в корзине.")
+            safe_answer_callback_query(call.id)
+            return
+
         header = (
             f"🧺 Сборка доставки\n"
             f"Клиент: {delivery_entry.name}\n"
             f"Телефон: {delivery_entry.phone}\n"
             f"Сумма: {delivery_entry.total_sum} ₽\n"
             f"Адрес: {delivery_entry.address or 'адрес не указан'}\n"
+            f"Собирает: {collector_name}\n"
             f"Срез доставки: {format_datetime(get_delivery_cutoff_at(delivery_entry))}"
         )
+        session.commit()
 
+    show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
     bot.send_message(call.message.chat.id, header)
-    if not items:
-        bot.send_message(call.message.chat.id, "У клиента нет обработанных товаров в корзине.")
-        safe_answer_callback_query(call.id)
-        return
 
     for item in items:
         caption = build_item_list_caption(
@@ -6592,16 +6727,26 @@ def show_delivery_collection_client(call):
 
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("✅ Собрано", callback_data=f"delivery_collected_{delivery_id}"))
-    keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data="collect_delivery_page_0"))
+    keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data=f"collect_delivery_release_{delivery_id}_{page}"))
     bot.send_message(call.message.chat.id, "Когда корзина собрана, нажмите «Собрано».", reply_markup=keyboard)
     safe_answer_callback_query(call.id)
 
 
-def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None):
+def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None, collector_user_id=None):
     with Session(bind=engine) as session:
-        delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
+        delivery_entry = session.query(ForDelivery).filter(
+            ForDelivery.id == delivery_id,
+        ).with_for_update().first()
         if not delivery_entry:
             return False, "Клиент уже обработан или удалён из списка.", 0
+
+        if (
+            collector_user_id
+            and delivery_entry.collector_user_id
+            and int(delivery_entry.collector_user_id) != int(collector_user_id)
+        ):
+            collector_name = delivery_entry.collector_name or f"ID {delivery_entry.collector_user_id}"
+            return False, f"Эту корзину сейчас собирает {collector_name}.", 0
 
         related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
         cutoff_at = get_delivery_cutoff_at(delivery_entry)
@@ -6685,15 +6830,29 @@ def mark_delivery_collected(call):
 
     delivery_id = int(call.data.rsplit("_", 1)[1])
     with Session(bind=engine) as session:
-        delivery_entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
+        delivery_entry = session.query(ForDelivery).filter(
+            ForDelivery.id == delivery_id,
+        ).with_for_update().first()
         if not delivery_entry:
             safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
             return
+        if delivery_entry.collector_user_id and int(delivery_entry.collector_user_id) != int(call.from_user.id):
+            collector_name = delivery_entry.collector_name or f"ID {delivery_entry.collector_user_id}"
+            safe_answer_callback_query(
+                call.id,
+                f"Эту корзину сейчас собирает {collector_name}.",
+                show_alert=True,
+            )
+            return
+        if not delivery_entry.collector_user_id:
+            claim_delivery_collection_entry(session, delivery_entry, call.from_user)
+            session.commit()
 
     set_user_state(call.from_user.id, {
         "action": "AWAITING_DELIVERY_COLLECTED_SUM",
         "delivery_id": delivery_id,
         "source_message_id": call.message.message_id,
+        "collector_user_id": call.from_user.id,
     })
     safe_edit_message_text(
         bot,
@@ -6719,6 +6878,7 @@ def handle_delivery_collected_sum(message):
     state = get_user_state(message.chat.id) or {}
     delivery_id = state.get("delivery_id")
     source_message_id = state.get("source_message_id")
+    collector_user_id = state.get("collector_user_id") or message.from_user.id
     clear_user_state(message.chat.id)
 
     if not delivery_id:
@@ -6730,6 +6890,7 @@ def handle_delivery_collected_sum(message):
     success, message_text, moved_count = move_for_delivery_to_in_delivery(
         delivery_id,
         manual_total_sum=manual_total_sum,
+        collector_user_id=collector_user_id,
     )
     bot.send_message(
         message.chat.id,

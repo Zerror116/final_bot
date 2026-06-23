@@ -664,6 +664,44 @@ def test_audit_can_collect_delivery_only():
         raise AssertionError("collect delivery button must be inside audit menu")
 
 
+def test_delivery_collection_claim_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    for_delivery_text = (ROOT / "db" / "for_delivery.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "collector_user_id = mapped_column(BIGINT, nullable=True)",
+        "collector_name = mapped_column(String, nullable=True)",
+        "collection_started_at = mapped_column(DateTime, nullable=True)",
+    ]:
+        if marker not in for_delivery_text:
+            raise AssertionError(f"delivery collection claim model marker missing {marker}")
+
+    for marker in [
+        '"008_for_delivery_collection_claim"',
+        'add_column_if_missing("for_delivery", "collector_user_id"',
+        'add_column_if_missing("for_delivery", "collector_name"',
+        'add_column_if_missing("for_delivery", "collection_started_at"',
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"delivery collection claim migration marker missing {marker}")
+
+    for marker in [
+        "def claim_delivery_collection_entry(",
+        "def release_delivery_collection_entry(",
+        "def build_delivery_collection_button_text(",
+        "👷 {row.collector_name}",
+        'callback_data=f"collect_delivery_{row.id}_{page}"',
+        '@bot.callback_query_handler(func=lambda call: call.data.startswith("collect_delivery_release_"))',
+        'callback_data=f"collect_delivery_release_{delivery_id}_{page}"',
+        "Эту корзину сейчас собирает",
+        '"collector_user_id": call.from_user.id',
+        "collector_user_id=collector_user_id",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"delivery collection claim marker missing {marker}")
+
+
 def test_client_menu_hides_orders_in_delivery():
     keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
     client_menu = keyboard_text.split("def client_main_menu():", 1)[1].split("def worker_main_menu():", 1)[0]
@@ -859,6 +897,7 @@ def main():
     test_delivery_clients_summary_markers()
     test_delivery_collection_pauses_reserved_group_flow()
     test_audit_can_collect_delivery_only()
+    test_delivery_collection_claim_markers()
     test_client_menu_hides_orders_in_delivery()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()
