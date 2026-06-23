@@ -1,7 +1,6 @@
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 
-
 def supreme_leader_main_menu():
     leader_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     create_new_post = KeyboardButton("➕ Новый пост")
@@ -48,14 +47,22 @@ def audit_main_menu():
 
 def admin_main_menu():
     admin_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    create_new_post = KeyboardButton("➕ Новый пост")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
     send_new_posts_to_channel = KeyboardButton("📢 Отправить посты в канал")
     manage_clients = KeyboardButton("⚙️ Клиенты")
     delivery_management = KeyboardButton("🚚 Управление доставкой")
     manage_workres = KeyboardButton("👔 Назначить работника")
-    admin_keyboard.add( my_orders,manage_posts, send_new_posts_to_channel, manage_clients,
-                 delivery_management,manage_workres)
+    admin_keyboard.add(
+        create_new_post,
+        my_orders,
+        manage_posts,
+        send_new_posts_to_channel,
+        manage_clients,
+        delivery_management,
+        manage_workres,
+    )
     return admin_keyboard
 def unknown_main_menu():
     unknown_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
