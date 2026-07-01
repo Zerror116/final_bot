@@ -4490,11 +4490,28 @@ def handle_statistic(message):
     else:
         raise TypeError(f"Unsupported data type for 'all_clients': {type(all_clients)}")
 
-    # Генерация статистики постов
+    revision_post_ids_by_period = {"today": set(), "week": set(), "last_week": set()}
+
+    # Генерация статистики ревизии и списка товаров, которые нужно исключить из созданных постов
     for key, date_range in days_range.items():
+        for revision_log in revision_logs:
+            if not revision_log.created_at:
+                continue
+            revision_date = revision_log.created_at.date()
+            if date_range[0] <= revision_date <= date_range[1]:
+                revision_post_ids_by_period[key].add(revision_log.post_id)
+                auditor_name = clients_dict.get(revision_log.auditor_user_id, "Неизвестный пользователь")
+                if auditor_name not in revision_statistics[key]:
+                    revision_statistics[key][auditor_name] = 0
+                revision_statistics[key][auditor_name] += 1
+                total_revisions[key] += 1
+
         for post in all_posts:
             if not post.created_at:
                 continue
+            if post.id in revision_post_ids_by_period[key]:
+                continue
+
             created_at_date = post.created_at.date()
             created_at_time = post.created_at.time()
 
@@ -4508,17 +4525,6 @@ def handle_statistic(message):
                     post_statistics[key][creator_name] = 0
                 post_statistics[key][creator_name] += 1
                 total_posts[key] += 1
-
-        for revision_log in revision_logs:
-            if not revision_log.created_at:
-                continue
-            revision_date = revision_log.created_at.date()
-            if date_range[0] <= revision_date <= date_range[1]:
-                auditor_name = clients_dict.get(revision_log.auditor_user_id, "Неизвестный пользователь")
-                if auditor_name not in revision_statistics[key]:
-                    revision_statistics[key][auditor_name] = 0
-                revision_statistics[key][auditor_name] += 1
-                total_revisions[key] += 1
 
     # Формирование текста ответа
     response = "📊 Статистика:\n"
@@ -4537,12 +4543,12 @@ def handle_statistic(message):
         if not names_data:
             response += "  - нет данных\n"
         for name, count in sorted(names_data.items()):
-            response += f"  - {name}: {count} постов\n"
+            response += f"  - {name}: {count} товаров\n"
 
-    response += f"\nОбщее количество созданных постов:\n"
-    response += f"  - Сегодня: {total_posts['today']} постов\n"
-    response += f"  - На этой неделе: {total_posts['week']} постов\n"
-    response += f"  - На прошлой неделе: {total_posts['last_week']} постов\n"
+    response += f"\nОбщее количество созданных товаров:\n"
+    response += f"  - Сегодня: {total_posts['today']} товаров\n"
+    response += f"  - На этой неделе: {total_posts['week']} товаров\n"
+    response += f"  - На прошлой неделе: {total_posts['last_week']} товаров\n"
 
     response += "\nСделанная ревизия:\n"
     for period, names_data in revision_statistics.items():

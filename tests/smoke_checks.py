@@ -491,6 +491,28 @@ def test_revision_excludes_linked_posts_and_logs_work():
             raise AssertionError(f"new additive migration marker missing {marker}")
 
 
+def test_statistic_excludes_revision_posts_from_created_posts():
+    text = MAIN.read_text(encoding="utf-8")
+    statistic_block = text.split("@bot.message_handler(commands=['statistic'])", 1)[1].split(
+        "def close_expired_delivery_broadcast_campaigns",
+        1,
+    )[0]
+    for marker in [
+        "revision_post_ids_by_period",
+        "revision_post_ids_by_period[key].add(revision_log.post_id)",
+        "if post.id in revision_post_ids_by_period[key]:",
+        "Общее количество созданных товаров",
+        "{count} товаров",
+    ]:
+        if marker not in statistic_block:
+            raise AssertionError(f"statistic revision exclusion marker missing {marker}")
+
+    post_skip_index = statistic_block.index("if post.id in revision_post_ids_by_period[key]:")
+    post_count_index = statistic_block.index("total_posts[key] += 1")
+    if post_skip_index > post_count_index:
+        raise AssertionError("revision posts must be skipped before incrementing created-post totals")
+
+
 def test_delivery_cleanup_schedule_markers():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
@@ -890,6 +912,7 @@ def main():
     test_post_delete_and_zero_quantity_are_safe()
     test_delivery_move_and_archive_are_loss_safe()
     test_revision_excludes_linked_posts_and_logs_work()
+    test_statistic_excludes_revision_posts_from_created_posts()
     test_delivery_cleanup_schedule_markers()
     test_midnight_posts_are_snapshotted_before_delete()
     test_cart_clear_processed_is_available()
