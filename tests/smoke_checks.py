@@ -797,10 +797,13 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
         "Posts.release_reserved_id(data.get(\"post_id\"), chat_id=chat_id)",
         "Id товара: {created_post_id}",
         "Ваш пост успешно создан!",
-        "def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None):",
+        "def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None, show_quantity=True):",
         "Id товара: {post_id}",
         'post_id=item["post_id"]',
         "author=item.get(\"author\")",
+        "for unit_index in range(quantity):",
+        '"show_quantity": False',
+        'show_quantity=item.get("show_quantity", True)',
     ]:
         if marker not in main_text:
             raise AssertionError(f"post id display marker missing {marker}")

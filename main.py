@@ -3138,16 +3138,17 @@ def format_post_author(post):
     return author_name or f"user_id {post.chat_id}"
 
 
-def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None):
+def build_item_list_caption(description, price, quantity, created_at, post_id=None, author=None, show_quantity=True):
     lines = []
     if post_id is not None:
         lines.append(f"Id товара: {post_id}")
     lines.extend([
         f"Описание: {description}",
         f"Цена: {price} ₽",
-        f"Количество: {quantity}",
-        f"Дата создания: {format_cart_date(created_at)}",
     ])
+    if show_quantity:
+        lines.append(f"Количество: {quantity}")
+    lines.append(f"Дата создания: {format_cart_date(created_at)}")
     if author:
         lines.append(f"Выложил: {author}")
     return "\n".join(lines)
@@ -6431,36 +6432,49 @@ def get_delivery_entry_cart_items(session, delivery_entry):
         ).all()
     }
 
-    grouped_items = {}
+    items = []
     for reservation in reservations:
         post = posts_by_id.get(reservation.post_id)
         client = clients_by_user_id.get(reservation.user_id)
         temp_item = get_temp_fulfilled_for_reservation(session, reservation)
         amount = calculate_delivery_row_amount(reservation, post=post, temp_item=temp_item)
-        unit_price = max((amount // reservation.quantity), 0) if reservation.quantity else 0
+        quantity = max(int(reservation.quantity or 0), 1)
+        base_unit_price = max((amount // quantity), 0)
+        remainder = max(amount - (base_unit_price * quantity), 0)
         description = build_delivery_row_description(reservation, post=post, temp_item=temp_item)
-        item_key = (reservation.post_id, unit_price, description)
-        if item_key not in grouped_items:
-            grouped_items[item_key] = {
+        created_at = get_delivery_row_created_at(reservation, post=post, temp_item=temp_item)
+        author = format_post_author(post)
+        names = set()
+        if client and client.name:
+            names.add(client.name)
+
+        for unit_index in range(quantity):
+            unit_price = base_unit_price + (1 if unit_index < remainder else 0)
+            items.append({
                 "post_id": reservation.post_id,
                 "photo": post.photo if post else None,
                 "description": description,
                 "unit_price": unit_price,
-                "quantity": 0,
-                "total_price": 0,
-                "names": set(),
-                "created_at": get_delivery_row_created_at(reservation, post=post, temp_item=temp_item),
-                "author": format_post_author(post),
-            }
-        item = grouped_items[item_key]
-        item["quantity"] += reservation.quantity
-        item["total_price"] += amount
-        if client and client.name:
-            item["names"].add(client.name)
-        if not item.get("created_at"):
-            item["created_at"] = get_delivery_row_created_at(reservation, post=post, temp_item=temp_item)
+                "quantity": 1,
+                "total_price": unit_price,
+                "names": names,
+                "created_at": created_at,
+                "reserved_at": reservation.created_at,
+                "reservation_id": reservation.id,
+                "unit_index": unit_index,
+                "author": author,
+                "show_quantity": False,
+            })
 
-    return list(grouped_items.values())
+    return sorted(
+        items,
+        key=lambda item: (
+            item.get("created_at") or datetime.min,
+            item.get("reserved_at") or datetime.min,
+            item["reservation_id"],
+            item["unit_index"],
+        ),
+    )
 
 
 def get_delivery_collector_name(session, telegram_user):
@@ -6718,6 +6732,7 @@ def show_delivery_collection_client(call):
             created_at=item.get("created_at"),
             post_id=item["post_id"],
             author=item.get("author"),
+            show_quantity=item.get("show_quantity", True),
         )
         try:
             send_photo_or_text(bot, call.message.chat.id, item["photo"], caption)
