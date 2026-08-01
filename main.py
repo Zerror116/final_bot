@@ -86,7 +86,7 @@ RESERVED_GROUP_FLOW_STATE_KEY = 0
 RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
 RESERVED_GROUP_MESSAGE_SKIPPED = -1
-DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-5305488751"))
+DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-1004453060578"))
 DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "0.3"))
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
@@ -387,6 +387,7 @@ delivery_cleanup_started = False
 delivery_cleanup_stop_event = threading.Event()
 reserved_group_flow_lock = threading.Lock()
 delivery_collection_report_lock = threading.Lock()
+delivery_collection_report_target_group_id = DELIVERY_COLLECTION_REPORT_GROUP_ID
 reservation_stats_report_started = False
 reservation_stats_report_stop_event = threading.Event()
 reservation_stats_live_lock = threading.Lock()
@@ -6592,11 +6593,55 @@ def build_delivery_collection_report_item_caption(item):
     ])
 
 
+def telegram_migrate_to_chat_id(exc):
+    result_json = getattr(exc, "result_json", None) or {}
+    parameters = result_json.get("parameters") or {}
+    migrate_to_chat_id = parameters.get("migrate_to_chat_id")
+    return int(migrate_to_chat_id) if migrate_to_chat_id else None
+
+
+def update_delivery_collection_report_group_id(migrate_to_chat_id):
+    global delivery_collection_report_target_group_id
+    if not migrate_to_chat_id:
+        return False
+
+    old_chat_id = delivery_collection_report_target_group_id
+    delivery_collection_report_target_group_id = int(migrate_to_chat_id)
+    logger.warning(
+        "Delivery collection report group migrated: old_chat_id=%s new_chat_id=%s",
+        old_chat_id,
+        delivery_collection_report_target_group_id,
+    )
+    return True
+
+
+def send_delivery_collection_report_message(text):
+    for attempt in range(2):
+        try:
+            return bot.send_message(delivery_collection_report_target_group_id, text)
+        except Exception as exc:
+            migrate_to_chat_id = telegram_migrate_to_chat_id(exc)
+            if attempt == 0 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+                continue
+            raise
+
+
+def send_delivery_collection_report_photo_or_text(photo, text):
+    for attempt in range(2):
+        try:
+            return send_photo_or_text(bot, delivery_collection_report_target_group_id, photo, text)
+        except Exception as exc:
+            migrate_to_chat_id = telegram_migrate_to_chat_id(exc)
+            if attempt == 0 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+                continue
+            raise
+
+
 def send_delivery_collection_report_item_to_group(item):
     caption = build_delivery_collection_report_item_caption(item)
     for attempt in range(2):
         try:
-            send_photo_or_text(bot, DELIVERY_COLLECTION_REPORT_GROUP_ID, item.get("photo"), caption)
+            send_delivery_collection_report_photo_or_text(item.get("photo"), caption)
             return True
         except Exception as exc:
             if attempt == 0 and sleep_for_short_retry_after(exc, max_retry_after=10):
@@ -6617,7 +6662,7 @@ def send_delivery_collection_report_to_group(context, items):
     with delivery_collection_report_lock:
         header = build_delivery_collection_report_header(context, grouped_items)
         try:
-            bot.send_message(DELIVERY_COLLECTION_REPORT_GROUP_ID, header)
+            send_delivery_collection_report_message(header)
         except Exception as exc:
             logger.warning(
                 "Delivery collection report header send failed for phone=%s: %s",
