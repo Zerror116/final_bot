@@ -724,6 +724,36 @@ def test_delivery_collection_claim_markers():
             raise AssertionError(f"delivery collection claim marker missing {marker}")
 
 
+def test_delivery_collection_report_group_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+
+    for marker in [
+        'DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-5305488751"))',
+        "DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS",
+        "delivery_collection_report_lock = threading.Lock()",
+        "def get_delivery_entry_full_cart_report_items(",
+        "Reservations.user_id.in_(related_user_ids)",
+        "def get_delivery_collection_report_collector_name(session, collector_user_id):",
+        "session.query(Clients).filter(Clients.user_id == collector_user_id).first()",
+        "def group_delivery_collection_report_items(",
+        "def build_delivery_collection_report_header(",
+        "def build_delivery_collection_report_item_caption(",
+        "def send_delivery_collection_report_to_group(",
+        "with delivery_collection_report_lock:",
+        "bot.send_message(DELIVERY_COLLECTION_REPORT_GROUP_ID, header)",
+        "send_photo_or_text(bot, DELIVERY_COLLECTION_REPORT_GROUP_ID",
+        "Номер телефона клиента: {context['phone']",
+        "Кто собирает: {context['collector_name']",
+        "Сумма товара: {item['total_price']} ₽",
+        "Количество: {item['quantity']}",
+        "report_context = build_delivery_collection_report_context(session, delivery_entry)",
+        "report_items = get_delivery_entry_full_cart_report_items(session, delivery_entry)",
+        "send_delivery_collection_report_to_group(report_context, report_items)",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"delivery collection report group marker missing {marker}")
+
+
 def test_client_menu_hides_orders_in_delivery():
     keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
     client_menu = keyboard_text.split("def client_main_menu():", 1)[1].split("def worker_main_menu():", 1)[0]
@@ -924,6 +954,7 @@ def main():
     test_delivery_collection_pauses_reserved_group_flow()
     test_audit_can_collect_delivery_only()
     test_delivery_collection_claim_markers()
+    test_delivery_collection_report_group_markers()
     test_client_menu_hides_orders_in_delivery()
     test_post_id_labels_for_new_posts_and_delivery_collection()
     test_telegram_safe_helpers()

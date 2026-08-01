@@ -86,6 +86,8 @@ RESERVED_GROUP_FLOW_STATE_KEY = 0
 RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
 RESERVED_GROUP_MESSAGE_SKIPPED = -1
+DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-5305488751"))
+DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "0.3"))
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -384,6 +386,7 @@ channel_post_auto_publish_stop_event = threading.Event()
 delivery_cleanup_started = False
 delivery_cleanup_stop_event = threading.Event()
 reserved_group_flow_lock = threading.Lock()
+delivery_collection_report_lock = threading.Lock()
 reservation_stats_report_started = False
 reservation_stats_report_stop_event = threading.Event()
 reservation_stats_live_lock = threading.Lock()
@@ -6477,6 +6480,168 @@ def get_delivery_entry_cart_items(session, delivery_entry):
     )
 
 
+def get_delivery_entry_full_cart_report_items(session, delivery_entry):
+    related_user_ids = get_related_delivery_user_ids(session, delivery_entry)
+    reservations = session.query(Reservations).filter(
+        Reservations.user_id.in_(related_user_ids),
+    ).order_by(
+        Reservations.created_at,
+        Reservations.id,
+    ).all()
+
+    if not reservations:
+        return []
+
+    posts_by_id = get_posts_or_snapshots_by_ids(
+        session,
+        {reservation.post_id for reservation in reservations},
+    )
+
+    items = []
+    for reservation in reservations:
+        post = posts_by_id.get(reservation.post_id)
+        temp_item = get_temp_fulfilled_for_reservation(session, reservation)
+        amount = calculate_delivery_row_amount(reservation, post=post, temp_item=temp_item)
+        items.append({
+            "post_id": reservation.post_id,
+            "photo": post.photo if post else None,
+            "description": build_delivery_row_description(reservation, post=post, temp_item=temp_item),
+            "quantity": max(int(reservation.quantity or 0), 1),
+            "total_price": max(int(amount or 0), 0),
+            "created_at": get_delivery_row_created_at(reservation, post=post, temp_item=temp_item),
+            "reserved_at": reservation.created_at,
+            "reservation_id": reservation.id,
+            "author": format_post_author(post),
+        })
+
+    return items
+
+
+def get_delivery_collection_report_collector_name(session, collector_user_id):
+    if not collector_user_id:
+        return None
+
+    client = session.query(Clients).filter(Clients.user_id == collector_user_id).first()
+    if client and client.name:
+        return client.name
+
+    return None
+
+
+def build_delivery_collection_report_context(session, delivery_entry):
+    return {
+        "name": delivery_entry.name,
+        "phone": delivery_entry.phone,
+        "collector_name": get_delivery_collection_report_collector_name(
+            session,
+            delivery_entry.collector_user_id,
+        ),
+    }
+
+
+def group_delivery_collection_report_items(items):
+    grouped_items = []
+    grouped_by_key = {}
+
+    for item in items:
+        item_key = (
+            item.get("post_id"),
+            item.get("description"),
+            item.get("created_at"),
+            item.get("author"),
+        )
+        if item_key not in grouped_by_key:
+            grouped_item = {
+                "post_id": item.get("post_id"),
+                "photo": item.get("photo"),
+                "description": item.get("description"),
+                "quantity": 0,
+                "total_price": 0,
+                "created_at": item.get("created_at"),
+                "author": item.get("author"),
+            }
+            grouped_by_key[item_key] = grouped_item
+            grouped_items.append(grouped_item)
+
+        grouped_item = grouped_by_key[item_key]
+        grouped_item["quantity"] += max(int(item.get("quantity") or 0), 1)
+        grouped_item["total_price"] += max(int(item.get("total_price") or item.get("unit_price") or 0), 0)
+
+    return grouped_items
+
+
+def build_delivery_collection_report_header(context, grouped_items):
+    total_quantity = sum(item["quantity"] for item in grouped_items)
+    total_sum = sum(item["total_price"] for item in grouped_items)
+    return "\n".join([
+        "🧺 Собирают доставку",
+        f"Номер телефона клиента: {context['phone'] or 'не указан'}",
+        f"Клиент: {context['name'] or 'имя не указано'}",
+        f"Кто собирает: {context['collector_name'] or 'неизвестно'}",
+        f"Товаров в списке: {total_quantity}",
+        f"Сумма товаров: {total_sum} ₽",
+    ])
+
+
+def build_delivery_collection_report_item_caption(item):
+    return "\n".join([
+        f"Id товара: {item['post_id']}",
+        f"Описание товара: {item['description']}",
+        f"Сумма товара: {item['total_price']} ₽",
+        f"Количество: {item['quantity']}",
+    ])
+
+
+def send_delivery_collection_report_item_to_group(item):
+    caption = build_delivery_collection_report_item_caption(item)
+    for attempt in range(2):
+        try:
+            send_photo_or_text(bot, DELIVERY_COLLECTION_REPORT_GROUP_ID, item.get("photo"), caption)
+            return True
+        except Exception as exc:
+            if attempt == 0 and sleep_for_short_retry_after(exc, max_retry_after=10):
+                continue
+            logger.warning(
+                "Delivery collection report item send failed for post_id=%s: %s",
+                item.get("post_id"),
+                exc,
+            )
+            return False
+
+
+def send_delivery_collection_report_to_group(context, items):
+    grouped_items = group_delivery_collection_report_items(items)
+    if not grouped_items:
+        return 0
+
+    with delivery_collection_report_lock:
+        header = build_delivery_collection_report_header(context, grouped_items)
+        try:
+            bot.send_message(DELIVERY_COLLECTION_REPORT_GROUP_ID, header)
+        except Exception as exc:
+            logger.warning(
+                "Delivery collection report header send failed for phone=%s: %s",
+                context.get("phone"),
+                exc,
+            )
+            return 0
+
+        time.sleep(DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+        sent_count = 0
+        for item in grouped_items:
+            if send_delivery_collection_report_item_to_group(item):
+                sent_count += 1
+            time.sleep(DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+
+    logger.info(
+        "Delivery collection report sent: phone=%s collector=%s items=%s",
+        context.get("phone"),
+        context.get("collector_name"),
+        sent_count,
+    )
+    return sent_count
+
+
 def get_delivery_collector_name(session, telegram_user):
     user_id = getattr(telegram_user, "id", None)
     if user_id:
@@ -6719,6 +6884,8 @@ def show_delivery_collection_client(call):
             f"Собирает: {collector_name}\n"
             f"Срез доставки: {format_datetime(get_delivery_cutoff_at(delivery_entry))}"
         )
+        report_context = build_delivery_collection_report_context(session, delivery_entry)
+        report_items = get_delivery_entry_full_cart_report_items(session, delivery_entry)
         session.commit()
 
     show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
@@ -6751,6 +6918,7 @@ def show_delivery_collection_client(call):
     keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data=f"collect_delivery_release_{delivery_id}_{page}"))
     bot.send_message(call.message.chat.id, "Когда корзина собрана, нажмите «Собрано».", reply_markup=keyboard)
     safe_answer_callback_query(call.id)
+    send_delivery_collection_report_to_group(report_context, report_items)
 
 
 def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None, collector_user_id=None):
