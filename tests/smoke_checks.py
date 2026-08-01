@@ -729,7 +729,7 @@ def test_delivery_collection_report_group_markers():
 
     for marker in [
         'DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-1004453060578"))',
-        "DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS",
+        'DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "5"))',
         "delivery_collection_report_lock = threading.Lock()",
         "delivery_collection_report_target_group_id = DELIVERY_COLLECTION_REPORT_GROUP_ID",
         "def get_delivery_entry_full_cart_report_items(",
@@ -745,6 +745,9 @@ def test_delivery_collection_report_group_markers():
         "global delivery_collection_report_target_group_id",
         "def send_delivery_collection_report_message(text):",
         "def send_delivery_collection_report_photo_or_text(photo, text):",
+        "Delivery collection report header rate-limited",
+        "Delivery collection report item rate-limited",
+        "wait_seconds = max(retry_after + 1, DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)",
         "def send_delivery_collection_report_to_group(",
         "with delivery_collection_report_lock:",
         "send_delivery_collection_report_message(header)",

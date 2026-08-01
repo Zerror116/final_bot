@@ -87,7 +87,7 @@ RESERVED_GROUP_RESUME_BATCH_SIZE = 50
 RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
 RESERVED_GROUP_MESSAGE_SKIPPED = -1
 DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-1004453060578"))
-DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "0.3"))
+DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "5"))
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -6616,23 +6616,45 @@ def update_delivery_collection_report_group_id(migrate_to_chat_id):
 
 
 def send_delivery_collection_report_message(text):
-    for attempt in range(2):
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
             return bot.send_message(delivery_collection_report_target_group_id, text)
         except Exception as exc:
             migrate_to_chat_id = telegram_migrate_to_chat_id(exc)
-            if attempt == 0 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+            if attempt == 1 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+                continue
+            retry_after = telegram_retry_after_seconds(exc)
+            if retry_after is not None and attempt < attempts:
+                wait_seconds = max(retry_after + 1, DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+                logger.info(
+                    "Delivery collection report header rate-limited retry_after=%ss wait=%ss",
+                    retry_after,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
                 continue
             raise
 
 
 def send_delivery_collection_report_photo_or_text(photo, text):
-    for attempt in range(2):
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         try:
             return send_photo_or_text(bot, delivery_collection_report_target_group_id, photo, text)
         except Exception as exc:
             migrate_to_chat_id = telegram_migrate_to_chat_id(exc)
-            if attempt == 0 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+            if attempt == 1 and update_delivery_collection_report_group_id(migrate_to_chat_id):
+                continue
+            retry_after = telegram_retry_after_seconds(exc)
+            if retry_after is not None and attempt < attempts:
+                wait_seconds = max(retry_after + 1, DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+                logger.info(
+                    "Delivery collection report item rate-limited retry_after=%ss wait=%ss",
+                    retry_after,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
                 continue
             raise
 
