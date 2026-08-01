@@ -32,7 +32,7 @@ from handlers.reservations_manage import *
 from types import SimpleNamespace
 from handlers.reservations_manage import calculate_total_sum, calculate_processed_sum
 from handlers.classess import *
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from datetime import datetime, timedelta, time as datetime_time
 from db.bot_session import BotSession
@@ -88,6 +88,7 @@ RESERVED_GROUP_SEND_INTERVAL_SECONDS = 5
 RESERVED_GROUP_MESSAGE_SKIPPED = -1
 DELIVERY_COLLECTION_REPORT_GROUP_ID = int(os.environ.get("DELIVERY_COLLECTION_REPORT_GROUP_ID", "-1004453060578"))
 DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS", "5"))
+DELIVERY_COLLECTION_REPORT_LOCK_KEY = int(os.environ.get("DELIVERY_COLLECTION_REPORT_LOCK_KEY", "4453060578"))
 PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"
 PHOENIX_BROADCAST_DELAY_SECONDS = float(os.environ.get("PHOENIX_BROADCAST_DELAY_SECONDS", "1.5"))
 PHOENIX_BROADCAST_BATCH_SIZE = int(os.environ.get("PHOENIX_BROADCAST_BATCH_SIZE", "50"))
@@ -6575,7 +6576,7 @@ def build_delivery_collection_report_header(context, grouped_items):
     total_quantity = sum(item["quantity"] for item in grouped_items)
     total_sum = sum(item["total_price"] for item in grouped_items)
     return "\n".join([
-        "🧺 Собирают доставку",
+        "🧺 Начало сборки доставки",
         f"Номер телефона клиента: {context['phone'] or 'не указан'}",
         f"Клиент: {context['name'] or 'имя не указано'}",
         f"Кто собирает: {context['collector_name'] or 'неизвестно'}",
@@ -6584,12 +6585,27 @@ def build_delivery_collection_report_header(context, grouped_items):
     ])
 
 
-def build_delivery_collection_report_item_caption(item):
+def build_delivery_collection_report_item_caption(context, item):
     return "\n".join([
         f"Id товара: {item['post_id']}",
+        f"Номер телефона клиента: {context['phone'] or 'не указан'}",
+        f"Кто собирает: {context['collector_name'] or 'неизвестно'}",
         f"Описание товара: {item['description']}",
         f"Сумма товара: {item['total_price']} ₽",
         f"Количество: {item['quantity']}",
+    ])
+
+
+def build_delivery_collection_report_footer(context, grouped_items):
+    total_quantity = sum(item["quantity"] for item in grouped_items)
+    total_sum = sum(item["total_price"] for item in grouped_items)
+    return "\n".join([
+        "✅ Конец корзины",
+        f"Номер телефона клиента: {context['phone'] or 'не указан'}",
+        f"Клиент: {context['name'] or 'имя не указано'}",
+        f"Кто собирает: {context['collector_name'] or 'неизвестно'}",
+        f"Товаров в списке: {total_quantity}",
+        f"Сумма товаров: {total_sum} ₽",
     ])
 
 
@@ -6659,8 +6675,33 @@ def send_delivery_collection_report_photo_or_text(photo, text):
             raise
 
 
-def send_delivery_collection_report_item_to_group(item):
-    caption = build_delivery_collection_report_item_caption(item)
+def acquire_delivery_collection_report_db_lock():
+    if engine.dialect.name != "postgresql":
+        return None
+
+    connection = engine.connect()
+    connection.execute(
+        text("SELECT pg_advisory_lock(:lock_key)"),
+        {"lock_key": DELIVERY_COLLECTION_REPORT_LOCK_KEY},
+    )
+    return connection
+
+
+def release_delivery_collection_report_db_lock(connection):
+    if connection is None:
+        return
+
+    try:
+        connection.execute(
+            text("SELECT pg_advisory_unlock(:lock_key)"),
+            {"lock_key": DELIVERY_COLLECTION_REPORT_LOCK_KEY},
+        )
+    finally:
+        connection.close()
+
+
+def send_delivery_collection_report_item_to_group(context, item):
+    caption = build_delivery_collection_report_item_caption(context, item)
     for attempt in range(2):
         try:
             send_delivery_collection_report_photo_or_text(item.get("photo"), caption)
@@ -6682,23 +6723,38 @@ def send_delivery_collection_report_to_group(context, items):
         return 0
 
     with delivery_collection_report_lock:
-        header = build_delivery_collection_report_header(context, grouped_items)
+        db_lock_connection = acquire_delivery_collection_report_db_lock()
         try:
-            send_delivery_collection_report_message(header)
-        except Exception as exc:
-            logger.warning(
-                "Delivery collection report header send failed for phone=%s: %s",
-                context.get("phone"),
-                exc,
-            )
-            return 0
+            header = build_delivery_collection_report_header(context, grouped_items)
+            try:
+                send_delivery_collection_report_message(header)
+            except Exception as exc:
+                logger.warning(
+                    "Delivery collection report header send failed for phone=%s: %s",
+                    context.get("phone"),
+                    exc,
+                )
+                return 0
 
-        time.sleep(DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
-        sent_count = 0
-        for item in grouped_items:
-            if send_delivery_collection_report_item_to_group(item):
-                sent_count += 1
             time.sleep(DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+            sent_count = 0
+            for item in grouped_items:
+                if send_delivery_collection_report_item_to_group(context, item):
+                    sent_count += 1
+                time.sleep(DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
+
+            try:
+                send_delivery_collection_report_message(
+                    build_delivery_collection_report_footer(context, grouped_items)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Delivery collection report footer send failed for phone=%s: %s",
+                    context.get("phone"),
+                    exc,
+                )
+        finally:
+            release_delivery_collection_report_db_lock(db_lock_connection)
 
     logger.info(
         "Delivery collection report sent: phone=%s collector=%s items=%s",
