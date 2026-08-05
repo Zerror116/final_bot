@@ -205,12 +205,19 @@ def test_phoenix_broadcast_markers():
     main_text = MAIN.read_text(encoding="utf-8")
     keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
     qr_path = ROOT / "images" / "phoenix_qr.jpg"
+    channel_footer_path = ROOT / "images" / "phoenix_channel_footer.jpg"
 
     if not qr_path.exists():
         raise AssertionError("Phoenix QR image is missing")
+    if not channel_footer_path.exists():
+        raise AssertionError("Phoenix channel footer image is missing")
 
     for marker in [
         'PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"',
+        "PHOENIX_CHANNEL_FOOTER_IMAGE_PATH",
+        "PHOENIX_CHANNEL_FOOTER_TEXT",
+        "Возвращение Феникса, большое обновление ВК",
+        "https://vk.ru/club239413025",
         "def require_creator",
         "def get_phoenix_broadcast_recipients",
         "def run_phoenix_broadcast",
@@ -354,6 +361,9 @@ def test_channel_post_auto_publish_markers():
         "def start_channel_post_auto_publish_worker():",
         "start_channel_post_auto_publish_worker()",
         "def send_phoenix_channel_footer():",
+        "PHOENIX_CHANNEL_FOOTER_IMAGE_PATH",
+        "PHOENIX_CHANNEL_FOOTER_TEXT",
+        "send_photo_or_text(",
         'if source == "auto" and sent_count and not failed_post_ids:',
         "send_phoenix_channel_footer()",
         "Phoenix footer sent to channel after post publish",
