@@ -16,6 +16,9 @@ class ForDelivery(AbstractModel):
     address = mapped_column(String, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
     delivery_cutoff_at = mapped_column(DateTime, nullable=True)
+    collector_user_id = mapped_column(BIGINT, nullable=True)
+    collector_name = mapped_column(String, nullable=True)
+    collection_started_at = mapped_column(DateTime, nullable=True)
 
     @staticmethod
     def insert(user_id, name, phone, address, total_sum, delivery_cutoff_at=None):

@@ -1,7 +1,5 @@
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
-from main import create_new_post
-
 
 def supreme_leader_main_menu():
     leader_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -15,16 +13,18 @@ def supreme_leader_main_menu():
     manage_workers = KeyboardButton("👔 Назначить работника")
     audit_manage = KeyboardButton(" Ревизия")
     i_have_a_defect = KeyboardButton("😞 У меня брак")
+    phoenix_broadcast = KeyboardButton("Рассылка о Фениксе")
+    reservation_stats = KeyboardButton("БроньСтатистик")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
-                        delivery_management,orders_in_delivery,manage_workers,audit_manage,i_have_a_defect)
+                        delivery_management, orders_in_delivery, manage_workers, audit_manage, i_have_a_defect,
+                        phoenix_broadcast, reservation_stats)
     return leader_keyboard
 
 def client_main_menu():
     client_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     my_orders = KeyboardButton("🛒 Мои заказы")
-    orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     i_have_a_defect = KeyboardButton("😞 У меня брак")
-    client_keyboard.add(my_orders, orders_in_delivery, i_have_a_defect)
+    client_keyboard.add(my_orders, i_have_a_defect)
     return client_keyboard
 
 def worker_main_menu():
@@ -40,8 +40,9 @@ def audit_main_menu():
     create_new_post = KeyboardButton("➕ Новый пост")
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
+    collect_delivery = KeyboardButton("🧺 Собрать доставку")
     audit_manage = KeyboardButton(" Ревизия")
-    audit_keydoard.add(create_new_post, my_orders, manage_posts, audit_manage)
+    audit_keydoard.add(create_new_post, my_orders, manage_posts, collect_delivery, audit_manage)
     return audit_keydoard
 
 def admin_main_menu():
@@ -53,12 +54,18 @@ def admin_main_menu():
     manage_clients = KeyboardButton("⚙️ Клиенты")
     delivery_management = KeyboardButton("🚚 Управление доставкой")
     manage_workres = KeyboardButton("👔 Назначить работника")
-    admin_keyboard.add(create_new_post, my_orders,manage_posts, send_new_posts_to_channel, manage_clients,
-                 delivery_management,manage_workres)
+    admin_keyboard.add(
+        create_new_post,
+        my_orders,
+        manage_posts,
+        send_new_posts_to_channel,
+        manage_clients,
+        delivery_management,
+        manage_workres,
+    )
     return admin_keyboard
 def unknown_main_menu():
     unknown_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     registration_button = KeyboardButton("Регистрация")
     unknown_keyboard.add(registration_button)
     return unknown_keyboard
-

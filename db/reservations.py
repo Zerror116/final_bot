@@ -6,13 +6,17 @@ from sqlalchemy import (
     Integer,
 )
 from sqlalchemy.orm import mapped_column, Session
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from . import Posts
 from .db import AbstractModel, engine
 
-def utcnow_naive():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def local_now_naive():
+    return datetime.now(SAMARA_TZ).replace(tzinfo=None)
 
 
 class Reservations(AbstractModel):
@@ -32,8 +36,9 @@ class Reservations(AbstractModel):
     is_fulfilled = mapped_column(Boolean, nullable=False)
     return_order = mapped_column(Integer, default=0)
     old_price = mapped_column(Integer, nullable=False)
-    created_at = mapped_column(DateTime, nullable=True, default=utcnow_naive)
+    created_at = mapped_column(DateTime, nullable=True, default=local_now_naive)
     fulfilled_at = mapped_column(DateTime, nullable=True)
+    reserved_group_message_id = mapped_column(BIGINT, nullable=True)
 
     @staticmethod
     def insert(

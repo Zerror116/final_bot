@@ -79,6 +79,37 @@ class BotSession(AbstractModel):
             session.commit()
 
     @staticmethod
+    def update_bucket_dict(user_id, bucket_name, updates=None, delete_keys=None):
+        column = BotSession.BUCKET_COLUMNS[bucket_name]
+        updates = dict(updates or {})
+        delete_keys = list(delete_keys or [])
+
+        with Session(bind=engine) as session:
+            row = (
+                session.query(BotSession)
+                .filter(BotSession.user_id == int(user_id))
+                .with_for_update()
+                .first()
+            )
+            if row:
+                current = BotSession.decode(getattr(row, column)) or {}
+            else:
+                row = BotSession(user_id=int(user_id))
+                session.add(row)
+                current = {}
+
+            if not isinstance(current, dict):
+                current = {}
+
+            for key in delete_keys:
+                current.pop(key, None)
+            current.update(updates)
+
+            setattr(row, column, BotSession.encode(current))
+            session.commit()
+            return current
+
+    @staticmethod
     def clear_bucket(user_id, bucket_name):
         column = BotSession.BUCKET_COLUMNS[bucket_name]
         with Session(bind=engine) as session:

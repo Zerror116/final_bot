@@ -4,11 +4,19 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
-    func,
 )
 from sqlalchemy.orm import mapped_column, Session
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from .db import AbstractModel, engine
+
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def local_now_naive():
+    return datetime.now(SAMARA_TZ).replace(tzinfo=None)
+
 
 class TempReservations(AbstractModel):
     __tablename__ = "temp_reservations"
@@ -22,7 +30,7 @@ class TempReservations(AbstractModel):
     quantity = mapped_column(Integer, nullable=False)
     post_id = mapped_column(Integer, nullable=False)
     temp_fulfilled = mapped_column(Boolean, nullable=False)
-    created_at = mapped_column(DateTime, nullable=False, default=func.now())
+    created_at = mapped_column(DateTime, nullable=False, default=local_now_naive)
 
     @staticmethod
     def insert(user_id: int, quantity: int, post_id: int, temp_fulfilled: bool):
@@ -35,5 +43,4 @@ class TempReservations(AbstractModel):
             )
             session.add(reservations)
             session.commit()
-
 
