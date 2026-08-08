@@ -121,6 +121,8 @@ def test_reserved_group_flow_markers():
         "def update_reserved_group_message_by_id",
         "Статус: {status}",
         "Обработано:",
+        "def truncate_telegram_caption(caption, limit=1024):",
+        "caption=truncate_telegram_caption(caption)",
     ]
     for marker in required:
         if marker not in text:
@@ -871,6 +873,83 @@ def test_post_id_labels_for_new_posts_and_delivery_collection():
             raise AssertionError(f"post id display marker missing {marker}")
 
 
+def test_post_creation_state_updates_are_atomic():
+    main_text = MAIN.read_text(encoding="utf-8")
+    session_store_text = (ROOT / "services" / "session_store.py").read_text(encoding="utf-8")
+    bot_session_text = (ROOT / "db" / "bot_session.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "def update_bucket_dict(user_id, bucket_name, updates=None, delete_keys=None):",
+        ".with_for_update()",
+        "def update_dict(self, key, updates=None, delete_keys=None):",
+        "latest = self._parent.update_dict(self._key, {key: value})",
+    ]:
+        if marker not in session_store_text + bot_session_text:
+            raise AssertionError(f"atomic session update marker missing {marker}")
+
+    for marker in [
+        "def get_temp_post_payload(user_id):",
+        "def get_temp_post_id_or_reset(user_id):",
+        "temp_post_data.update_dict(message.chat.id, {\"photo\": message.photo[-1].file_id})",
+        "temp_post_data.update_dict(chat_id, {\"price\": message.text})",
+        "temp_post_data.update_dict(chat_id, {\"description\": description})",
+        "data = dict(temp_post_data.update_dict(chat_id, {\"quantity\": quantity}))",
+        "Сначала отправьте фото товара.",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"post creation state marker missing {marker}")
+
+    forbidden = [
+        'temp_post_data[message.chat.id]["photo"]',
+        'temp_post_data[chat_id]["price"]',
+        'temp_post_data[chat_id]["description"]',
+        'temp_post_data[chat_id]["quantity"]',
+        'temp_post_data[user_id]["post_id"]',
+    ]
+    for marker in forbidden:
+        if marker in main_text:
+            raise AssertionError(f"post flow must not use non-atomic temp_post_data access: {marker}")
+
+
+def test_telegram_startup_preflight_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "TELEGRAM_STARTUP_RETRY_SECONDS",
+        "TELEGRAM_STARTUP_MAX_RETRY_SECONDS",
+        "def wait_for_telegram_api():",
+        "username = bot.user.username",
+        "Telegram API is unavailable before polling",
+        "wait_for_telegram_api()",
+        "bot.infinity_polling(timeout=30, long_polling_timeout=30)",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"telegram startup preflight marker missing {marker}")
+
+
+def test_state_membership_checks_are_safe_for_dict_states():
+    main_text = MAIN.read_text(encoding="utf-8")
+    if "def user_state_in(chat_id, expected_states):" not in main_text:
+        raise AssertionError("safe user state membership helper missing")
+    if "return isinstance(state, str) and state in expected_states" not in main_text:
+        raise AssertionError("safe user state membership helper must ignore dict states")
+    if "get_user_state(message.chat.id) in {" in main_text:
+        raise AssertionError("message handlers must not compare possibly-dict state with set membership directly")
+
+
+def test_auto_fulfill_avoids_lock_contention_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    for marker in [
+        "reservation_auto_fulfill_lock = threading.Lock()",
+        "if not reservation_auto_fulfill_lock.acquire(blocking=False):",
+        "Auto-fulfill skipped: another auto-fulfill run is active",
+        ").with_for_update(skip_locked=True).all()",
+        "reservation_auto_fulfill_lock.release()",
+        "with session.no_autoflush:",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"auto-fulfill lock contention marker missing {marker}")
+
+
 class RaisingBot:
     def __init__(self, exc):
         self.exc = exc
@@ -989,6 +1068,10 @@ def main():
     test_delivery_collection_report_group_markers()
     test_client_menu_hides_orders_in_delivery()
     test_post_id_labels_for_new_posts_and_delivery_collection()
+    test_post_creation_state_updates_are_atomic()
+    test_telegram_startup_preflight_markers()
+    test_state_membership_checks_are_safe_for_dict_states()
+    test_auto_fulfill_avoids_lock_contention_markers()
     test_telegram_safe_helpers()
     test_silent_blacklist_markers()
     print("smoke checks ok")

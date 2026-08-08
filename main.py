@@ -48,6 +48,7 @@ from services.telegram_safe import (
 
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ADMIN_ROLES = {"admin", "supreme_leader"}
+POST_EDITOR_ROLES = {"worker", "admin", "supreme_leader", "audit"}
 DELIVERY_ROLES = {"admin", "supreme_leader"}
 DELIVERY_COLLECTION_ROLES = DELIVERY_ROLES | {"audit"}
 DELIVERY_THRESHOLD = 1500
@@ -70,6 +71,8 @@ AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
 AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 CHANNEL_POST_SEND_ATTEMPTS = 3
 CHANNEL_POST_SEND_RETRY_SECONDS = 5
+TELEGRAM_STARTUP_RETRY_SECONDS = float(os.environ.get("TELEGRAM_STARTUP_RETRY_SECONDS", "5"))
+TELEGRAM_STARTUP_MAX_RETRY_SECONDS = float(os.environ.get("TELEGRAM_STARTUP_MAX_RETRY_SECONDS", "60"))
 DELIVERY_CLEANUP_WEEKDAYS = {0, 2, 4}
 DELIVERY_CLEANUP_HOUR = 22
 DELIVERY_CLEANUP_CHECK_SECONDS = 60
@@ -412,6 +415,7 @@ configure_locale()
 active_audit = {}
 reservation_auto_fulfill_started = False
 reservation_auto_fulfill_stop_event = threading.Event()
+reservation_auto_fulfill_lock = threading.Lock()
 phoenix_broadcast_lock = threading.Lock()
 channel_post_publish_lock = threading.Lock()
 channel_post_auto_publish_started = False
@@ -576,10 +580,11 @@ def add_reservation_stat_event(session, event_type, reservation, event_time=None
     if not reservation or not getattr(reservation, "id", None):
         return False
 
-    exists = session.query(ReservationStatEvent.id).filter(
-        ReservationStatEvent.event_type == event_type,
-        ReservationStatEvent.reservation_id == reservation.id,
-    ).first()
+    with session.no_autoflush:
+        exists = session.query(ReservationStatEvent.id).filter(
+            ReservationStatEvent.event_type == event_type,
+            ReservationStatEvent.reservation_id == reservation.id,
+        ).first()
     if exists:
         return False
 
@@ -832,7 +837,7 @@ def list_unsent_posts(message):
     role = get_client_role(user_id)
 
     # Проверяем роль пользователя
-    if role not in ["admin", "worker", "supreme_leader", "audit"]:
+    if role not in POST_EDITOR_ROLES:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -1687,16 +1692,27 @@ def start_reserved_group_resume_flush_if_delivery_done(admin_chat_id=None, recov
     return True
 
 
+def truncate_telegram_caption(caption, limit=1024):
+    caption = str(caption or "")
+    if len(caption) <= limit:
+        return caption
+
+    separator = "\n...\n"
+    tail_length = min(360, max(0, limit - len(separator)))
+    head_length = max(0, limit - len(separator) - tail_length)
+    return f"{caption[:head_length].rstrip()}{separator}{caption[-tail_length:].lstrip()}"
+
+
 def edit_reserved_group_message(message_id, post, caption):
     if not message_id:
         return False
 
     try:
-        if post and post.photo and len(caption) <= 1024:
+        if post and post.photo:
             bot.edit_message_caption(
                 chat_id=TARGET_GROUP_ID,
                 message_id=message_id,
-                caption=caption,
+                caption=truncate_telegram_caption(caption),
                 reply_markup=None,
             )
         else:
@@ -1862,36 +1878,43 @@ def ensure_temp_fulfilled_for_reservation(session, reservation):
 
 
 def auto_fulfill_expired_reservations(now=None, older_than_seconds=RESERVATION_AUTO_FULFILL_SECONDS):
+    if not reservation_auto_fulfill_lock.acquire(blocking=False):
+        logger.debug("Auto-fulfill skipped: another auto-fulfill run is active")
+        return 0
+
     now = now or now_local()
     deadline = now - timedelta(seconds=older_than_seconds)
 
-    with Session(bind=engine) as session:
-        expired_reservations = session.query(Reservations).filter(
-            Reservations.is_fulfilled == False,
-            or_(
-                Reservations.reserved_group_message_id == None,
-                Reservations.reserved_group_message_id != RESERVED_GROUP_MESSAGE_SKIPPED,
-            ),
-            or_(
-                Reservations.created_at == None,
-                Reservations.created_at <= deadline,
-            ),
-        ).all()
+    try:
+        with Session(bind=engine) as session:
+            expired_reservations = session.query(Reservations).filter(
+                Reservations.is_fulfilled == False,
+                or_(
+                    Reservations.reserved_group_message_id == None,
+                    Reservations.reserved_group_message_id != RESERVED_GROUP_MESSAGE_SKIPPED,
+                ),
+                or_(
+                    Reservations.created_at == None,
+                    Reservations.created_at <= deadline,
+                ),
+            ).with_for_update(skip_locked=True).all()
 
-        fulfilled_count = 0
-        fulfilled_ids = []
-        for reservation in expired_reservations:
-            if ensure_temp_fulfilled_for_reservation(session, reservation):
-                fulfilled_count += 1
-                fulfilled_ids.append(reservation.id)
+            fulfilled_count = 0
+            fulfilled_ids = []
+            for reservation in expired_reservations:
+                if ensure_temp_fulfilled_for_reservation(session, reservation):
+                    fulfilled_count += 1
+                    fulfilled_ids.append(reservation.id)
 
-        if fulfilled_count:
-            session.commit()
+            if fulfilled_count:
+                session.commit()
 
-        for reservation_id in fulfilled_ids:
-            update_reserved_group_message_by_id(reservation_id)
+            for reservation_id in fulfilled_ids:
+                update_reserved_group_message_by_id(reservation_id)
 
-        return fulfilled_count
+            return fulfilled_count
+    finally:
+        reservation_auto_fulfill_lock.release()
 
 
 def reservation_auto_fulfill_loop():
@@ -2841,6 +2864,11 @@ def get_user_state(chat_id):
     return state
 
 
+def user_state_in(chat_id, expected_states):
+    state = get_user_state(chat_id)
+    return isinstance(state, str) and state in expected_states
+
+
 def clear_user_state(user_id):
     user_states[user_id] = None
     BotSession.clear_state(user_id)
@@ -3362,32 +3390,35 @@ def cleanup_or_refresh_for_delivery_by_phone(session, phone):
     if not normalized_phone:
         return stats
 
-    related_clients = session.query(Clients).filter(
-        Clients.phone.in_(phone_variants(normalized_phone))
-    ).all()
+    with session.no_autoflush:
+        related_clients = session.query(Clients).filter(
+            Clients.phone.in_(phone_variants(normalized_phone))
+        ).all()
     related_user_ids = [client.user_id for client in related_clients]
     if not related_user_ids:
         return stats
 
-    processed_sum = session.query(
-        func.sum(
-            (func.coalesce(Reservations.old_price, 0) * Reservations.quantity)
-            - func.coalesce(Reservations.return_order, 0)
-        )
-    ).select_from(
-        Reservations
-    ).filter(
-        Reservations.user_id.in_(related_user_ids),
-        Reservations.is_fulfilled == True,
-    ).scalar()
+    with session.no_autoflush:
+        processed_sum = session.query(
+            func.sum(
+                (func.coalesce(Reservations.old_price, 0) * Reservations.quantity)
+                - func.coalesce(Reservations.return_order, 0)
+            )
+        ).select_from(
+            Reservations
+        ).filter(
+            Reservations.user_id.in_(related_user_ids),
+            Reservations.is_fulfilled == True,
+        ).scalar()
     processed_sum = int(processed_sum or 0)
 
-    delivery_entries = session.query(ForDelivery).filter(
-        or_(
-            ForDelivery.phone.in_(phone_variants(normalized_phone)),
-            ForDelivery.user_id.in_(related_user_ids),
-        )
-    ).all()
+    with session.no_autoflush:
+        delivery_entries = session.query(ForDelivery).filter(
+            or_(
+                ForDelivery.phone.in_(phone_variants(normalized_phone)),
+                ForDelivery.user_id.in_(related_user_ids),
+            )
+        ).all()
 
     if processed_sum < DELIVERY_THRESHOLD:
         for delivery_entry in delivery_entries:
@@ -3854,13 +3885,30 @@ def is_audit(user_id):
     role = get_client_role(user_id)
     return role and "audit" in role
 
+def get_temp_post_payload(user_id):
+    payload = temp_post_data.get(user_id, {})
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def get_temp_post_id_or_reset(user_id):
+    payload = get_temp_post_payload(user_id)
+    post_id = payload.get("post_id")
+    if post_id:
+        return post_id
+
+    clear_user_state(user_id)
+    temp_post_data.pop(user_id, None)
+    bot.send_message(user_id, "Данные поста потерялись. Нажмите «Новый пост» и начните заново.")
+    return None
+
+
 # Новый пост
 @bot.message_handler(func=lambda message: message.text == "➕ Новый пост")
 def create_new_post(message):
     user_id = message.chat.id
     role = get_client_role(user_id)
 
-    if role not in ["worker", "admin", "supreme_leader", "audit"]:
+    if role not in POST_EDITOR_ROLES:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -3871,13 +3919,23 @@ def create_new_post(message):
         bot.send_message(user_id, "Не удалось зарезервировать ID товара. Попробуйте ещё раз.")
         return
 
-    bot.send_message(
-        message.chat.id,
-        f"Id товара: {reserved_post_id}\n"
-        "Отправьте фото",
-    )
-    temp_post_data[message.chat.id] = {"post_id": reserved_post_id}
-    set_user_state(message.chat.id, CreatingPost.CREATING_POST)
+    try:
+        temp_post_data[message.chat.id] = {"post_id": reserved_post_id}
+        set_user_state(message.chat.id, CreatingPost.CREATING_POST)
+        bot.send_message(
+            message.chat.id,
+            f"Id товара: {reserved_post_id}\n"
+            "Отправьте фото",
+        )
+    except Exception as exc:
+        Posts.release_reserved_id(reserved_post_id, chat_id=user_id)
+        temp_post_data.pop(message.chat.id, None)
+        clear_user_state(message.chat.id)
+        logger.exception("Post creation state init failed for user_id=%s: %s", user_id, exc)
+        try:
+            bot.send_message(user_id, "Не удалось начать создание поста. Попробуйте ещё раз.")
+        except Exception:
+            pass
 
 # Фото
 @bot.message_handler(content_types=["photo"])
@@ -3885,13 +3943,20 @@ def handle_photo(message):
     user_id = message.chat.id
     role = get_client_role(user_id)
     state = get_user_state(message.chat.id)
-    if role not in ["worker", "admin","supreme_leader", "audit"]:
+    if role not in POST_EDITOR_ROLES:
         bot.send_message(
             user_id, "Если у вас возникли вопросы, задайте их в чате поддержки"
         )
         return
     if state == CreatingPost.CREATING_POST:
-        temp_post_data[message.chat.id]["photo"] = message.photo[-1].file_id
+        payload = get_temp_post_payload(message.chat.id)
+        if not payload.get("post_id"):
+            clear_user_state(message.chat.id)
+            temp_post_data.pop(message.chat.id, None)
+            bot.send_message(message.chat.id, "Сессия создания поста потерялась. Нажмите «Новый пост» и отправьте фото заново.")
+            return
+
+        temp_post_data.update_dict(message.chat.id, {"photo": message.photo[-1].file_id})
         bot.send_message(message.chat.id, "Теперь введите цену на товар.")
     else:
         bot.send_message(message.chat.id, "Неправильная последовательность действий")
@@ -3900,26 +3965,31 @@ def handle_photo(message):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.CREATING_POST)
 def handle_post_details(message):
     chat_id = message.chat.id
-    if "photo" in temp_post_data[chat_id] and "price" not in temp_post_data[chat_id]:
+    data = get_temp_post_payload(chat_id)
+    if not data.get("post_id"):
+        clear_user_state(chat_id)
+        temp_post_data.pop(chat_id, None)
+        bot.send_message(chat_id, "Сессия создания поста потерялась. Нажмите «Новый пост» и начните заново.")
+        return
+
+    if "photo" not in data:
+        bot.send_message(chat_id, "Сначала отправьте фото товара.")
+        return
+
+    if "price" not in data:
         if not message.text.isdigit():
             bot.send_message(
                 chat_id, "Ошибка: Цена должна быть числом. Попробуйте снова."
             )
             return
-        temp_post_data[chat_id]["price"] = message.text
+        temp_post_data.update_dict(chat_id, {"price": message.text})
         bot.send_message(chat_id, "Введите описание товара.")
-    elif (
-            "price" in temp_post_data[chat_id]
-            and "description" not in temp_post_data[chat_id]
-    ):
+    elif "description" not in data:
         # Поле "description" сохраняем без проверки, но заменяем "*" на "x"
         description = message.text.replace("*", "x")
-        temp_post_data[chat_id]["description"] = description
+        temp_post_data.update_dict(chat_id, {"description": description})
         bot.send_message(chat_id, "Введите количество товара.")
-    elif (
-            "description" in temp_post_data[chat_id]
-            and "quantity" not in temp_post_data[chat_id]
-    ):
+    elif "quantity" not in data:
         if not message.text.isdigit():
             bot.send_message(
                 chat_id, "Ошибка: Количество должно быть числом. Попробуйте снова."
@@ -3929,10 +3999,9 @@ def handle_post_details(message):
         if quantity <= 0:
             bot.send_message(chat_id, "Ошибка: Количество должно быть больше нуля. Попробуйте снова.")
             return
-        temp_post_data[chat_id]["quantity"] = quantity
+        data = dict(temp_post_data.update_dict(chat_id, {"quantity": quantity}))
 
         # Сохраняем пост
-        data = temp_post_data[chat_id]
         try:
             created_post_id = save_post(
                 chat_id,
@@ -3975,7 +4044,7 @@ def manage_posts(message):
     role = get_client_role(user_id)
 
     # Проверяем, имеет ли пользователь соответствующую роль
-    if role not in ["admin", "worker", "supreme_leader", "audit"]:
+    if role not in POST_EDITOR_ROLES:
         bot.send_message(user_id, "У вас нет прав доступа к этой функции.")
         return
 
@@ -4065,7 +4134,7 @@ def edit_post(call):
 
     # Проверяем права на редактирование
     role = get_client_role(user_id)
-    if role not in ["admin", "worker", "supreme_leader", "audit"]:
+    if role not in POST_EDITOR_ROLES:
         safe_answer_callback_query(
             callback_query_id=call.id,
             text="У вас нет прав доступа к этой функции.",
@@ -4144,7 +4213,9 @@ def handle_edit_quantity(call):
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_PRICE)
 def edit_post_price(message):
     user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]  # Получаем ID поста
+    post_id = get_temp_post_id_or_reset(user_id)
+    if not post_id:
+        return
 
     # Проверка, что введено число
     if not message.text.isdigit():
@@ -4152,10 +4223,13 @@ def edit_post_price(message):
         return
 
     new_price = int(message.text)
-    temp_post_data[user_id]["price"] = new_price
+    temp_post_data.update_dict(user_id, {"price": new_price})
 
     try:
         post = Posts.get_row_by_id(post_id)  # Получаем старые данные поста
+        if not post:
+            bot.send_message(user_id, "Пост не найден.")
+            return
         success, msg = Posts.update_row(
             post_id=post_id,
             price=new_price,
@@ -4172,19 +4246,25 @@ def edit_post_price(message):
     except Exception as e:
         bot.send_message(user_id, f"Ошибка обновления цены: {e}")
     finally:
+        temp_post_data.pop(user_id, None)
         clear_user_state(user_id)  # Сбрасываем состояние пользователя
 
 # Обработчик ввода нового описания
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_DESCRIPTION)
 def edit_post_description(message):
     user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]  # Получаем ID поста
+    post_id = get_temp_post_id_or_reset(user_id)
+    if not post_id:
+        return
 
     new_description = message.text  # Новое описание
-    temp_post_data[user_id]["description"] = new_description
+    temp_post_data.update_dict(user_id, {"description": new_description})
 
     try:
         post = Posts.get_row_by_id(post_id)  # Получаем старые данные поста
+        if not post:
+            bot.send_message(user_id, "Пост не найден.")
+            return
         success, msg = Posts.update_row(
             post_id=post_id,
             price=post.price,
@@ -4201,13 +4281,16 @@ def edit_post_description(message):
     except Exception as e:
         bot.send_message(user_id, f"Ошибка обновления описания: {e}")
     finally:
+        temp_post_data.pop(user_id, None)
         clear_user_state(user_id)  # Сбрасываем состояние пользователя
 
 # Обработчик ввода нового количества
 @bot.message_handler(func=lambda message: get_user_state(message.chat.id) == CreatingPost.EDITING_POST_QUANTITY)
 def edit_post_quantity(message):
     user_id = message.chat.id
-    post_id = temp_post_data[user_id]["post_id"]  # Получаем ID поста
+    post_id = get_temp_post_id_or_reset(user_id)
+    if not post_id:
+        return
 
     # Проверяем, что ввод является числом
     if not message.text.isdigit():
@@ -4215,10 +4298,13 @@ def edit_post_quantity(message):
         return
 
     new_quantity = int(message.text)
-    temp_post_data[user_id]["quantity"] = new_quantity
+    temp_post_data.update_dict(user_id, {"quantity": new_quantity})
 
     try:
         post = Posts.get_row_by_id(post_id)  # Получаем старые данные
+        if not post:
+            bot.send_message(user_id, "Пост не найден.")
+            return
         success, msg = Posts.update_row(
             post_id=post_id,
             price=post.price,
@@ -4235,6 +4321,7 @@ def edit_post_quantity(message):
     except Exception as e:
         bot.send_message(user_id, f"Ошибка обновления количества: {e}")
     finally:
+        temp_post_data.pop(user_id, None)
         clear_user_state(user_id)  # Очистка состояния
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_post_"))
@@ -7504,11 +7591,11 @@ def disabled_manual_audit_callback(call):
 
 
 @bot.message_handler(
-    func=lambda message: get_user_state(message.chat.id) in {
+    func=lambda message: user_state_in(message.chat.id, {
         "EDITING_AUDIT_PRICE",
         "EDITING_AUDIT_DESCRIPTION",
         "EDITING_AUDIT_QUANTITY",
-    }
+    })
 )
 def disabled_manual_audit_message(message):
     answer_manual_audit_disabled(message)
@@ -7885,8 +7972,28 @@ def contact_client(call, user_id):
 
 
 
+def wait_for_telegram_api():
+    retry_delay = TELEGRAM_STARTUP_RETRY_SECONDS
+    while True:
+        try:
+            username = bot.user.username
+            logger.info("Telegram API is available. Bot username: @%s", username)
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Telegram API is unavailable before polling: %s. Retrying in %s seconds.",
+                exc,
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, TELEGRAM_STARTUP_MAX_RETRY_SECONDS)
+
+
 # Запуск бота
 def run_bot():
+    wait_for_telegram_api()
     start_reservation_auto_fulfill_worker()
     start_channel_post_auto_publish_worker()
     start_delivery_cleanup_worker()
