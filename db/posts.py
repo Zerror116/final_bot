@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from datetime import datetime, timedelta
@@ -11,6 +12,7 @@ from .db import AbstractModel, engine
 from .post_id_reservations import PostIdReservation
 
 
+logger = logging.getLogger(__name__)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
 POST_ID_RESERVATION_TTL = timedelta(hours=6)
 POST_ID_RESERVATION_ATTEMPTS = 10
@@ -23,6 +25,8 @@ USED_POST_ID_TABLES = (
     ("temp_fulfilled", "post_id"),
     ("in_delivery", "post_id"),
     ("temp_reservations", "post_id"),
+    ("delivery_collection_items", "post_id"),
+    ("missing_delivery_items", "post_id"),
     ("deleted_post_snapshots", "post_id"),
     ("revision_logs", "post_id"),
 )
@@ -90,6 +94,10 @@ class Posts(AbstractModel):
                         SELECT post_id AS id FROM in_delivery WHERE post_id > 0
                         UNION
                         SELECT post_id AS id FROM temp_reservations WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM delivery_collection_items WHERE post_id > 0
+                        UNION
+                        SELECT post_id AS id FROM missing_delivery_items WHERE post_id > 0
                         UNION
                         SELECT post_id AS id FROM deleted_post_snapshots WHERE post_id > 0
                         UNION
@@ -225,14 +233,17 @@ class Posts(AbstractModel):
                     if os.path.exists(photo_path):
                         os.remove(photo_path)
             except Exception as e:
-                return False, f"Ошибка при удалении фотографии: {str(e)}"
+                logger.exception("Post photo delete failed for post_id=%s: %s", post_id, e)
+                return False, "Ошибка при удалении фотографии."
 
             try:
                 session.delete(query)
                 session.commit()
                 return True, "Пост и связанные данные успешно удалены."  # Возвращаем True, если всё успешно удалено
             except Exception as e:
-                return False, f"Ошибка при удалении поста: {str(e)}"
+                session.rollback()
+                logger.exception("Post row delete failed for post_id=%s: %s", post_id, e)
+                return False, "Ошибка при удалении поста."
 
     @staticmethod
     def update_row(post_id: int, price: int = None, description: str = None, quantity: int = None,
@@ -266,6 +277,7 @@ class Posts(AbstractModel):
             return session.query(Posts).filter(
                 Posts.is_sent == False,
                 Posts.message_id == None,
+                Posts.quantity > 0,
             ).order_by(Posts.id).all()
 
     @staticmethod
@@ -326,6 +338,7 @@ class Posts(AbstractModel):
                     Posts.chat_id == user_id,
                     Posts.is_sent == False,
                     Posts.message_id == None,
+                    Posts.quantity > 0,
                 ).all()
 
     @staticmethod
@@ -333,11 +346,11 @@ class Posts(AbstractModel):
         original_post = Posts.get_row_by_id(post_id)
 
         if not original_post:
-            print(f"❌ Ошибка: Оригинальный пост с ID {post_id} не найден.")
+            logger.warning("Original post not found for clone post_id=%s", post_id)
             return None, "Оригинальный пост не найден."
 
         try:
-            print(f"Копируем пост ID={post_id} с параметрами: {kwargs}")
+            logger.info("Cloning post_id=%s", post_id)
 
             # Создаём новый пост
             new_post_id = Posts.insert(
@@ -349,12 +362,12 @@ class Posts(AbstractModel):
             )
 
             if not new_post_id:
-                print(f"❌ Ошибка при создании поста: insert вернул None.")
+                logger.warning("Post clone insert returned None for source_post_id=%s", post_id)
                 return None, "Ошибка при сохранении нового поста."
 
-            print(f"✅ Новый пост создан с ID: {new_post_id}")
+            logger.info("Post clone created source_post_id=%s new_post_id=%s", post_id, new_post_id)
             return new_post_id, None
 
         except Exception as e:
-            print(f"❌ Ошибка при создании нового поста: {e}")
-            return None, f"Ошибка: {e}"
+            logger.exception("Post clone failed for source_post_id=%s: %s", post_id, e)
+            return None, "Ошибка при создании нового поста."

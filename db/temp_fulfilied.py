@@ -1,4 +1,5 @@
 import datetime
+import logging
 from zoneinfo import ZoneInfo
 from sqlalchemy import String, BIGINT, Boolean, DateTime, Index, Integer
 from sqlalchemy.exc import SQLAlchemyError
@@ -6,6 +7,7 @@ from .db import AbstractModel
 from sqlalchemy.orm import mapped_column, Session
 
 
+logger = logging.getLogger(__name__)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
 
 
@@ -54,7 +56,7 @@ class Temp_Fulfilled(AbstractModel):
             return True
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при добавлении записи: {e}")
+            logger.exception("Temp fulfilled insert failed: %s", e)
             return False
 
     @staticmethod
@@ -64,7 +66,7 @@ class Temp_Fulfilled(AbstractModel):
             record = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.id == record_id).first()
             return record
         except SQLAlchemyError as e:
-            print(f"Ошибка при получении записи: {e}")
+            logger.exception("Temp fulfilled get failed for record_id=%s: %s", record_id, e)
             return None
 
     @staticmethod
@@ -74,7 +76,7 @@ class Temp_Fulfilled(AbstractModel):
             records = session.query(Temp_Fulfilled).all()
             return records
         except SQLAlchemyError as e:
-            print(f"Ошибка при получении записей: {e}")
+            logger.exception("Temp fulfilled list failed: %s", e)
             return None
 
     @staticmethod
@@ -87,11 +89,11 @@ class Temp_Fulfilled(AbstractModel):
                 session.commit()
                 return True
             else:
-                print("Запись не найдена")
+                logger.debug("Temp fulfilled record not found for delete record_id=%s", record_id)
                 return False
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при удалении записи: {e}")
+            logger.exception("Temp fulfilled delete failed for record_id=%s: %s", record_id, e)
             return False
 
     @staticmethod
@@ -106,11 +108,11 @@ class Temp_Fulfilled(AbstractModel):
                 session.commit()
                 return True
             else:
-                print("Запись не найдена")
+                logger.debug("Temp fulfilled record not found for update record_id=%s", record_id)
                 return False
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при обновлении записи: {e}")
+            logger.exception("Temp fulfilled update failed for record_id=%s: %s", record_id, e)
             return False
 
     @staticmethod
@@ -127,5 +129,5 @@ class Temp_Fulfilled(AbstractModel):
             return deleted_count
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при удалении старых записей: {e}")
+            logger.exception("Temp fulfilled cleanup failed: %s", e)
             return 0

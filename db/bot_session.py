@@ -30,7 +30,10 @@ class BotSession(AbstractModel):
     def decode(value):
         if value is None or value == "":
             return None
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
 
     @staticmethod
     def _get_or_create(session, user_id):

@@ -55,9 +55,9 @@ class InDelivery(AbstractModel):
                 )
                 session.add(new_entry)
                 session.commit()
-            except Exception as e:
+            except Exception:
                 session.rollback()
-                raise e
+                raise
 
     @staticmethod
     def get_all_rows():
@@ -67,9 +67,9 @@ class InDelivery(AbstractModel):
         with Session(bind=engine) as session:
             try:
                 return session.query(InDelivery).all()
-            except Exception as e:
+            except Exception:
                 session.rollback()
-                raise e
+                raise
 
     @staticmethod
     def clear_table():
@@ -80,6 +80,6 @@ class InDelivery(AbstractModel):
             try:
                 session.query(InDelivery).delete()
                 session.commit()
-            except Exception as e:
+            except Exception:
                 session.rollback()
-                raise e
+                raise

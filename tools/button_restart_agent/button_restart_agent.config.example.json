@@ -1,0 +1,7 @@
+{
+  "restart_url": "http://109.196.100.116:8092/api/restart",
+  "token": "put-token-here",
+  "key": "",
+  "cooldown_seconds": 30,
+  "bind_and_restart_on_first_press": true
+}

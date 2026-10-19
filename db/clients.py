@@ -1,12 +1,19 @@
+import logging
+
 from sqlalchemy import (
     Index,
     String,
     BIGINT,
     Integer,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import mapped_column, Session
 
 from .db import AbstractModel, engine
+
+
+logger = logging.getLogger(__name__)
+
 
 class Clients(AbstractModel):
     __tablename__ = "clients"
@@ -44,9 +51,40 @@ class Clients(AbstractModel):
         return {variant for variant in variants if variant}
 
     @staticmethod
+    def role_priority(role):
+        return {
+            "client": 0,
+            "audit": 1,
+            "worker": 2,
+            "admin": 3,
+            "supreme_leader": 4,
+        }.get(str(role or ""), 0)
+
+    @staticmethod
+    def preserve_highest_role(existing_role, new_role):
+        if Clients.role_priority(new_role) > Clients.role_priority(existing_role):
+            return new_role
+        return existing_role or new_role
+
+    @staticmethod
+    def apply_registration_data(client, name, phone, role):
+        client.name = name
+        client.phone = Clients.normalize_phone(phone)
+        client.role = Clients.preserve_highest_role(client.role, role)
+        return client
+
+    @staticmethod
     def insert(user_id: int, name: str, phone: str, role: str):
         with Session(bind=engine) as session:
             try:
+                existing_client = session.query(Clients).filter(
+                    Clients.user_id == user_id,
+                ).with_for_update().first()
+                if existing_client:
+                    Clients.apply_registration_data(existing_client, name, phone, role)
+                    session.commit()
+                    return existing_client.id
+
                 client = Clients(
                     user_id=user_id,
                     name=name,
@@ -55,8 +93,17 @@ class Clients(AbstractModel):
                 )
                 session.add(client)
                 session.commit()
-            except Exception:
-                raise
+                return client.id
+            except IntegrityError:
+                session.rollback()
+                existing_client = session.query(Clients).filter(
+                    Clients.user_id == user_id,
+                ).with_for_update().first()
+                if not existing_client:
+                    raise
+                Clients.apply_registration_data(existing_client, name, phone, role)
+                session.commit()
+                return existing_client.id
 
     @staticmethod
     def get_row_all():
@@ -114,11 +161,12 @@ class Clients(AbstractModel):
         with Session(bind=engine) as session:
             query = session.query(Clients).filter(Clients.id == client_id).first()
             if query is None:
-                print(f"Клиент с ID {client_id} не найден для удаления.")
+                logger.info("Client delete skipped: client_id=%s not found", client_id)
                 return False
-            print(f"Клиент {query.phone} ({query.name}) успешно удален.")
+            logger.info("Client deleted: client_id=%s phone=%s name=%s", client_id, query.phone, query.name)
             session.delete(query)
             session.commit()
+            return True
 
     @staticmethod
     def update_row(user_id: int, name: str, phone: str, role: str):
@@ -134,9 +182,9 @@ class Clients(AbstractModel):
             query.role = role
             try:
                 session.commit()  # Сохраняем изменения
-                print(f"[update_row] Обновлены данные для user_id={user_id}.")
+                logger.debug("Client row updated for user_id=%s", user_id)
             except Exception as e:
-                print(f"[update_row] Ошибка при обновлении: {e}")
+                logger.exception("Client row update failed for user_id=%s: %s", user_id, e)
                 session.rollback()
                 raise
             return True, "Данные пользователя обновлены успешно."
@@ -144,6 +192,8 @@ class Clients(AbstractModel):
     @staticmethod
     def get_row_by_phone_digits(phone_digits):
         phone_digits = Clients.normalize_phone(phone_digits)[-4:]
+        if len(phone_digits) != 4:
+            return []
         """Получение всех пользователей с совпадающими последними цифрами номера."""
         with Session(bind=engine) as session:
             clients = session.query(Clients).filter(Clients.phone.like(f"%{phone_digits}")).all()
@@ -182,15 +232,23 @@ class Clients(AbstractModel):
 
     @staticmethod
     def update_row_for_work(user_id, updates):
+        updates = dict(updates or {})
+        if not updates:
+            return True
+
         try:
             if "phone" in updates:
-                updates = {**updates, "phone": Clients.normalize_phone(updates["phone"])}
-            # Пример обновления через SQLAlchemy
-            with Session(bind=engine) as session:
-                session.query(Clients).filter(Clients.user_id == user_id).update(updates)
-                session.commit()  # Убедитесь, что изменения фиксируются
-            return True
+                updates["phone"] = Clients.normalize_phone(updates["phone"])
         except Exception as e:
-            print(f"Error in update_row_for_work: {e}")
-            session.rollback()  # Отменяем изменения при возникновении ошибки
+            logger.warning("Client work update normalization failed for user_id=%s: %s", user_id, e)
             return False
+
+        with Session(bind=engine) as session:
+            try:
+                updated_count = session.query(Clients).filter(Clients.user_id == user_id).update(updates)
+                session.commit()
+                return updated_count > 0
+            except Exception as e:
+                logger.exception("Client work update failed for user_id=%s: %s", user_id, e)
+                session.rollback()
+                return False

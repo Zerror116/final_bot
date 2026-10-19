@@ -1,3 +1,4 @@
+import logging
 from sqlalchemy import (
     BIGINT,
     Boolean,
@@ -13,6 +14,7 @@ from . import Posts
 from .db import AbstractModel, engine
 
 SAMARA_TZ = ZoneInfo("Europe/Samara")
+logger = logging.getLogger(__name__)
 
 
 def local_now_naive():
@@ -134,7 +136,8 @@ class Reservations(AbstractModel):
                     return False  # Запись с таким id не найдена
             except Exception as e:
                 session.rollback()  # В случае ошибки откатываем изменения
-                raise Exception(f"Ошибка при удалении строки с id {reservation_id}: {e}")
+                logger.exception("Reservation delete failed reservation_id=%s: %s", reservation_id, e)
+                raise
 
     @staticmethod
     def delete_rows_by_user_id(user_id: int):

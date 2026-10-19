@@ -11,7 +11,7 @@ def supreme_leader_main_menu():
     delivery_management = KeyboardButton("🚚 Управление доставкой")
     orders_in_delivery = KeyboardButton("🚗 Заказы в доставке")
     manage_workers = KeyboardButton("👔 Назначить работника")
-    audit_manage = KeyboardButton(" Ревизия")
+    audit_manage = KeyboardButton("Ревизия")
     i_have_a_defect = KeyboardButton("😞 У меня брак")
     phoenix_broadcast = KeyboardButton("Рассылка о Фениксе")
     reservation_stats = KeyboardButton("БроньСтатистик")
@@ -41,7 +41,7 @@ def audit_main_menu():
     my_orders = KeyboardButton("🛒 Мои заказы")
     manage_posts = KeyboardButton("📄 Посты")
     collect_delivery = KeyboardButton("🧺 Собрать доставку")
-    audit_manage = KeyboardButton(" Ревизия")
+    audit_manage = KeyboardButton("Ревизия")
     audit_keydoard.add(create_new_post, my_orders, manage_posts, collect_delivery, audit_manage)
     return audit_keydoard
 

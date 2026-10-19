@@ -1,5 +1,8 @@
 .venv
 .idea
+.DS_Store
+._*
+**/._*
 __pycache__/
 */__pycache__/*
 .deploy_backups/
@@ -15,5 +18,11 @@ credentials.json
 venv/
 *.swp
 *.swo
-sage.chat.id,
-ystemctl restart final_bot
+android_post_stats/.gradle/
+android_post_stats/build/
+android_post_stats/app/build/
+android_post_stats/*.apk
+android_post_stats/local.properties
+android_post_stats/web_preview/config.local.js
+tools/button_restart_agent/button_restart_agent.config.json
+tools/button_restart_agent/*.log
