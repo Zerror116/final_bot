@@ -4425,7 +4425,7 @@ def remove_unprocessed_reservation_from_cart(session, reservation, post, stats, 
             continue
 
         if post:
-            post.quantity += 1
+            return_post_stock_to_today(post)
             stats["returned"] += 1
 
     return post_id
@@ -4453,10 +4453,18 @@ def remove_processed_reservation_from_cart(session, reservation, post, stats, qu
             continue
 
         if post:
-            post.quantity += 1
+            return_post_stock_to_today(post)
             stats["returned"] += 1
 
     return post_id
+
+
+def return_post_stock_to_today(post, quantity=1):
+    if not post:
+        return 0
+    post.quantity = int(post.quantity or 0) + max(int(quantity or 0), 1)
+    post.created_at = Posts.next_created_at()
+    return post.quantity
 
 
 def remove_reservation_from_cart(session, reservation, stats, queued_notifications):

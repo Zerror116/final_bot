@@ -1718,6 +1718,9 @@ def test_cart_clear_processed_is_available():
         "def promote_next_queue_entry(",
         "Wait queue entry removed because client is missing",
         'client_id = parse_callback_int_suffix(call, "clear_cart_", "Некорректный клиент.")',
+        "def return_post_stock_to_today(post, quantity=1):",
+        "post.created_at = Posts.next_created_at()",
+        "return_post_stock_to_today(post)",
     ]:
         if marker not in text:
             raise AssertionError(f"cart clear processed marker missing {marker}")
@@ -1732,6 +1735,8 @@ def test_cart_clear_processed_is_available():
         "send_queue_transfer_notifications",
         "create_reservation_from_queue",
         "post.quantity +=",
+        "return_post_stock_to_today",
+        "Posts.next_created_at()",
     ]
     for marker in forbidden:
         if marker in no_channel_block:
