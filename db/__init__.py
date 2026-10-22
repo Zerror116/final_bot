@@ -16,6 +16,7 @@ from .delivery_broadcast_campaigns import DeliveryBroadcastCampaign
 from .delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from .delivery_collection_items import DeliveryCollectionItem
 from .missing_delivery_items import MissingDeliveryItem
+from .delivery_cart_merges import DeliveryCartMerge
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -65,6 +66,7 @@ def run_schema_migrations():
         "026_delivery_collection_report_message_tracking",
         ensure_delivery_collection_report_message_tracking,
     )
+    run_migration("027_delivery_cart_merges", ensure_delivery_cart_merges)
 
 
 def ensure_schema_migrations():
@@ -588,6 +590,38 @@ def backfill_completed_delivery_collection_item_collector_sheet_tracking():
         ))
 
 
+def ensure_delivery_cart_merges():
+    AbstractModel.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_cart_merges_extra_phone "
+            "ON delivery_cart_merges (extra_phone)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_delivery_cart_merges_main_phone "
+            "ON delivery_cart_merges (main_phone)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_delivery_cart_merges_extra_phone "
+            "ON delivery_cart_merges (extra_phone)"
+        ))
+        connection.execute(text(
+            "INSERT INTO delivery_cart_merges (main_phone, extra_phone, merge_order, created_at) "
+            "SELECT parent.phone, child.phone, COALESCE(child.merge_order, 0), CURRENT_TIMESTAMP "
+            "FROM for_delivery child "
+            "JOIN for_delivery parent ON parent.id = child.merged_into_delivery_id "
+            "WHERE child.merged_into_delivery_id IS NOT NULL "
+            "AND child.phone IS NOT NULL AND child.phone != '' "
+            "AND parent.phone IS NOT NULL AND parent.phone != '' "
+            "AND child.phone != parent.phone "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM delivery_cart_merges existing "
+            "WHERE existing.extra_phone = child.phone"
+            ")"
+        ))
+
+
 def ensure_for_delivery_cart_merge():
     AbstractModel.metadata.create_all(engine)
 
@@ -920,5 +954,6 @@ __all__ = {
     "DeliveryBroadcastRecipient",
     "DeliveryCollectionItem",
     "MissingDeliveryItem",
+    "DeliveryCartMerge",
     "init_db",
 }

@@ -26,6 +26,7 @@ from db.delivery_broadcast_campaigns import DeliveryBroadcastCampaign
 from db.delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from db.delivery_collection_items import DeliveryCollectionItem
 from db.missing_delivery_items import MissingDeliveryItem
+from db.delivery_cart_merges import DeliveryCartMerge
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -99,6 +100,19 @@ POST_EDITOR_ROLES = {"worker", "admin", "supreme_leader", "audit"}
 DELIVERY_ROLES = {"admin", "supreme_leader"}
 DELIVERY_COLLECTION_ROLES = DELIVERY_ROLES | {"audit"}
 DELIVERY_THRESHOLD = 1500
+DELIVERY_CHECKOUT_STATES = {
+    "WAITING_FOR_ADDRESS",
+    "WAITING_FOR_CONFIRMATION",
+    "WAITING_FOR_DATA_EDIT",
+    "WAITING_FOR_NEW_ADDRESS",
+    "WAITING_FOR_NEW_PHONE",
+}
+DELIVERY_ADDRESS_INPUT_STATES = {
+    "WAITING_FOR_ADDRESS",
+    "WAITING_FOR_CONFIRMATION",
+    "WAITING_FOR_DATA_EDIT",
+    "WAITING_FOR_NEW_ADDRESS",
+}
 RESERVATION_AUTO_FULFILL_SECONDS = 60 * 60
 RESERVATION_AUTO_FULFILL_CHECK_SECONDS = 60
 POST_ID_REUSE_STALE_GRACE = timedelta(days=2)
@@ -109,10 +123,12 @@ DEFECTIVE_RESERVATION_PAGE_SIZE = 8
 MISSING_DELIVERY_STATUS_MISSING = "missing"
 MISSING_DELIVERY_STATUS_RETURNED_CHANNEL = "returned_channel"
 MISSING_DELIVERY_STATUS_RETURNED_CART = "returned_cart"
+MISSING_DELIVERY_STATUS_FOUND = "found"
 MISSING_DELIVERY_STATUS_LABELS = {
     MISSING_DELIVERY_STATUS_MISSING: "В пропаже",
     MISSING_DELIVERY_STATUS_RETURNED_CHANNEL: "Вернули на канал",
     MISSING_DELIVERY_STATUS_RETURNED_CART: "Вернули в корзину",
+    MISSING_DELIVERY_STATUS_FOUND: "Нашли",
 }
 LEGACY_DELIVERY_CUTOFF_AT = datetime(2026, 5, 16, 14, 0, 0)
 SAMARA_TZ = ZoneInfo("Europe/Samara")
@@ -3929,7 +3945,9 @@ def request_delivery_cart_merge_main(message):
     safe_send_message(
         bot,
         message.chat.id,
-        "Введите телефон основной корзины. В списке сборки будет показываться именно она.",
+        "Введите телефон основной корзины.\n"
+        "Корзины можно объединять даже если их ещё нет в списке сборки. "
+        "Когда основная корзина попадёт в сборку, дополнительные тоже добавятся.",
         logger=logger,
     )
 
@@ -3946,29 +3964,56 @@ def handle_delivery_cart_merge_main_input(message):
         return
 
     with Session(bind=engine) as session:
-        delivery_entry, error_text = find_delivery_entry_by_phone_input(session, text)
+        main_client, error_text = find_client_by_phone_input(session, text)
         if error_text:
             safe_send_message(bot, message.chat.id, error_text, logger=logger)
             return
 
-        root_entry = get_delivery_root_entry(session, delivery_entry)
-        if not root_entry:
-            safe_send_message(bot, message.chat.id, "Основная корзина не найдена.", logger=logger)
+        main_phone = normalize_phone(main_client.phone)
+        owner_merge = find_delivery_cart_merge_by_extra_phone(session, main_phone)
+        if owner_merge:
+            owner_client = find_client_by_normalized_phone(session, owner_merge.main_phone)
+            owner_label = format_client_cart_label(owner_client, owner_merge.main_phone)
+            safe_send_message(
+                bot,
+                message.chat.id,
+                "Этот номер уже дополнительная корзина для "
+                f"{owner_label}.\n"
+                "Введите телефон основной корзины, чтобы добавить ещё одну "
+                "или разъединить уже объединённый номер.",
+                logger=logger,
+            )
             return
 
+        extra_rows = list_delivery_cart_merges_for_main(session, main_phone)
+        extra_labels = []
+        for extra_row in extra_rows:
+            extra_client = find_client_by_normalized_phone(session, extra_row.extra_phone)
+            extra_labels.append(format_client_cart_label(extra_client, extra_row.extra_phone))
+
+        main_label = format_client_cart_label(main_client, main_phone)
         temp_user_data[message.chat.id] = {
-            "main_delivery_id": root_entry.id,
-            "main_phone": root_entry.phone,
-            "main_name": root_entry.name,
+            "main_phone": main_phone,
+            "main_name": main_client.name,
         }
 
     set_user_state(message.chat.id, MERGE_DELIVERY_EXTRA_STATE)
-    safe_send_message(
-        bot,
-        message.chat.id,
-        "Введите телефон дополнительной корзины. Ее товары будут идти после основной корзины.",
-        logger=logger,
-    )
+    prompt_lines = [
+        f"Основная корзина: {main_label}",
+    ]
+    if extra_labels:
+        prompt_lines.append("Уже объединены:")
+        prompt_lines.extend(f"- {label}" for label in extra_labels)
+        prompt_lines.append(
+            "Введите телефон дополнительной корзины, чтобы добавить её. "
+            "Если введёте уже объединённый номер, корзины разъединятся."
+        )
+    else:
+        prompt_lines.append(
+            "Введите телефон дополнительной корзины. "
+            "Её товары будут идти после основной корзины."
+        )
+    safe_send_message(bot, message.chat.id, "\n".join(prompt_lines), logger=logger)
 
 
 @bot.message_handler(func=lambda message: message_user_state_is(message, MERGE_DELIVERY_EXTRA_STATE))
@@ -3982,21 +4027,17 @@ def handle_delivery_cart_merge_extra_input(message):
     if text is None:
         return
 
-    flow_data = temp_user_data.get(message.chat.id) or {}
-    main_delivery_id = flow_data.get("main_delivery_id")
-    if not main_delivery_id:
-        clear_user_state(message.chat.id)
-        temp_user_data.pop(message.chat.id, None)
-        safe_send_message(
-            bot,
-            message.chat.id,
-            "Данные объединения потерялись. Нажмите «Объединить корзины» заново.",
-            logger=logger,
-        )
+    flow_data = get_temp_user_data_or_reset(
+        message.chat.id,
+        required_fields=("main_phone",),
+        notice_chat_id=message.chat.id,
+        notice_text="Данные объединения потерялись. Нажмите «Объединить корзины» заново.",
+    )
+    if not flow_data:
         return
 
     with Session(bind=engine) as session:
-        success, result_text = merge_delivery_cart_entries(session, main_delivery_id, text)
+        success, result_text = merge_or_unmerge_delivery_carts(session, flow_data["main_phone"], text)
         if success:
             session.commit()
         else:
@@ -6589,28 +6630,11 @@ def handle_delivery_response_callback(call):
             logger=logger,
         )
     elif response == "delivery_yes":
-        current_state = get_user_state(user_id)
         existing_temp = temp_user_data.get(user_id, {})
         if not isinstance(existing_temp, dict):
             existing_temp = {}
 
-        active_delivery_states = {
-            "WAITING_FOR_ADDRESS",
-            "WAITING_FOR_CONFIRMATION",
-            "WAITING_FOR_DATA_EDIT",
-            "WAITING_FOR_NEW_ADDRESS",
-            "WAITING_FOR_NEW_PHONE",
-        }
         existing_cutoff = parse_datetime(existing_temp.get("delivery_cutoff_at"))
-        if current_state in active_delivery_states and existing_cutoff:
-            delete_delivery_offer_buttons(user_id, message_id)
-            safe_send_message(
-                bot,
-                user_id,
-                "Вы уже начали оформление доставки. Отправьте адрес или завершите текущее подтверждение.",
-                logger=logger,
-            )
-            return
         with Session(bind=engine) as session:
             campaign_cutoff = get_delivery_cutoff_for_user(session, user_id)
             already_in_delivery = has_current_delivery_entry_for_user(
@@ -6631,7 +6655,7 @@ def handle_delivery_response_callback(call):
             return
         delivery_cutoff_at = (
             existing_cutoff
-            if current_state in active_delivery_states and existing_cutoff
+            if user_state_in(user_id, DELIVERY_CHECKOUT_STATES) and existing_cutoff
             else (campaign_cutoff or now_local())
         )
         # Если согласие до 16:00, запрашиваем адрес
@@ -6659,7 +6683,7 @@ def handle_delivery_response_callback(call):
         safe_send_message(bot, user_id, "Вы отказались от доставки. Оповестим вас при следующей доставке.", logger=logger)
 
 # Обрабатывает ввод адреса пользователя.
-@bot.message_handler(func=lambda message: get_user_state(message.chat.id) == "WAITING_FOR_ADDRESS")
+@bot.message_handler(func=lambda message: user_state_in(message.chat.id, DELIVERY_ADDRESS_INPUT_STATES))
 def handle_address_input(message):
     user_id = message.chat.id
     if ignore_silent_blocked_message(message):
@@ -6687,19 +6711,16 @@ def handle_address_input(message):
     logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     # Поиск всех пользователей с таким же телефоном
     from db import Session, engine
-    with Session(bind=engine) as session:
-        same_phone_users = session.query(Clients).filter(
-            Clients.phone.in_(phone_variants(phone))
-        ).all()
+    phone_filter = phone_variants(phone)
+    same_phone_users = []
+    if phone_filter:
+        with Session(bind=engine) as session:
+            same_phone_users = session.query(Clients).filter(
+                Clients.phone.in_(phone_filter)
+            ).all()
     if not same_phone_users:
-        logger.warning("No related delivery users found for user_id=%s", user_id)
-        safe_send_message(
-            bot,
-            user_id,
-            "Ошибка! Не удалось найти других заказов с данным номером телефона.",
-            logger=logger,
-        )
-        return
+        logger.warning("No related delivery users found for user_id=%s, continue with current client", user_id)
+        same_phone_users = [user_data]
     # Подсчет общей суммы всех заказов
     total_sum_by_phone = user_orders_sum
     all_user_orders_details = []
@@ -6731,6 +6752,12 @@ def handle_address_input(message):
     )
     if not confirmation_message:
         logger.warning("Delivery confirmation prompt was not sent for user_id=%s", user_id)
+        safe_send_message(
+            bot,
+            user_id,
+            "Не удалось отправить подтверждение. Отправьте адрес ещё раз.",
+            logger=logger,
+        )
         return
     # Сохраняем данные во временном хранилище
     temp_user_data[user_id] = {
@@ -7000,11 +7027,22 @@ def has_current_delivery_entry_for_user(session, user_id, cutoff_at):
     return bool(delivery_entry and same_delivery_cutoff_day(delivery_entry.delivery_cutoff_at, cutoff_at))
 
 
-def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum, delivery_cutoff_at=None):
+def upsert_for_delivery_entry(
+    session,
+    user_id,
+    name,
+    phone,
+    address,
+    total_sum,
+    delivery_cutoff_at=None,
+    apply_merges=True,
+):
     deduplicate_for_delivery_entries(session)
     normalized_phone = normalize_phone(phone)
     delivery_cutoff_at = delivery_cutoff_at or now_local()
-    delivery_entry = session.query(ForDelivery).filter(ForDelivery.phone == normalized_phone).first()
+    delivery_entry = session.query(ForDelivery).filter(
+        ForDelivery.phone.in_(phone_variants(normalized_phone) or [normalized_phone or phone]),
+    ).order_by(ForDelivery.id.asc()).first()
 
     if delivery_entry:
         if (
@@ -7032,6 +7070,9 @@ def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum,
             user_id,
             effective_cutoff_at,
         )
+        session.flush()
+        if apply_merges:
+            apply_persistent_cart_merges_for_phone(session, delivery_entry.phone)
         return delivery_entry
 
     total_sum = calculate_delivery_total_for_phone(
@@ -7049,7 +7090,21 @@ def upsert_for_delivery_entry(session, user_id, name, phone, address, total_sum,
         delivery_cutoff_at=delivery_cutoff_at,
     )
     session.add(delivery_entry)
+    session.flush()
+    if apply_merges:
+        apply_persistent_cart_merges_for_phone(session, delivery_entry.phone)
     return delivery_entry
+
+
+def transfer_delivery_collection_items(session, source_delivery_id, target_delivery_id):
+    if not source_delivery_id or not target_delivery_id or source_delivery_id == target_delivery_id:
+        return
+    session.query(DeliveryCollectionItem).filter(
+        DeliveryCollectionItem.delivery_id == source_delivery_id,
+    ).update(
+        {DeliveryCollectionItem.delivery_id: target_delivery_id},
+        synchronize_session=False,
+    )
 
 
 def deduplicate_for_delivery_entries(session):
@@ -7066,19 +7121,26 @@ def deduplicate_for_delivery_entries(session):
             entries_by_phone[normalized_phone] = entry
             continue
 
-        if entry.address and not existing.address:
-            existing.address = entry.address
-        if entry.total_sum and entry.total_sum > (existing.total_sum or 0):
-            existing.total_sum = entry.total_sum
-            existing.user_id = entry.user_id
-            existing.name = entry.name
-        if should_replace_delivery_cutoff(existing.delivery_cutoff_at, entry.delivery_cutoff_at):
-            existing.delivery_cutoff_at = entry.delivery_cutoff_at
+        keeper, discarded = existing, entry
         if entry.collector_user_id and not existing.collector_user_id:
-            existing.collector_user_id = entry.collector_user_id
-            existing.collector_name = entry.collector_name
-            existing.collection_started_at = entry.collection_started_at
-        session.delete(entry)
+            keeper, discarded = entry, existing
+            entries_by_phone[normalized_phone] = entry
+
+        if discarded.address and not keeper.address:
+            keeper.address = discarded.address
+        if discarded.total_sum and discarded.total_sum > (keeper.total_sum or 0):
+            if not delivery_entry_has_collection_items(session, keeper):
+                keeper.total_sum = discarded.total_sum
+                keeper.user_id = discarded.user_id
+                keeper.name = discarded.name
+        if should_replace_delivery_cutoff(keeper.delivery_cutoff_at, discarded.delivery_cutoff_at):
+            keeper.delivery_cutoff_at = discarded.delivery_cutoff_at
+        if discarded.collector_user_id and not keeper.collector_user_id:
+            keeper.collector_user_id = discarded.collector_user_id
+            keeper.collector_name = discarded.collector_name
+            keeper.collection_started_at = discarded.collection_started_at
+        transfer_delivery_collection_items(session, discarded.id, keeper.id)
+        session.delete(discarded)
 
 @bot.message_handler(func=lambda message: message.text == "👨‍🦯 Засунуть в доставку")
 def push_in_delivery(message):
@@ -8421,6 +8483,320 @@ def get_delivery_collection_entry_ids(session, delivery_entry, lock=False):
     ]
 
 
+def format_client_cart_label(client, phone=None):
+    display_phone = phone or (client.phone if client else None)
+    display_name = client.name if client else None
+    return f"{display_name or 'Имя не указано'} | {display_phone or 'телефон не указан'}"
+
+
+def find_client_by_normalized_phone(session, phone):
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return None
+    return session.query(Clients).filter(
+        Clients.phone.in_(phone_variants(normalized_phone)),
+    ).order_by(Clients.id.asc()).first()
+
+
+def find_client_by_phone_input(session, raw_phone):
+    normalized_phone = normalize_phone(raw_phone)
+    if not normalized_phone:
+        return None, "Введите номер телефона корзины."
+
+    query = session.query(Clients)
+    if len(normalized_phone) >= 10:
+        query = query.filter(Clients.phone.in_(phone_variants(normalized_phone)))
+    elif len(normalized_phone) >= 4:
+        query = query.filter(Clients.phone.like(f"%{normalized_phone}"))
+    else:
+        return None, "Введите полный номер телефона или минимум последние 4 цифры."
+
+    rows = query.order_by(
+        Clients.name.asc(),
+        Clients.phone.asc(),
+        Clients.id.asc(),
+    ).all()
+    if not rows:
+        return None, f"Клиент с телефоном {normalized_phone} не найден."
+
+    unique_by_phone = {}
+    for row in rows:
+        phone_key = normalize_phone(row.phone) or row.phone
+        if phone_key not in unique_by_phone:
+            unique_by_phone[phone_key] = row
+    if len(unique_by_phone) > 1:
+        matches = "\n".join(
+            f"- {format_client_cart_label(row)}"
+            for row in list(unique_by_phone.values())[:10]
+        )
+        if len(unique_by_phone) > 10:
+            matches += f"\n...и еще {len(unique_by_phone) - 10}"
+        return None, f"Найдено несколько клиентов. Введите телефон точнее:\n{matches}"
+    return next(iter(unique_by_phone.values())), None
+
+
+def find_for_delivery_entry_by_phone(session, phone, lock=False):
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return None
+    query = session.query(ForDelivery).filter(
+        ForDelivery.phone.in_(phone_variants(normalized_phone)),
+    ).order_by(ForDelivery.id.asc())
+    if lock:
+        query = query.with_for_update()
+    return query.first()
+
+
+def delivery_cart_merge_phone_match(column, phone):
+    return column.in_(phone_variants(normalize_phone(phone)))
+
+
+def find_delivery_cart_merge_by_extra_phone(session, phone):
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return None
+    return session.query(DeliveryCartMerge).filter(
+        delivery_cart_merge_phone_match(DeliveryCartMerge.extra_phone, normalized_phone),
+    ).order_by(DeliveryCartMerge.id.asc()).first()
+
+
+def list_delivery_cart_merges_for_main(session, main_phone):
+    normalized_phone = normalize_phone(main_phone)
+    if not normalized_phone:
+        return []
+    return session.query(DeliveryCartMerge).filter(
+        delivery_cart_merge_phone_match(DeliveryCartMerge.main_phone, normalized_phone),
+    ).order_by(
+        DeliveryCartMerge.merge_order.asc(),
+        DeliveryCartMerge.id.asc(),
+    ).all()
+
+
+def next_delivery_cart_merge_order(session, main_phone):
+    rows = list_delivery_cart_merges_for_main(session, main_phone)
+    if not rows:
+        return 1
+    return max(int(row.merge_order or 0) for row in rows) + 1
+
+
+def delivery_carts_blocked_for_merge(session, *phones):
+    entries = []
+    seen_ids = set()
+    for phone in phones:
+        entry = find_for_delivery_entry_by_phone(session, phone, lock=True)
+        if not entry:
+            continue
+        for group_entry in get_delivery_collection_entries(session, entry, lock=True):
+            if not group_entry or group_entry.id in seen_ids:
+                continue
+            seen_ids.add(group_entry.id)
+            entries.append(group_entry)
+
+    blocked_entry = next((entry for entry in entries if entry.collector_user_id), None)
+    if blocked_entry:
+        return (
+            "Нельзя менять объединение корзин, которые уже открыты на сборку. "
+            f"Сейчас корзину {format_delivery_entry_label(blocked_entry)} собирает "
+            f"{blocked_entry.collector_name or f'ID {blocked_entry.collector_user_id}'}."
+        )
+    if any(delivery_entry_has_collection_items(session, entry) for entry in entries):
+        return "Нельзя менять объединение корзин, которые уже открывались на сборку. Сначала закончите текущую сборку."
+    if delivery_entries_have_placed_items(session, entries):
+        return "Нельзя менять объединение корзин, где уже нажимали «Положил»."
+    return None
+
+
+def unlink_for_delivery_extra_entry(session, extra_entry):
+    if not extra_entry:
+        return
+    extra_entry.merged_into_delivery_id = None
+    extra_entry.merge_order = 0
+    extra_entry.collector_user_id = None
+    extra_entry.collector_name = None
+    extra_entry.collection_started_at = None
+
+
+def apply_persistent_cart_merges_for_phone(session, phone):
+    normalized_phone = normalize_phone(phone)
+    if not normalized_phone:
+        return None
+
+    owner_merge = find_delivery_cart_merge_by_extra_phone(session, normalized_phone)
+    if owner_merge:
+        main_entry = find_for_delivery_entry_by_phone(session, owner_merge.main_phone, lock=True)
+        extra_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=True)
+        if (
+            main_entry
+            and extra_entry
+            and extra_entry.id != main_entry.id
+            and not main_entry.collector_user_id
+            and not delivery_entry_has_collection_items(session, main_entry)
+        ):
+            extra_group = get_delivery_collection_entries(session, extra_entry, lock=True)
+            for child in extra_group:
+                if child.id == main_entry.id:
+                    continue
+                child.merged_into_delivery_id = main_entry.id
+                child.merge_order = owner_merge.merge_order or 1
+            extra_entry.merged_into_delivery_id = main_entry.id
+            extra_entry.merge_order = owner_merge.merge_order or 1
+            session.flush()
+            main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
+        return extra_entry or main_entry
+
+    main_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=True)
+    if not main_entry:
+        return None
+    if main_entry.collector_user_id or delivery_entry_has_collection_items(session, main_entry):
+        return main_entry
+
+    main_entry.merged_into_delivery_id = None
+    main_entry.merge_order = 0
+    extra_rows = list_delivery_cart_merges_for_main(session, normalized_phone)
+    for extra_row in extra_rows:
+        extra_client = find_client_by_normalized_phone(session, extra_row.extra_phone)
+        if not extra_client:
+            continue
+        extra_entry = find_for_delivery_entry_by_phone(session, extra_row.extra_phone, lock=True)
+        if extra_entry and (
+            extra_entry.collector_user_id
+            or delivery_entry_has_collection_items(session, extra_entry)
+        ):
+            continue
+        if not extra_entry:
+            extra_entry = upsert_for_delivery_entry(
+                session,
+                extra_client.user_id,
+                extra_client.name,
+                extra_row.extra_phone,
+                "",
+                0,
+                delivery_cutoff_at=main_entry.delivery_cutoff_at,
+                apply_merges=False,
+            )
+            session.flush()
+        extra_group = get_delivery_collection_entries(session, extra_entry, lock=True)
+        for child in extra_group:
+            if child.id == main_entry.id:
+                continue
+            child.merged_into_delivery_id = main_entry.id
+            child.merge_order = extra_row.merge_order or 1
+        extra_entry.merged_into_delivery_id = main_entry.id
+        extra_entry.merge_order = extra_row.merge_order or 1
+    session.flush()
+    if not delivery_entry_has_collection_items(session, main_entry):
+        main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
+    return main_entry
+
+
+def unmerge_delivery_carts(session, main_phone, extra_phone):
+    main_phone = normalize_phone(main_phone)
+    extra_phone = normalize_phone(extra_phone)
+    merge_row = find_delivery_cart_merge_by_extra_phone(session, extra_phone)
+    if not merge_row or normalize_phone(merge_row.main_phone) != main_phone:
+        return False, "Эти корзины сейчас не объединены."
+
+    blocked_text = delivery_carts_blocked_for_merge(session, main_phone, extra_phone)
+    if blocked_text:
+        return False, blocked_text
+
+    extra_entry = find_for_delivery_entry_by_phone(session, extra_phone, lock=True)
+    unlink_for_delivery_extra_entry(session, extra_entry)
+    session.delete(merge_row)
+    session.flush()
+
+    main_entry = find_for_delivery_entry_by_phone(session, main_phone, lock=True)
+    if main_entry and not delivery_entry_has_collection_items(session, main_entry):
+        main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
+
+    extra_client = find_client_by_normalized_phone(session, extra_phone)
+    main_client = find_client_by_normalized_phone(session, main_phone)
+    return True, (
+        "Корзины разъединены.\n"
+        f"Основная: {format_client_cart_label(main_client, main_phone)}\n"
+        f"Дополнительная: {format_client_cart_label(extra_client, extra_phone)}\n"
+        "Дополнительная корзина снова собирается отдельно."
+    )
+
+
+def merge_or_unmerge_delivery_carts(session, main_phone, extra_phone_text):
+    extra_client, error_text = find_client_by_phone_input(session, extra_phone_text)
+    if error_text:
+        return False, error_text
+
+    main_phone = normalize_phone(main_phone)
+    extra_phone = normalize_phone(extra_client.phone)
+    if not main_phone or not extra_phone:
+        return False, "Введите корректные номера телефонов корзин."
+    if extra_phone == main_phone or extra_phone in phone_variants(main_phone):
+        return False, "Нельзя объединить корзину саму с собой."
+
+    existing_extra = find_delivery_cart_merge_by_extra_phone(session, extra_phone)
+    if existing_extra and normalize_phone(existing_extra.main_phone) == main_phone:
+        return unmerge_delivery_carts(session, main_phone, extra_phone)
+    if existing_extra:
+        owner_client = find_client_by_normalized_phone(session, existing_extra.main_phone)
+        return False, (
+            "Эта корзина уже объединена с "
+            f"{format_client_cart_label(owner_client, existing_extra.main_phone)}.\n"
+            "Сначала разъедините её через основную корзину и этот номер."
+        )
+
+    blocked_text = delivery_carts_blocked_for_merge(session, main_phone, extra_phone)
+    if blocked_text:
+        return False, blocked_text
+
+    nested_extras = list_delivery_cart_merges_for_main(session, extra_phone)
+    merge_order = next_delivery_cart_merge_order(session, main_phone)
+    session.add(DeliveryCartMerge(
+        main_phone=main_phone,
+        extra_phone=extra_phone,
+        merge_order=merge_order,
+        created_at=now_local(),
+    ))
+    for offset, nested in enumerate(nested_extras, start=1):
+        nested.main_phone = main_phone
+        nested.merge_order = merge_order + offset
+    session.flush()
+    apply_persistent_cart_merges_for_phone(session, main_phone)
+
+    main_client = find_client_by_normalized_phone(session, main_phone)
+    extra_labels = [
+        format_client_cart_label(
+            find_client_by_normalized_phone(session, row.extra_phone),
+            row.extra_phone,
+        )
+        for row in list_delivery_cart_merges_for_main(session, main_phone)
+    ]
+    main_entry = find_for_delivery_entry_by_phone(session, main_phone)
+    extra_entry = find_for_delivery_entry_by_phone(session, extra_phone)
+    status_line = (
+        "В списке сборки будет показана только основная корзина, а товары дополнительной пойдут в конце."
+        if main_entry
+        else "Когда основная корзина попадёт в список сборки, дополнительная тоже будет добавлена."
+    )
+    if extra_entry and not main_entry:
+        status_line = (
+            "Дополнительная корзина уже в списке сборки. "
+            "Когда основная тоже попадёт в сборку, они соберутся вместе."
+        )
+    return True, (
+        "Корзины объединены.\n"
+        f"Основная: {format_client_cart_label(main_client, main_phone)}\n"
+        f"Дополнительные: {', '.join(extra_labels)}\n"
+        f"{status_line}"
+    )
+
+
+def merge_delivery_cart_entries(session, main_delivery_id, extra_phone_text):
+    main_entry = session.query(ForDelivery).filter(
+        ForDelivery.id == main_delivery_id,
+    ).first()
+    if not main_entry:
+        return False, "Основная корзина уже обработана или удалена из списка доставки."
+    return merge_or_unmerge_delivery_carts(session, main_entry.phone, extra_phone_text)
+
+
 def find_delivery_entry_by_phone_input(session, raw_phone):
     normalized_phone = normalize_phone(raw_phone)
     if not normalized_phone:
@@ -8460,76 +8836,6 @@ def delivery_entries_have_placed_items(session, delivery_entries):
         DeliveryCollectionItem.delivery_id.in_(delivery_ids),
         DeliveryCollectionItem.placed_at != None,
     ).first() is not None
-
-
-def merge_delivery_cart_entries(session, main_delivery_id, extra_phone_text):
-    main_entry = session.query(ForDelivery).filter(
-        ForDelivery.id == main_delivery_id,
-    ).with_for_update().first()
-    if not main_entry:
-        return False, "Основная корзина уже обработана или удалена из списка доставки."
-
-    main_entry = get_delivery_root_entry(session, main_entry, lock=True)
-    if not main_entry:
-        return False, "Основная корзина не найдена."
-
-    extra_entry, error_text = find_delivery_entry_by_phone_input(session, extra_phone_text)
-    if error_text:
-        return False, error_text
-
-    extra_entry = session.query(ForDelivery).filter(
-        ForDelivery.id == extra_entry.id,
-    ).with_for_update().first()
-    if not extra_entry:
-        return False, "Дополнительная корзина уже обработана или удалена из списка доставки."
-
-    extra_root = get_delivery_root_entry(session, extra_entry, lock=True)
-    if not extra_root:
-        return False, "Дополнительная корзина не найдена."
-
-    if extra_root.id == main_entry.id:
-        return False, "Эти корзины уже объединены."
-
-    main_entries = get_delivery_collection_entries(session, main_entry, lock=True)
-    extra_entries = get_delivery_collection_entries(session, extra_root, lock=True)
-    blocked_entry = next(
-        (
-            entry
-            for entry in [*main_entries, *extra_entries]
-            if entry.collector_user_id
-        ),
-        None,
-    )
-    if blocked_entry:
-        return False, (
-            "Нельзя объединить корзины, которые уже открыты на сборку. "
-            f"Сейчас корзину {format_delivery_entry_label(blocked_entry)} собирает "
-            f"{blocked_entry.collector_name or f'ID {blocked_entry.collector_user_id}'}."
-        )
-    if delivery_entries_have_placed_items(session, [*main_entries, *extra_entries]):
-        return False, "Нельзя объединить корзины, где уже нажимали «Положил»."
-
-    max_order = session.query(func.max(ForDelivery.merge_order)).filter(
-        ForDelivery.merged_into_delivery_id == main_entry.id,
-    ).scalar() or 0
-
-    main_entry.merged_into_delivery_id = None
-    main_entry.merge_order = 0
-    for offset, entry in enumerate(extra_entries, start=1):
-        if entry.id == main_entry.id:
-            continue
-        entry.merged_into_delivery_id = main_entry.id
-        entry.merge_order = max_order + offset
-
-    session.flush()
-    main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
-    extra_labels = ", ".join(format_delivery_entry_label(entry) for entry in extra_entries)
-    return True, (
-        "Корзины объединены.\n"
-        f"Основная: {format_delivery_entry_label(main_entry)}\n"
-        f"Дополнительная: {extra_labels}\n"
-        "В списке сборки будет показана только основная корзина, а товары дополнительной пойдут в конце."
-    )
 
 
 def allocate_delivery_amounts(rows_payload, manual_total_sum=None):
@@ -8901,6 +9207,7 @@ def build_delivery_collection_report_items_from_collection_items(collection_item
             "unit_index": item.unit_index,
             "author": None,
             "placed_count": max(int(item.quantity or 0), 1) if item.placed_at else 0,
+            "unplaced_item_ids": [] if item.placed_at else ([item.id] if item.id else []),
         }
         for item in collection_items
     ]
@@ -8932,6 +9239,7 @@ def group_delivery_collection_report_items(items):
                 "created_at": item.get("created_at"),
                 "author": item.get("author"),
                 "placed_count": 0,
+                "unplaced_item_ids": [],
             }
             grouped_by_key[item_key] = grouped_item
             grouped_items.append(grouped_item)
@@ -8941,6 +9249,7 @@ def group_delivery_collection_report_items(items):
         grouped_item["quantity"] += max(int(item.get("quantity") or 0), 1)
         grouped_item["total_price"] += max(int(item.get("total_price") or item.get("unit_price") or 0), 0)
         grouped_item["placed_count"] += max(int(item.get("placed_count") or 0), 0)
+        grouped_item["unplaced_item_ids"].extend(item.get("unplaced_item_ids") or [])
 
     return grouped_items
 
@@ -8958,17 +9267,30 @@ def build_delivery_collection_report_header(context, grouped_items):
     ])
 
 
-def format_delivery_collection_report_item_status(item):
+def format_delivery_collection_report_item_status(item, collection_finished=False):
     quantity = max(int(item.get("quantity") or 0), 1)
     placed_count = max(int(item.get("placed_count") or 0), 0)
-    if placed_count <= 0:
-        return "⏳ Не положил"
     if placed_count >= quantity:
-        return "✅ Положил"
-    return f"🟡 Положил {placed_count}/{quantity}"
+        return "✅ Нашли"
+    if placed_count > 0:
+        return f"✅ Нашли {placed_count}/{quantity}"
+    if collection_finished:
+        return "❌ Не нашли"
+    return "⏳ Собирается"
 
 
-def build_delivery_collection_report_item_caption(context, item):
+def build_delivery_collection_report_item_keyboard(item, collection_finished=False):
+    if not collection_finished:
+        return None
+    unplaced_item_ids = [item_id for item_id in (item.get("unplaced_item_ids") or []) if item_id]
+    if not unplaced_item_ids:
+        return None
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("НАШЛИ!", callback_data=f"delivery_report_found_{unplaced_item_ids[0]}"))
+    return keyboard
+
+
+def build_delivery_collection_report_item_caption(context, item, collection_finished=False):
     return "\n".join([
         f"Id товара: {item['post_id']}",
         f"Номер телефона клиента: {item.get('phone') or context['phone'] or 'не указан'}",
@@ -8977,7 +9299,7 @@ def build_delivery_collection_report_item_caption(context, item):
         f"Описание товара: {item['description']}",
         f"Сумма товара: {item['total_price']} ₽",
         f"Количество: {item['quantity']}",
-        f"Статус: {format_delivery_collection_report_item_status(item)}",
+        f"Статус: {format_delivery_collection_report_item_status(item, collection_finished=collection_finished)}",
     ])
 
 
@@ -9044,11 +9366,17 @@ def send_delivery_collection_report_message(text):
             raise
 
 
-def send_delivery_collection_report_photo_or_text(photo, text):
+def send_delivery_collection_report_photo_or_text(photo, text, reply_markup=None):
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            return send_photo_or_text(bot, delivery_collection_report_target_group_id, photo, text)
+            return send_photo_or_text(
+                bot,
+                delivery_collection_report_target_group_id,
+                photo,
+                text,
+                reply_markup=reply_markup,
+            )
         except Exception as exc:
             migrate_to_chat_id = telegram_migrate_to_chat_id(exc)
             if attempt == 1 and update_delivery_collection_report_group_id(migrate_to_chat_id):
@@ -9125,6 +9453,17 @@ def load_delivery_collection_report_group_item(session, collection_item_ids):
     return build_delivery_collection_report_group_item_from_items(collection_items)
 
 
+def delivery_collection_report_is_finished(session, items):
+    delivery_ids = {
+        int(item.delivery_id)
+        for item in (items or [])
+        if item and item.delivery_id
+    }
+    if not delivery_ids:
+        return True
+    return session.query(ForDelivery.id).filter(ForDelivery.id.in_(delivery_ids)).first() is None
+
+
 def get_delivery_collection_report_item_for_send(item):
     collection_item_ids = item.get("collection_item_ids") or []
     if not collection_item_ids:
@@ -9150,6 +9489,7 @@ def edit_delivery_collection_report_item_message(item):
         grouped_item = build_delivery_collection_report_group_item_from_items(related_items)
         if not grouped_item:
             return False
+        collection_finished = delivery_collection_report_is_finished(session, related_items)
         context = {
             "name": related_items[0].user_name if related_items else None,
             "phone": related_items[0].phone if related_items else None,
@@ -9159,7 +9499,15 @@ def edit_delivery_collection_report_item_message(item):
         message_id = item.report_message_id
         message_has_photo = bool(item.report_message_has_photo)
 
-    caption = build_delivery_collection_report_item_caption(context, grouped_item)
+    caption = build_delivery_collection_report_item_caption(
+        context,
+        grouped_item,
+        collection_finished=collection_finished,
+    )
+    reply_markup = build_delivery_collection_report_item_keyboard(
+        grouped_item,
+        collection_finished=collection_finished,
+    )
     if message_has_photo:
         edited_caption = safe_edit_message_caption(
             bot,
@@ -9167,6 +9515,7 @@ def edit_delivery_collection_report_item_message(item):
             chat_id=chat_id,
             message_id=message_id,
             caption=caption,
+            reply_markup=reply_markup,
         )
         if edited_caption is not None:
             return True
@@ -9178,6 +9527,7 @@ def edit_delivery_collection_report_item_message(item):
         chat_id=chat_id,
         message_id=message_id,
         text=caption,
+        reply_markup=reply_markup,
     ) is not None
 
 
@@ -9307,46 +9657,29 @@ def sort_delivery_collection_items(items):
 
 
 def get_or_create_delivery_collection_items(session, delivery_entry):
-    delivery_entries = get_delivery_collection_entries(session, delivery_entry)
-    delivery_order = {
-        entry.id: index
-        for index, entry in enumerate(delivery_entries)
-        if entry and entry.id
-    }
-    delivery_ids = list(delivery_order.keys())
-    if not delivery_ids:
-        return []
-
+    delivery_entry = get_delivery_root_entry(session, delivery_entry) or delivery_entry
     existing_items = session.query(DeliveryCollectionItem).filter(
-        DeliveryCollectionItem.delivery_id.in_(delivery_ids),
+        DeliveryCollectionItem.delivery_id == delivery_entry.id,
     ).all()
+    if existing_items:
+        for item in existing_items:
+            apply_delivery_collection_entry_to_item(item, delivery_entry)
+        return sort_delivery_collection_items(existing_items)
+
     cart_items = get_delivery_entry_cart_items(session, delivery_entry)
-    existing_by_key = {
-        (int(item.reservation_id), int(item.unit_index or 0)): item
-        for item in existing_items
-    }
-    result = []
-    result_keys = set()
-
-    for item in existing_items:
-        item._delivery_order = delivery_order.get(item.delivery_id, 0)
-        apply_delivery_collection_entry_to_item(item, delivery_entry)
-
     cart_items_by_key = {
         delivery_collection_cart_item_key(cart_item): cart_item
         for cart_item in cart_items
     }
-    missing_keys = [key for key in cart_items_by_key if key not in existing_by_key]
-    missing_existing_by_key = find_delivery_collection_items_by_keys(session, missing_keys)
-    existing_by_key.update(missing_existing_by_key)
-
+    existing_by_key = find_delivery_collection_items_by_keys(session, list(cart_items_by_key))
+    items = []
     for key, cart_item in cart_items_by_key.items():
         item = existing_by_key.get(key)
         if item:
+            item.delivery_id = delivery_entry.id
             apply_delivery_collection_entry_to_item(item, delivery_entry)
-            item._delivery_order = delivery_order.get(item.delivery_id, cart_item.get("source_delivery_order", 0))
-            result.append(item)
-            result_keys.add(key)
+            item._delivery_order = cart_item.get("source_delivery_order", 0)
+            items.append(item)
             continue
 
         item = build_delivery_collection_item_from_cart(delivery_entry, cart_item)
@@ -9359,22 +9692,13 @@ def get_or_create_delivery_collection_items(session, delivery_entry):
             item = find_delivery_collection_items_by_keys(session, [key]).get(key)
             if not item:
                 raise
+            item.delivery_id = delivery_entry.id
             apply_delivery_collection_entry_to_item(item, delivery_entry)
-            item._delivery_order = delivery_order.get(item.delivery_id, cart_item.get("source_delivery_order", 0))
-        result.append(item)
-        result_keys.add(key)
-
-    for key, item in existing_by_key.items():
-        if key in result_keys:
-            continue
-        if item.delivery_id not in delivery_ids:
-            continue
-        apply_delivery_collection_entry_to_item(item, delivery_entry)
-        item._delivery_order = delivery_order.get(item.delivery_id, 0)
-        result.append(item)
+            item._delivery_order = cart_item.get("source_delivery_order", 0)
+        items.append(item)
 
     session.flush()
-    return sort_delivery_collection_items(result)
+    return sort_delivery_collection_items(items)
 
 
 def delivery_collection_cart_item_key(cart_item):
@@ -9408,7 +9732,7 @@ def apply_delivery_collection_entry_to_item(item, delivery_entry):
 
 def build_delivery_collection_item_from_cart(delivery_entry, cart_item):
     return DeliveryCollectionItem(
-        delivery_id=cart_item.get("source_delivery_id") or delivery_entry.id,
+        delivery_id=delivery_entry.id,
         reservation_id=cart_item["reservation_id"],
         unit_index=cart_item.get("unit_index", 0),
         post_id=cart_item["post_id"],
@@ -9586,6 +9910,27 @@ def mark_delivery_collection_items_collector_sheet_result(session, delivery_id, 
     ).update(values, synchronize_session=False)
 
 
+def get_delivery_sheet_phone(session, phone=None, delivery_entry=None, item=None):
+    entry = delivery_entry
+    if entry is None and item is not None and item.delivery_id:
+        entry = session.query(ForDelivery).filter(ForDelivery.id == item.delivery_id).first()
+    if entry:
+        root = get_delivery_root_entry(session, entry) or entry
+        if root.phone:
+            return normalize_phone(root.phone) or root.phone
+
+    source_phone = phone
+    if not source_phone and item is not None:
+        source_phone = item.phone
+    normalized = normalize_phone(source_phone)
+    if not normalized:
+        return source_phone
+    owner_merge = find_delivery_cart_merge_by_extra_phone(session, normalized)
+    if owner_merge and owner_merge.main_phone:
+        return owner_merge.main_phone
+    return normalized
+
+
 def add_delivery_collector_name_to_sheet(delivery_id):
     with Session(bind=engine, expire_on_commit=False) as session:
         delivery_entry = session.query(ForDelivery).filter(
@@ -9598,7 +9943,7 @@ def add_delivery_collector_name_to_sheet(delivery_id):
                 session.commit()
                 return True, delivery_entry
             source_id = None
-            phone = delivery_entry.phone
+            phone = get_delivery_sheet_phone(session, delivery_entry=delivery_entry)
             collector_name = delivery_entry.collector_name
             source = delivery_entry
         else:
@@ -9613,7 +9958,7 @@ def add_delivery_collector_name_to_sheet(delivery_id):
             if not item:
                 return True, None
             source_id = item.id
-            phone = item.phone
+            phone = get_delivery_sheet_phone(session, item=item)
             collector_name = item.collector_name
             source = item
         if not collector_name:
@@ -9706,7 +10051,7 @@ def add_collection_item_amount_to_sheet(item_id):
             return True, item
         if not item.placed_at:
             return False, item
-        phone = item.phone
+        phone = get_delivery_sheet_phone(session, item=item)
         amount = item.amount
 
     db_lock_connection = None
@@ -9927,9 +10272,8 @@ def parse_delivery_collection_callback(data, prefix):
 
 
 def calculate_delivery_entry_actual_total(session, delivery_entry):
-    delivery_ids = get_delivery_collection_entry_ids(session, delivery_entry)
     existing_items = session.query(DeliveryCollectionItem).filter(
-        DeliveryCollectionItem.delivery_id.in_(delivery_ids or [delivery_entry.id]),
+        DeliveryCollectionItem.delivery_id == delivery_entry.id,
     ).all()
     if existing_items:
         return sum(max(int(item.amount or 0), 0) for item in existing_items)
@@ -9965,8 +10309,16 @@ def build_delivery_collection_button_text(row):
 def build_delivery_collection_keyboard(session, page=0):
     deduplicate_for_delivery_entries(session)
     session.flush()
-    total_count = session.query(ForDelivery).count()
-    rows = session.query(ForDelivery).order_by(
+    for root_entry in session.query(ForDelivery).filter(
+        ForDelivery.merged_into_delivery_id == None,
+    ).order_by(ForDelivery.id.asc()).all():
+        apply_persistent_cart_merges_for_phone(session, root_entry.phone)
+    session.flush()
+    visible_query = session.query(ForDelivery).filter(
+        ForDelivery.merged_into_delivery_id == None,
+    )
+    total_count = visible_query.count()
+    rows = visible_query.order_by(
         ForDelivery.name,
         ForDelivery.phone,
         ForDelivery.id,
@@ -10122,6 +10474,8 @@ def show_delivery_collection_client(call):
             safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
             return
 
+        delivery_entry = get_delivery_root_entry(session, delivery_entry, lock=True) or delivery_entry
+        delivery_id = delivery_entry.id
         claimed, collector_name = claim_delivery_collection_entry(session, delivery_entry, call.from_user)
         if not claimed:
             session.commit()
@@ -10246,6 +10600,21 @@ def mark_delivery_collection_item_placed(call):
             ForDelivery.id == item.delivery_id,
         ).with_for_update().first()
         if not delivery_entry:
+            live_entries = session.query(ForDelivery).filter(
+                ForDelivery.collector_user_id == call.from_user.id,
+            ).with_for_update().all()
+            if item.phone:
+                phone_set = set(phone_variants(item.phone))
+                phone_matches = [
+                    entry for entry in live_entries
+                    if normalize_phone(entry.phone) in phone_set or entry.phone in phone_set
+                ]
+                if phone_matches:
+                    live_entries = phone_matches
+            if live_entries:
+                delivery_entry = get_delivery_root_entry(session, live_entries[0], lock=True) or live_entries[0]
+                item.delivery_id = delivery_entry.id
+        if not delivery_entry:
             safe_answer_callback_query(call.id, "Сборка уже завершена или удалена.", show_alert=True)
             return
         if delivery_entry.collector_user_id and int(delivery_entry.collector_user_id) != int(call.from_user.id):
@@ -10273,6 +10642,138 @@ def mark_delivery_collection_item_placed(call):
 
     if not sheet_ok:
         logger.warning("Delivery item marked placed but Sheets update is pending item_id=%s", item_id)
+
+
+def recover_missing_delivery_collection_items(item_id, telegram_user):
+    recovered_ids = []
+    notify_items = []
+    report_item = None
+    with Session(bind=engine, expire_on_commit=False) as session:
+        item = session.query(DeliveryCollectionItem).filter(
+            DeliveryCollectionItem.id == item_id,
+        ).with_for_update().first()
+        if not item:
+            return False, "Товар не найден.", []
+
+        if item.report_message_chat_id and item.report_message_id:
+            related_items = session.query(DeliveryCollectionItem).filter(
+                DeliveryCollectionItem.report_message_chat_id == item.report_message_chat_id,
+                DeliveryCollectionItem.report_message_id == item.report_message_id,
+                DeliveryCollectionItem.placed_at == None,
+            ).with_for_update().all()
+        else:
+            related_items = [item] if not item.placed_at else []
+
+        if not related_items:
+            return False, "Этот товар уже отмечен как найденный.", []
+
+        live_entry = session.query(ForDelivery).filter(
+            ForDelivery.id == item.delivery_id,
+        ).first()
+        collector_name = get_delivery_collector_name(session, telegram_user)
+        admin_user_id = getattr(telegram_user, "id", None)
+
+        for collection_item in related_items:
+            if collection_item.placed_at:
+                continue
+            collection_item.placed_at = now_local()
+            collection_item.collector_user_id = admin_user_id
+            collection_item.collector_name = collector_name
+            recovered_ids.append(collection_item.id)
+            if live_entry:
+                continue
+
+            session.add(InDelivery(
+                reservation_id=collection_item.reservation_id,
+                post_id=collection_item.post_id,
+                user_id=collection_item.user_id,
+                user_name=collection_item.user_name or "Имя не указано",
+                item_description=collection_item.item_description,
+                quantity=collection_item.quantity or 1,
+                price=collection_item.amount or 0,
+                delivery_address=collection_item.delivery_address or "",
+            ))
+            session.add(Temp_Fulfilled(
+                reservation_id=collection_item.reservation_id,
+                post_id=collection_item.post_id,
+                user_id=collection_item.user_id,
+                user_name=collection_item.user_name or "Имя не указано",
+                item_description=collection_item.item_description,
+                quantity=collection_item.quantity or 1,
+                price=collection_item.amount or 0,
+                in_delivery=True,
+                created_at=now_local(),
+            ))
+            missing_item = session.query(MissingDeliveryItem).filter(
+                MissingDeliveryItem.reservation_id == collection_item.reservation_id,
+                MissingDeliveryItem.unit_index == collection_item.unit_index,
+                MissingDeliveryItem.status == MISSING_DELIVERY_STATUS_MISSING,
+            ).with_for_update().first()
+            if not missing_item:
+                missing_item = session.query(MissingDeliveryItem).filter(
+                    MissingDeliveryItem.post_id == collection_item.post_id,
+                    MissingDeliveryItem.user_id == collection_item.user_id,
+                    MissingDeliveryItem.unit_index == collection_item.unit_index,
+                    MissingDeliveryItem.status == MISSING_DELIVERY_STATUS_MISSING,
+                ).with_for_update().first()
+            if missing_item:
+                missing_item.status = MISSING_DELIVERY_STATUS_FOUND
+                missing_item.resolved_at = now_local()
+                missing_item.resolved_by_user_id = admin_user_id
+            notify_items.append(collection_item)
+
+        session.commit()
+        report_item = related_items[0]
+        if not live_entry:
+            for collection_item in notify_items:
+                sheet_phone = get_delivery_sheet_phone(session, item=collection_item)
+                collection_item._found_final_sum = get_in_delivery_total_for_phones(
+                    session,
+                    [sheet_phone, collection_item.phone],
+                    collection_item.user_id,
+                )
+                collection_item._found_notify_user_ids = sorted({
+                    uid
+                    for uid in [
+                        collection_item.user_id,
+                        *get_related_delivery_user_ids_by_phone(session, sheet_phone, collection_item.user_id),
+                        *get_related_delivery_user_ids_by_phone(session, collection_item.phone, collection_item.user_id),
+                    ]
+                    if uid
+                })
+
+    for recovered_id in recovered_ids:
+        add_collection_item_amount_to_sheet(recovered_id)
+    if report_item:
+        edit_delivery_collection_item_message(report_item)
+        edit_delivery_collection_report_item_message(report_item)
+    for collection_item in notify_items:
+        final_sum = getattr(collection_item, "_found_final_sum", collection_item.amount or 0)
+        text = build_found_delivery_item_client_text(collection_item, final_sum)
+        notify_user_ids = getattr(collection_item, "_found_notify_user_ids", None) or [collection_item.user_id]
+        for user_id in notify_user_ids:
+            send_delivery_client_notice(user_id, text, photo=collection_item.photo)
+
+    return True, "Товар отмечен как найденный и добавлен клиенту.", recovered_ids
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_report_found_"))
+def mark_delivery_report_item_found(call):
+    if not has_role(call.from_user.id, ADMIN_ROLES):
+        safe_answer_callback_query(
+            call.id,
+            "Кнопка доступна только администратору и создателю.",
+            show_alert=True,
+        )
+        return
+
+    item_id = parse_callback_int_suffix(call, "delivery_report_found_")
+    if item_id is None:
+        return
+    safe_answer_callback_query(call.id, "Отмечаю товар как найденный.")
+    success, message_text, _recovered_ids = recover_missing_delivery_collection_items(item_id, call.from_user)
+    if not success:
+        safe_send_message(bot, call.from_user.id, f"❌ {message_text}", logger=logger)
 
 
 def move_for_delivery_to_in_delivery(delivery_id, manual_total_sum=None, collector_user_id=None):
@@ -10379,6 +10880,129 @@ def build_unplaced_delivery_items_text(items):
     return "\n".join(lines)
 
 
+def serialize_delivery_collection_item_notice(item):
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "user_name": item.user_name,
+        "phone": item.phone,
+        "post_id": item.post_id,
+        "photo": item.photo,
+        "description": item.item_description,
+        "amount": max(int(item.amount or 0), 0),
+        "quantity": max(int(item.quantity or 0), 1),
+    }
+
+
+def build_delivery_collection_client_notice(delivery_entry, placed_items, unplaced_items):
+    return {
+        "main_user_id": delivery_entry.user_id,
+        "phone": delivery_entry.phone,
+        "name": delivery_entry.name,
+        "placed_sum": delivery_collection_items_amount(placed_items),
+        "user_ids": sorted({
+            int(item.user_id)
+            for item in [*placed_items, *unplaced_items]
+            if item and item.user_id
+        } | ({int(delivery_entry.user_id)} if delivery_entry.user_id else set())),
+        "missing_items": [serialize_delivery_collection_item_notice(item) for item in unplaced_items],
+        "report_item_ids": [
+            item.id
+            for item in [*placed_items, *unplaced_items]
+            if item and item.id
+        ],
+    }
+
+
+def send_delivery_client_notice(user_id, text, photo=None):
+    if not user_id or not text:
+        return False
+    try:
+        if photo:
+            send_photo_or_text(bot, user_id, photo, text)
+        else:
+            safe_send_message(bot, user_id, text, logger=logger)
+        return True
+    except Exception as exc:
+        logger.warning("Delivery client notice failed user_id=%s: %s", user_id, exc)
+        return False
+
+
+def build_missing_delivery_item_client_text(item):
+    return "\n".join([
+        "Этот товар во время сборки мы не нашли.",
+        "",
+        f"Цена: {item['amount']} ₽",
+        f"Описание: {item['description']}",
+    ])
+
+
+def build_found_delivery_item_client_text(item, final_sum):
+    return "\n".join([
+        "Этот товар нашли и добавили в вашу корзину.",
+        "",
+        f"Цена: {item.amount} ₽",
+        f"Описание: {item.item_description}",
+        "",
+        f"Окончательная сумма корзины: {final_sum} ₽",
+    ])
+
+
+def notify_client_after_delivery_collection(notice):
+    if not notice:
+        return
+    final_sum = max(int(notice.get("placed_sum") or 0), 0)
+    final_text = f"Сборка вашей доставки завершена.\nОкончательная сумма корзины: {final_sum} ₽"
+    for user_id in notice.get("user_ids") or []:
+        send_delivery_client_notice(user_id, final_text)
+        time.sleep(0.2)
+
+    main_user_id = notice.get("main_user_id")
+    for item in notice.get("missing_items") or []:
+        text = build_missing_delivery_item_client_text(item)
+        targets = {item.get("user_id"), main_user_id}
+        for user_id in targets:
+            if not user_id:
+                continue
+            send_delivery_client_notice(user_id, text, photo=item.get("photo"))
+            time.sleep(0.3)
+
+
+def refresh_delivery_collection_report_after_finish(item_ids):
+    item_ids = [int(item_id) for item_id in (item_ids or []) if item_id]
+    if not item_ids:
+        return
+    seen_messages = set()
+    with Session(bind=engine) as session:
+        items = session.query(DeliveryCollectionItem).filter(
+            DeliveryCollectionItem.id.in_(item_ids),
+        ).all()
+        for item in items:
+            message_key = (item.report_message_chat_id, item.report_message_id)
+            if not item.report_message_id or message_key in seen_messages:
+                continue
+            seen_messages.add(message_key)
+            edit_delivery_collection_report_item_message(item)
+
+
+def get_in_delivery_total_for_phones(session, phones, fallback_user_id=None):
+    user_ids = set()
+    add_user_id_to_set(user_ids, fallback_user_id)
+    for phone in phones:
+        for user_id in get_related_delivery_user_ids_by_phone(session, phone, fallback_user_id):
+            add_user_id_to_set(user_ids, user_id)
+    if not user_ids:
+        return 0
+    total = session.query(func.coalesce(func.sum(InDelivery.price), 0)).filter(
+        InDelivery.user_id.in_(sorted(user_ids)),
+    ).scalar()
+    return int(total or 0)
+
+
+def get_in_delivery_total_for_phone(session, phone, fallback_user_id=None):
+    return get_in_delivery_total_for_phones(session, [phone], fallback_user_id)
+
+
 def delivery_collection_items_quantity(items):
     return sum(max(int(item.quantity or 0), 1) for item in items)
 
@@ -10400,13 +11024,16 @@ def mark_temp_fulfilled_in_delivery_for_items(session, reservation, placed_items
 
 def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplaced_to_missing=False):
     affected_missing_post_ids = set()
-    with Session(bind=engine) as session:
+    client_notice = None
+    with Session(bind=engine, expire_on_commit=False) as session:
         delivery_entry = session.query(ForDelivery).filter(
             ForDelivery.id == delivery_id,
         ).with_for_update().first()
         if not delivery_entry:
             return False, "Клиент уже обработан или удалён из списка.", 0, 0
 
+        delivery_entry = get_delivery_root_entry(session, delivery_entry, lock=True) or delivery_entry
+        delivery_id = delivery_entry.id
         if (
             collector_user_id
             and delivery_entry.collector_user_id
@@ -10500,8 +11127,25 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
                 sheet_error=delivery_entry.collector_sheet_error or "Ожидает повторной записи Google Sheets",
             )
 
+        client_notice = build_delivery_collection_client_notice(delivery_entry, placed_items, unplaced_items)
+
+        for extra_entry in get_delivery_collection_entries(session, delivery_entry, lock=True):
+            if extra_entry.id == delivery_entry.id:
+                continue
+            if delivery_entry_has_collection_items(session, extra_entry):
+                extra_entry.merged_into_delivery_id = None
+                extra_entry.merge_order = 0
+                extra_entry.collector_user_id = None
+                extra_entry.collector_name = None
+                extra_entry.collection_started_at = None
+                continue
+            session.delete(extra_entry)
         session.delete(delivery_entry)
         session.commit()
+
+    if client_notice:
+        refresh_delivery_collection_report_after_finish(client_notice.get("report_item_ids"))
+        notify_client_after_delivery_collection(client_notice)
 
     for post_id in affected_missing_post_ids:
         post = Posts.get_row_by_id(post_id)

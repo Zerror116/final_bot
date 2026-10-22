@@ -154,6 +154,18 @@ def test_delivery_cutoff_markers():
         "delivery yes state must be set after stale offer buttons are removed",
     )
 
+    if "Вы уже начали оформление доставки." in yes_block:
+        raise AssertionError("delivery yes must continue checkout instead of blocking on an in-progress state")
+    for marker in [
+        "DELIVERY_CHECKOUT_STATES",
+        "user_state_in(user_id, DELIVERY_CHECKOUT_STATES)",
+    ]:
+        if marker not in yes_block:
+            raise AssertionError(f"delivery yes resume marker missing {marker}")
+
+    address_header = main_text.split("def handle_address_input(message):", 1)[0][-500:]
+    if "user_state_in(message.chat.id, DELIVERY_ADDRESS_INPUT_STATES)" not in address_header:
+        raise AssertionError("delivery address handler must accept all checkout address states")
     address_block = main_text.split("def handle_address_input(message):", 1)[1].split(
         "@bot.message_handler(commands=[\"empty_delivery\"])",
         1,
@@ -163,6 +175,8 @@ def test_delivery_cutoff_markers():
         "if not confirmation_message:",
         "Delivery confirmation prompt was not sent for user_id=%s",
         "set_user_state(user_id, \"WAITING_FOR_CONFIRMATION\")",
+        "same_phone_users = [user_data]",
+        "Не удалось отправить подтверждение. Отправьте адрес ещё раз.",
     ]:
         if marker not in address_block:
             raise AssertionError(f"delivery address state block missing {marker}")
@@ -318,6 +332,7 @@ def test_callback_answers_are_safe():
         'user_id = parse_callback_int_suffix(call, "demote_")',
         'page = parse_callback_int_suffix(call, "delivery_page_", "Некорректная страница.")',
         'item_id = parse_callback_int_suffix(call, "delivery_item_placed_")',
+        'item_id = parse_callback_int_suffix(call, "delivery_report_found_")',
         'delivery_id = parse_callback_int_suffix(call, "delivery_collected_")',
         'delivery_id = parse_callback_int_suffix(call, "delivery_finish_confirm_")',
         'delivery_id = parse_callback_int_suffix(call, "delivery_finish_continue_")',
@@ -793,6 +808,8 @@ def test_all_callback_handlers_answer_before_slow_work():
         "return_missing_item_to_cart",
         "return_missing_item_to_channel",
         "add_collection_item_amount_to_sheet",
+        "recover_missing_delivery_collection_items",
+        "notify_client_after_delivery_collection",
         "add_delivery_collector_name_to_sheet",
         "send_user_orders_page",
         "send_delivery_orders_page",
@@ -1027,6 +1044,8 @@ def test_state_text_handlers_reject_non_text_messages():
         "def handle_new_phone(message):",
         "def handle_defect_reason(message):",
         "def handle_discount_amount(message):",
+        "def handle_delivery_cart_merge_main_input(message):",
+        "def handle_delivery_cart_merge_extra_input(message):",
     ]
     for signature in handler_signatures:
         block = main_text.split(signature, 1)[1].split("\n@bot.", 1)[0]
@@ -1863,6 +1882,70 @@ def test_delivery_clients_summary_markers():
             raise AssertionError(f"delivery clients summary marker missing {marker}")
 
 
+def test_delivery_cart_merge_works_without_for_delivery_rows():
+    main_text = MAIN.read_text(encoding="utf-8")
+    db_init_text = (ROOT / "db" / "__init__.py").read_text(encoding="utf-8")
+    model_text = (ROOT / "db" / "delivery_cart_merges.py").read_text(encoding="utf-8")
+
+    for marker in [
+        "class DeliveryCartMerge(AbstractModel):",
+        '__tablename__ = "delivery_cart_merges"',
+        'UniqueConstraint("extra_phone", name="uq_delivery_cart_merges_extra_phone")',
+        "main_phone = mapped_column(String, nullable=False)",
+        "extra_phone = mapped_column(String, nullable=False)",
+    ]:
+        if marker not in model_text:
+            raise AssertionError(f"delivery cart merge model marker missing {marker}")
+
+    for marker in [
+        "from .delivery_cart_merges import DeliveryCartMerge",
+        '"027_delivery_cart_merges"',
+        "def ensure_delivery_cart_merges():",
+        "INSERT INTO delivery_cart_merges (main_phone, extra_phone, merge_order, created_at)",
+        "child.merged_into_delivery_id IS NOT NULL",
+    ]:
+        if marker not in db_init_text:
+            raise AssertionError(f"delivery cart merge migration marker missing {marker}")
+
+    for marker in [
+        "def find_client_by_phone_input(session, raw_phone):",
+        "def merge_or_unmerge_delivery_carts(session, main_phone, extra_phone_text):",
+        "def unmerge_delivery_carts(session, main_phone, extra_phone):",
+        "def apply_persistent_cart_merges_for_phone(session, phone):",
+        "apply_merges=True",
+        "apply_persistent_cart_merges_for_phone(session, delivery_entry.phone)",
+        "apply_persistent_cart_merges_for_phone(session, root_entry.phone)",
+        "Корзины разъединены.",
+        "Когда основная корзина попадёт в список сборки, дополнительная тоже будет добавлена.",
+        "Если введёте уже объединённый номер, корзины разъединятся.",
+        'required_fields=("main_phone",)',
+        "Данные объединения потерялись. Нажмите «Объединить корзины» заново.",
+        "upsert_for_delivery_entry(",
+        "apply_merges=False",
+        "def get_delivery_sheet_phone(",
+        "get_delivery_sheet_phone(session, item=item)",
+        "find_delivery_cart_merge_by_extra_phone(session, normalized)",
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"delivery cart merge flow marker missing {marker}")
+
+    extra_block = main_text.split("def handle_delivery_cart_merge_extra_input(", 1)[1].split(
+        "@bot.message_handler",
+        1,
+    )[0]
+    assert_marker_order(
+        extra_block,
+        "get_temp_user_data_or_reset(",
+        "merge_or_unmerge_delivery_carts(",
+        "delivery cart merge extra step must keep main phone before merge/unmerge",
+    )
+    if "find_delivery_entry_by_phone_input(session, text)" in main_text.split(
+        "def handle_delivery_cart_merge_main_input(",
+        1,
+    )[1].split("def handle_delivery_cart_merge_extra_input(", 1)[0]:
+        raise AssertionError("main cart merge must look up clients, not only for_delivery rows")
+
+
 def test_delivery_collection_pauses_reserved_group_flow():
     text = MAIN.read_text(encoding="utf-8")
     for marker in [
@@ -2078,6 +2161,7 @@ def test_delivery_collection_item_and_missing_markers():
         "def build_delivery_collection_finish_keyboard(",
         "def mark_delivery_collection_item_placed(",
         "add_collection_item_amount_to_sheet",
+        "def get_delivery_sheet_phone(",
         "add_delivery_collector_name_to_sheet",
         "update_delivery_collection_items_collector",
         "mark_delivery_collection_items_collector_sheet_result",
@@ -2164,6 +2248,10 @@ def test_delivery_collection_item_and_missing_markers():
     )[0]
     if item_sheet_block.count("Session(bind=engine, expire_on_commit=False)") < 2:
         raise AssertionError("delivery item sheet update must return non-expired collection item objects")
+    if "get_delivery_sheet_phone(session, item=item)" not in item_sheet_block:
+        raise AssertionError("delivery item sheet update must write amounts to the main cart phone")
+    if "phone = item.phone" in item_sheet_block:
+        raise AssertionError("delivery item sheet update must not use extra cart phone")
 
     snapshot_block = main_text.split("def get_or_create_delivery_collection_items(", 1)[1].split(
         "def build_delivery_collection_item_caption(",
@@ -2188,6 +2276,7 @@ def test_delivery_collection_item_and_missing_markers():
         "cart_items = get_delivery_entry_cart_items(session, delivery_entry)",
         "existing_by_key = find_delivery_collection_items_by_keys(session, list(cart_items_by_key))",
         "apply_delivery_collection_entry_to_item(item, delivery_entry)",
+        "item.delivery_id = delivery_entry.id",
         "with session.begin_nested():",
         "except IntegrityError:",
         "item = find_delivery_collection_items_by_keys(session, [key]).get(key)",
@@ -2202,6 +2291,8 @@ def test_delivery_collection_item_and_missing_markers():
     )
     if "elif not item.placed_at:" in snapshot_block or "existing.get(key)" in snapshot_block:
         raise AssertionError("delivery collection snapshot items must not be refreshed from the current cart")
+    if "item.delivery_id not in delivery_ids" in snapshot_block:
+        raise AssertionError("delivery collection snapshot must not append leftover items from merged carts")
 
     item_message_block = main_text.split("def send_delivery_collection_item_message(", 1)[1].split(
         "def acquire_delivery_sheet_db_lock(",
@@ -2259,14 +2350,52 @@ def test_delivery_collection_item_and_missing_markers():
     for marker in [
         'safe_answer_callback_query(call.id, "Сборка уже завершена или удалена.", show_alert=True)',
         "if delivery_entry.collector_user_id",
+        "ForDelivery.collector_user_id == call.from_user.id",
+        "item.delivery_id = delivery_entry.id",
     ]:
         if marker not in placed_callback_block:
             raise AssertionError(f"delivery placed callback stale delivery guard missing {marker}")
     assert_marker_order(
         placed_callback_block,
+        "ForDelivery.collector_user_id == call.from_user.id",
+        'safe_answer_callback_query(call.id, "Сборка уже завершена или удалена.", show_alert=True)',
+        "placed callback must rebind live cart before treating collection as deleted",
+    )
+    assert_marker_order(
+        placed_callback_block,
         'safe_answer_callback_query(call.id, "Сборка уже завершена или удалена.", show_alert=True)',
         "item.placed_at = now_local()",
         "stale delivery placed callback must stop before marking item placed",
+    )
+
+    keyboard_block = main_text.split("def build_delivery_collection_keyboard(", 1)[1].split(
+        "def show_delivery_collection_list(",
+        1,
+    )[0]
+    for marker in [
+        "deduplicate_for_delivery_entries(session)",
+        "ForDelivery.merged_into_delivery_id == None",
+        "sync_delivery_entry_total_sum(session, row)",
+    ]:
+        if marker not in keyboard_block:
+            raise AssertionError(f"delivery collection list marker missing {marker}")
+
+    dedupe_block = main_text.split("def deduplicate_for_delivery_entries(", 1)[1].split(
+        "@bot.message_handler(func=lambda message: message.text == \"👨‍🦯 Засунуть в доставку\")",
+        1,
+    )[0]
+    for marker in [
+        "transfer_delivery_collection_items(session, discarded.id, keeper.id)",
+        "session.delete(discarded)",
+        "entry.collector_user_id and not existing.collector_user_id",
+    ]:
+        if marker not in dedupe_block:
+            raise AssertionError(f"delivery dedupe must preserve live collection items: missing {marker}")
+    assert_marker_order(
+        dedupe_block,
+        "transfer_delivery_collection_items(session, discarded.id, keeper.id)",
+        "session.delete(discarded)",
+        "dedupe must rebind collection items before deleting a duplicate cart",
     )
 
     continue_block = main_text.split("def continue_delivery_collection(", 1)[1].split(
@@ -2518,7 +2647,7 @@ def test_delivery_collection_report_group_markers():
         "def update_delivery_collection_report_group_id(migrate_to_chat_id):",
         "global delivery_collection_report_target_group_id",
         "def send_delivery_collection_report_message(text):",
-        "def send_delivery_collection_report_photo_or_text(photo, text):",
+        "def send_delivery_collection_report_photo_or_text(photo, text, reply_markup=None):",
         "def acquire_delivery_collection_report_db_lock():",
         "SELECT pg_advisory_lock(:lock_key)",
         "def release_delivery_collection_report_db_lock(connection):",
@@ -2534,13 +2663,25 @@ def test_delivery_collection_report_group_markers():
         "send_delivery_collection_report_message(header)",
         "send_delivery_collection_report_item_to_group(context, item)",
         "build_delivery_collection_report_footer(context, grouped_items)",
-        "send_delivery_collection_report_photo_or_text(item.get(\"photo\"), caption)",
+        "send_delivery_collection_report_photo_or_text(current_item.get(\"photo\"), caption)",
         "Сумма товара: {item['total_price']} ₽",
         "Количество: {item['quantity']}",
         "report_context = build_delivery_collection_report_context(session, delivery_entry)",
         "report_items = build_delivery_collection_report_items_from_collection_items(items)",
         "def start_delivery_collection_report_to_group(context, items):",
         "start_delivery_collection_report_to_group(report_context, report_items)",
+        'return "✅ Нашли"',
+        'return "❌ Не нашли"',
+        'InlineKeyboardButton("НАШЛИ!", callback_data=f"delivery_report_found_{unplaced_item_ids[0]}")',
+        "def notify_client_after_delivery_collection(notice):",
+        "Сборка вашей доставки завершена.",
+        "Этот товар во время сборки мы не нашли.",
+        "Этот товар нашли и добавили в вашу корзину.",
+        "def recover_missing_delivery_collection_items(",
+        "MISSING_DELIVERY_STATUS_FOUND",
+        'callback_data_startswith(call, "delivery_report_found_")',
+        "has_role(call.from_user.id, ADMIN_ROLES)",
+        "Кнопка доступна только администратору и создателю.",
     ]:
         if marker not in main_text:
             raise AssertionError(f"delivery collection report group marker missing {marker}")
@@ -3263,6 +3404,10 @@ def test_temp_user_data_flows_reset_when_memory_is_missing():
         "def handle_confirmation(call):": [
             'required_fields=("name", "phone", "address", "final_sum", "delivery_cutoff_at")',
             "Данные доставки потерялись. Нажмите согласие на доставку и заполните данные заново.",
+        ],
+        "def handle_delivery_cart_merge_extra_input(message):": [
+            'required_fields=("main_phone",)',
+            "Данные объединения потерялись. Нажмите «Объединить корзины» заново.",
         ],
     }
     for signature, markers in guarded_blocks.items():
@@ -4201,6 +4346,7 @@ def main():
     test_removed_delivery_entries_clear_collection_retry_rows()
     test_channel_delete_happens_only_after_delivery_cleanup()
     test_delivery_clients_summary_markers()
+    test_delivery_cart_merge_works_without_for_delivery_rows()
     test_delivery_collection_pauses_reserved_group_flow()
     test_audit_can_collect_delivery_only()
     test_delivery_collection_claim_markers()
