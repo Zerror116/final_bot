@@ -1,6 +1,6 @@
 from sqlalchemy import func
 
-from db import Reservations, Posts
+from db import Reservations
 from db.db import engine
 from sqlalchemy.orm import Session
 
@@ -12,11 +12,11 @@ def calculate_total_sum(user_id):
     with Session(bind=engine) as session:
         total = session.query(
             func.sum(
-                (Posts.price * Reservations.quantity)
+                (func.coalesce(Reservations.old_price, 0) * Reservations.quantity)
                 - func.coalesce(Reservations.return_order, 0)
             )
-        ).join(
-            Posts, Posts.id == Reservations.post_id
+        ).select_from(
+            Reservations
         ).filter(
             Reservations.user_id == user_id
         ).scalar()
@@ -29,15 +29,13 @@ def calculate_processed_sum(user_id):
     with Session(bind=engine) as session:
         total = session.query(
             func.sum(
-                (Posts.price * Reservations.quantity)
+                (func.coalesce(Reservations.old_price, 0) * Reservations.quantity)
                 - func.coalesce(Reservations.return_order, 0)
             )
-        ).join(
-            Posts, Posts.id == Reservations.post_id
+        ).select_from(
+            Reservations
         ).filter(
             Reservations.user_id == user_id,
             Reservations.is_fulfilled == True,
         ).scalar()
     return int(total or 0)
-
-

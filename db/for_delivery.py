@@ -1,4 +1,4 @@
-from sqlalchemy import BIGINT, DateTime, Index, Integer, String
+from sqlalchemy import BIGINT, DateTime, Index, Integer, String, Text
 from sqlalchemy.orm import mapped_column, Session
 from .db import AbstractModel, engine
 
@@ -16,6 +16,14 @@ class ForDelivery(AbstractModel):
     address = mapped_column(String, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
     delivery_cutoff_at = mapped_column(DateTime, nullable=True)
+    merged_into_delivery_id = mapped_column(Integer, nullable=True)
+    merge_order = mapped_column(Integer, nullable=False, default=0)
+    collector_user_id = mapped_column(BIGINT, nullable=True)
+    collector_name = mapped_column(String, nullable=True)
+    collection_started_at = mapped_column(DateTime, nullable=True)
+    collector_sheet_added_at = mapped_column(DateTime, nullable=True)
+    collector_sheet_row = mapped_column(Integer, nullable=True)
+    collector_sheet_error = mapped_column(Text, nullable=True)
 
     @staticmethod
     def insert(user_id, name, phone, address, total_sum, delivery_cutoff_at=None):
@@ -31,9 +39,9 @@ class ForDelivery(AbstractModel):
                 )
                 session.add(new_entry)
                 session.commit()  # Подтверждаем изменения
-            except Exception as e:
+            except Exception:
                 session.rollback()  # В случае ошибки откатываем изменения
-                raise e
+                raise
 
     @staticmethod
     def get_all_rows():
@@ -46,6 +54,6 @@ class ForDelivery(AbstractModel):
             try:
                 session.query(ForDelivery).delete()
                 session.commit()
-            except Exception as e:
+            except Exception:
                 session.rollback()
-                raise e
+                raise

@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Статистика постов</title>
+  <style>
+    :root {
+      --bg: #14120f;
+      --card: #f6f2e9;
+      --text: #18130e;
+      --muted: #f6f2e9;
+      --danger: #fca5a5;
+      --accent: #0f766e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #0f0d0a;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: grid;
+      place-items: center;
+      padding: 22px;
+    }
+
+    .phone {
+      width: min(100%, 960px);
+      aspect-ratio: 21 / 9;
+      min-height: 390px;
+      background: var(--bg);
+      border: 1px solid rgba(246, 242, 233, 0.18);
+      border-radius: 30px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+      overflow: hidden;
+    }
+
+    .screen {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 10px 14px 14px;
+      background: #14120f;
+    }
+
+    .header {
+      flex: 0 0 auto;
+      color: #f6f2e9;
+      text-align: center;
+      font-size: clamp(18px, 2.1vw, 24px);
+      line-height: 1.2;
+      font-weight: 850;
+      letter-spacing: 0;
+    }
+
+    .grid {
+      flex: 1 1 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .line {
+      flex: 1 1 0;
+      min-height: 0;
+      display: flex;
+      gap: 12px;
+    }
+
+    .card {
+      flex: 1 1 0;
+      min-width: 0;
+      display: flex;
+      align-items: stretch;
+      padding: 10px 14px 10px 0;
+      background: var(--card);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 8px;
+      box-shadow: 0 13px 30px rgba(0, 0, 0, 0.22);
+    }
+
+    .stripe {
+      width: 6px;
+      margin-right: 12px;
+      background: var(--accent);
+      border-radius: 0 4px 4px 0;
+    }
+
+    .content {
+      min-width: 0;
+      flex: 1;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      align-items: center;
+      justify-items: center;
+      text-align: center;
+    }
+
+    .count {
+      color: var(--accent);
+      font-size: clamp(46px, 7vw, 82px);
+      line-height: 0.95;
+      font-weight: 900;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+
+    .name {
+      width: 100%;
+      min-width: 0;
+      color: var(--text);
+      overflow-wrap: anywhere;
+      font-size: clamp(18px, 2vw, 27px);
+      line-height: 1.1;
+      font-weight: 850;
+      letter-spacing: 0;
+    }
+
+    .message {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 28px;
+      font-weight: 850;
+      letter-spacing: 0;
+    }
+
+    .message.error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 0;
+        background: var(--bg);
+      }
+
+      .phone {
+        width: 100vw;
+        min-height: 100vh;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="phone" aria-label="Предпросмотр Android-приложения">
+    <section class="screen">
+      <div class="header" id="nextUpdate"></div>
+      <section class="grid" id="grid"></section>
+    </section>
+  </main>
+
+  <script src="config.local.js"></script>
+  <script>
+    const FIRST_UPDATE_HOUR = 9;
+    const LAST_UPDATE_HOUR = 17;
+    const SAMARA_OFFSET_MS = 4 * 60 * 60 * 1000;
+    const FETCH_TIMEOUT_MS = 10000;
+    const DEFAULT_API_URL = "http://109.196.100.116:8091/api/statistic";
+    const DEFAULT_API_TOKEN = window.POST_STATS_API_TOKEN || "";
+    const ACCENTS = ["#0f766e", "#d97706", "#be123c", "#2563eb", "#7c3aed", "#16a34a", "#c2410c", "#0891b2"];
+    const MOCK_SNAPSHOT = {
+      today: [
+        { name: "Анастасия", count: 27 },
+        { name: "Екатерина", count: 30 },
+        { name: "Лариса", count: 11 },
+        { name: "Мария", count: 13 },
+        { name: "Оксана", count: 14 }
+      ],
+      week: [
+        { name: "Анастасия", count: 237 },
+        { name: "Валентина", count: 23 },
+        { name: "Екатерина", count: 335 },
+        { name: "Кристина", count: 212 },
+        { name: "Лариса", count: 144 },
+        { name: "Мария", count: 106 },
+        { name: "Матвей", count: 13 },
+        { name: "Надежда", count: 33 },
+        { name: "Никита", count: 52 },
+        { name: "Оксана", count: 198 },
+        { name: "Сергей", count: 14 },
+        { name: "Фархат", count: 1 }
+      ]
+    };
+
+    const grid = document.getElementById("grid");
+    const nextUpdate = document.getElementById("nextUpdate");
+    let currentPeriod = "today";
+    let currentSnapshot = null;
+    let refreshTimeoutId = null;
+    let pointerStartX = 0;
+    let pointerStartY = 0;
+
+    function getSettings() {
+      return {
+        apiUrl: localStorage.getItem("postStatsApiUrl") || DEFAULT_API_URL,
+        apiToken: localStorage.getItem("postStatsApiToken") || DEFAULT_API_TOKEN
+      };
+    }
+
+    function getColumnCount(count) {
+      if (count <= 0) return 1;
+      if (count <= 5) return count;
+      if (count <= 8) return 4;
+      return 5;
+    }
+
+    function renderRows(rows) {
+      grid.innerHTML = "";
+      if (!rows.length) {
+        renderMessage("Нет данных", false);
+        return;
+      }
+
+      const columns = getColumnCount(rows.length);
+      for (let index = 0; index < rows.length; index += columns) {
+        const line = document.createElement("div");
+        line.className = "line";
+        for (const item of rows.slice(index, index + columns)) {
+          line.appendChild(createCard(item, index + line.children.length));
+        }
+        grid.appendChild(line);
+      }
+    }
+
+    function renderCurrentPeriod() {
+      if (!currentSnapshot) return;
+      renderRows(currentPeriod === "week" ? currentSnapshot.week : currentSnapshot.today);
+      updateHeader();
+    }
+
+    function createCard(item, index) {
+      const card = document.createElement("article");
+      card.className = "card";
+      card.style.setProperty("--accent", ACCENTS[index % ACCENTS.length]);
+
+      const stripe = document.createElement("div");
+      stripe.className = "stripe";
+
+      const content = document.createElement("div");
+      content.className = "content";
+
+      const count = document.createElement("div");
+      count.className = "count";
+      count.textContent = item.count;
+
+      const name = document.createElement("div");
+      name.className = "name";
+      name.textContent = item.name;
+
+      content.append(count, name);
+      card.append(stripe, content);
+      return card;
+    }
+
+    function renderMessage(text, error) {
+      grid.innerHTML = "";
+      const message = document.createElement("div");
+      message.className = "message" + (error ? " error" : "");
+      message.textContent = text;
+      grid.appendChild(message);
+    }
+
+    async function refresh() {
+      const settings = getSettings();
+      if (!settings.apiToken) {
+        currentSnapshot = MOCK_SNAPSHOT;
+        renderCurrentPeriod();
+        scheduleRefresh();
+        return;
+      }
+
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetch(settings.apiUrl, {
+          headers: {
+            "Accept": "application/json",
+            "Authorization": `Bearer ${settings.apiToken}`
+          },
+          cache: "no-store",
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        currentSnapshot = {
+          today: payload.periods.today.created_posts.by_user,
+          week: payload.periods.week.created_posts.by_user
+        };
+        renderCurrentPeriod();
+        localStorage.setItem("postStatsLastFetchAt", String(Date.now()));
+      } catch (error) {
+        if (currentSnapshot) {
+          renderCurrentPeriod();
+        } else {
+          renderMessage("Ошибка загрузки", true);
+        }
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+      scheduleRefresh();
+    }
+
+    function scheduleRefresh() {
+      const nextAt = nextScheduledUpdateAfter(Date.now());
+      const delay = Math.max(nextAt.getTime() - Date.now(), 1000);
+      if (refreshTimeoutId !== null) {
+        window.clearTimeout(refreshTimeoutId);
+      }
+      updateHeader();
+      refreshTimeoutId = window.setTimeout(refresh, delay);
+    }
+
+    function updateHeader() {
+      const nextAt = nextScheduledUpdateAfter(Date.now());
+      const label = currentPeriod === "week" ? "Неделя" : "Сегодня";
+      nextUpdate.textContent = `${label} · следующее обновление: ${formatNextUpdate(nextAt)}`;
+    }
+
+    function nextScheduledUpdateAfter(baseMillis) {
+      const samaraBase = new Date(baseMillis + SAMARA_OFFSET_MS);
+      const year = samaraBase.getUTCFullYear();
+      const month = samaraBase.getUTCMonth();
+      const date = samaraBase.getUTCDate();
+      const hour = samaraBase.getUTCHours();
+      let targetDay = date;
+      let targetHour;
+
+      if (hour < FIRST_UPDATE_HOUR) {
+        targetHour = FIRST_UPDATE_HOUR;
+      } else if (hour >= LAST_UPDATE_HOUR) {
+        targetDay += 1;
+        targetHour = FIRST_UPDATE_HOUR;
+      } else {
+        targetHour = hour + 1;
+      }
+
+      return new Date(Date.UTC(year, month, targetDay, targetHour, 0, 0, 0) - SAMARA_OFFSET_MS);
+    }
+
+    function formatNextUpdate(nextAt) {
+      const nowSamara = new Date(Date.now() + SAMARA_OFFSET_MS);
+      const nextSamara = new Date(nextAt.getTime() + SAMARA_OFFSET_MS);
+      const hour = String(nextSamara.getUTCHours()).padStart(2, "0") + ":00";
+      const tomorrow = nowSamara.getUTCFullYear() !== nextSamara.getUTCFullYear()
+        || nowSamara.getUTCMonth() !== nextSamara.getUTCMonth()
+        || nowSamara.getUTCDate() !== nextSamara.getUTCDate();
+      return tomorrow ? "завтра в " + hour : hour;
+    }
+
+    function handleSwipe(deltaX, deltaY) {
+      if (!currentSnapshot) return;
+      if (Math.abs(deltaX) < 70 || Math.abs(deltaX) <= Math.abs(deltaY) * 1.3) return;
+      currentPeriod = currentPeriod === "today" ? "week" : "today";
+      renderCurrentPeriod();
+    }
+
+    document.addEventListener("pointerdown", event => {
+      pointerStartX = event.clientX;
+      pointerStartY = event.clientY;
+    });
+
+    document.addEventListener("pointerup", event => {
+      handleSwipe(event.clientX - pointerStartX, event.clientY - pointerStartY);
+    });
+
+    refresh();
+  </script>
+</body>
+</html>

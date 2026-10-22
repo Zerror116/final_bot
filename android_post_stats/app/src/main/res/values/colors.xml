@@ -1,0 +1,10 @@
+<resources>
+    <color name="app_background">#F5F7FA</color>
+    <color name="panel_background">#FFFFFF</color>
+    <color name="primary">#0F766E</color>
+    <color name="primary_dark">#115E59</color>
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#6B7280</color>
+    <color name="border">#D7DEE8</color>
+    <color name="danger">#B42318</color>
+</resources>

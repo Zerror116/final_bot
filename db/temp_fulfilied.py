@@ -1,8 +1,18 @@
 import datetime
+import logging
+from zoneinfo import ZoneInfo
 from sqlalchemy import String, BIGINT, Boolean, DateTime, Index, Integer
 from sqlalchemy.exc import SQLAlchemyError
 from .db import AbstractModel
 from sqlalchemy.orm import mapped_column, Session
+
+
+logger = logging.getLogger(__name__)
+SAMARA_TZ = ZoneInfo("Europe/Samara")
+
+
+def local_now_naive():
+    return datetime.datetime.now(SAMARA_TZ).replace(tzinfo=None)
 
 
 class Temp_Fulfilled(AbstractModel):
@@ -10,9 +20,11 @@ class Temp_Fulfilled(AbstractModel):
     __table_args__ = (
         Index("ix_temp_fulfilled_user_post", "user_id", "post_id"),
         Index("ix_temp_fulfilled_delivery_flags", "user_id", "in_delivery", "defect", "skidka"),
+        Index("ix_temp_fulfilled_reservation_id", "reservation_id"),
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reservation_id = mapped_column(Integer, nullable=True)
     post_id = mapped_column(Integer, nullable=False)
     user_id = mapped_column(BIGINT, nullable=False)
     user_name = mapped_column(String, nullable=False)
@@ -23,14 +35,15 @@ class Temp_Fulfilled(AbstractModel):
     defect = mapped_column(Boolean, nullable=False, default=0)
     skidka = mapped_column(Boolean, nullable=False, default=0)
     skidka_price = mapped_column(Integer, nullable=False, default=0)
-    created_at = mapped_column(DateTime, default=datetime.datetime.utcnow)
+    created_at = mapped_column(DateTime, default=local_now_naive)
 
     @staticmethod
     def insert(session: Session, post_id: int, user_id: int, user_name: str,
-               item_description: str, quantity: int, price: int) -> bool:
+               item_description: str, quantity: int, price: int, reservation_id: int = None) -> bool:
         """Добавляет запись в таблицу Temp_Fulfilied."""
         try:
             new_record = Temp_Fulfilled(
+                reservation_id=reservation_id,
                 post_id=post_id,
                 user_id=user_id,
                 user_name=user_name,
@@ -43,7 +56,7 @@ class Temp_Fulfilled(AbstractModel):
             return True
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при добавлении записи: {e}")
+            logger.exception("Temp fulfilled insert failed: %s", e)
             return False
 
     @staticmethod
@@ -53,7 +66,7 @@ class Temp_Fulfilled(AbstractModel):
             record = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.id == record_id).first()
             return record
         except SQLAlchemyError as e:
-            print(f"Ошибка при получении записи: {e}")
+            logger.exception("Temp fulfilled get failed for record_id=%s: %s", record_id, e)
             return None
 
     @staticmethod
@@ -63,7 +76,7 @@ class Temp_Fulfilled(AbstractModel):
             records = session.query(Temp_Fulfilled).all()
             return records
         except SQLAlchemyError as e:
-            print(f"Ошибка при получении записей: {e}")
+            logger.exception("Temp fulfilled list failed: %s", e)
             return None
 
     @staticmethod
@@ -76,11 +89,11 @@ class Temp_Fulfilled(AbstractModel):
                 session.commit()
                 return True
             else:
-                print("Запись не найдена")
+                logger.debug("Temp fulfilled record not found for delete record_id=%s", record_id)
                 return False
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при удалении записи: {e}")
+            logger.exception("Temp fulfilled delete failed for record_id=%s: %s", record_id, e)
             return False
 
     @staticmethod
@@ -95,18 +108,18 @@ class Temp_Fulfilled(AbstractModel):
                 session.commit()
                 return True
             else:
-                print("Запись не найдена")
+                logger.debug("Temp fulfilled record not found for update record_id=%s", record_id)
                 return False
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при обновлении записи: {e}")
+            logger.exception("Temp fulfilled update failed for record_id=%s: %s", record_id, e)
             return False
 
     @staticmethod
     def cleanup_old_records(session: Session) -> int:
         """Удаляет записи, которые старше 7 дней."""
         try:
-            limit_date = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+            limit_date = local_now_naive() - datetime.timedelta(days=7)
             old_records = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.created_at < limit_date).all()
 
             deleted_count = len(old_records)
@@ -116,5 +129,5 @@ class Temp_Fulfilled(AbstractModel):
             return deleted_count
         except SQLAlchemyError as e:
             session.rollback()
-            print(f"Ошибка при удалении старых записей: {e}")
+            logger.exception("Temp fulfilled cleanup failed: %s", e)
             return 0

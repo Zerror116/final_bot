@@ -1,0 +1,22 @@
+[Unit]
+Description=Final Bot Statistic API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/final_bot
+EnvironmentFile=-/etc/final_bot.env
+EnvironmentFile=/etc/final_bot_statistic_api.env
+ExecStart=/opt/final_bot/venv/bin/python statistic_api.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

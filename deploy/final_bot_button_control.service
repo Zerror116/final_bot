@@ -1,0 +1,21 @@
+[Unit]
+Description=Final Bot Button Control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/final_bot
+EnvironmentFile=/etc/final_bot_button.env
+ExecStart=/opt/final_bot/venv/bin/python button_control_api.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

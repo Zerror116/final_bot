@@ -1,0 +1,3 @@
+@echo off
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$task=Get-ScheduledTask -TaskName 'FinalBotButtonAgent' -TaskPath '\FinalBot\' -ErrorAction SilentlyContinue; if($task){Write-Host 'Task Scheduler: installed'}else{Write-Host 'Task Scheduler: not installed'}; $proc=Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*windows_button_agent.ps1*'} | Select-Object -First 1; if($proc){Write-Host 'Background agent: running'}else{Write-Host 'Background agent: not running'}; $dir=Join-Path $env:APPDATA 'FinalBotButtonAgent'; Write-Host ('Agent folder: ' + $dir); $log=Join-Path $dir 'button_restart_agent.log'; if(Test-Path $log){Write-Host 'Last log lines:'; Get-Content $log -Tail 20}else{Write-Host 'Log file: not created yet'}"
+pause

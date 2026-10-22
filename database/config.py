@@ -13,7 +13,21 @@ def _get_required(name: str) -> str:
 
 
 def _get_required_int(name: str) -> int:
-    return int(_get_required(name))
+    value = _get_required(name)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid integer environment variable: {name}") from exc
+
+
+def _get_optional_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value.strip())
+    except ValueError:
+        return default
 
 
 def _get_bot_link() -> str:
@@ -39,5 +53,5 @@ ADMIN_USER_ID = _get_required_int("ADMIN_USER_ID")
 ROLES = ["client", "worker", "audit", "admin"]
 SPECIAL_ROLES = ["supreme_leader"]
 support_link = _get_required("SUPPORT_LINK")
-protected_user_id = int(os.environ.get("PROTECTED_USER_ID", ADMIN_USER_ID))
+protected_user_id = _get_optional_int("PROTECTED_USER_ID", ADMIN_USER_ID)
 bot_link = _get_bot_link()

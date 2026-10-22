@@ -1,4 +1,5 @@
 from collections.abc import MutableMapping
+from threading import RLock
 
 from db.bot_session import BotSession
 
@@ -9,29 +10,35 @@ class PersistentNestedDict(dict):
         self._parent = parent
         self._key = key
 
-    def _sync(self):
-        self._parent[self._key] = dict(self)
-
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
-        self._sync()
+        latest = self._parent.update_dict(self._key, {key: value})
+        super().clear()
+        super().update(latest)
 
     def __delitem__(self, key):
         super().__delitem__(key)
-        self._sync()
+        latest = self._parent.update_dict(self._key, delete_keys=[key])
+        super().clear()
+        super().update(latest)
 
     def clear(self):
         super().clear()
-        self._sync()
+        self._parent[self._key] = {}
 
     def pop(self, key, default=None):
         value = super().pop(key, default)
-        self._sync()
+        latest = self._parent.update_dict(self._key, delete_keys=[key])
+        super().clear()
+        super().update(latest)
         return value
 
     def update(self, *args, **kwargs):
-        super().update(*args, **kwargs)
-        self._sync()
+        changes = dict(*args, **kwargs)
+        super().update(changes)
+        latest = self._parent.update_dict(self._key, changes)
+        super().clear()
+        super().update(latest)
 
 
 class PersistentBucket(MutableMapping):
@@ -39,6 +46,8 @@ class PersistentBucket(MutableMapping):
         self.bucket_name = bucket_name
         self.cache = {}
         self.loaded_keys = set()
+        self.locks = {}
+        self.locks_guard = RLock()
 
     def _normalize_key(self, key):
         return int(key)
@@ -47,6 +56,12 @@ class PersistentBucket(MutableMapping):
         if isinstance(value, dict) and not isinstance(value, PersistentNestedDict):
             return PersistentNestedDict(self, key, value)
         return value
+
+    def _lock_for(self, key):
+        with self.locks_guard:
+            if key not in self.locks:
+                self.locks[key] = RLock()
+            return self.locks[key]
 
     def _load(self, key):
         key = self._normalize_key(key)
@@ -64,15 +79,17 @@ class PersistentBucket(MutableMapping):
 
     def __setitem__(self, key, value):
         key = self._normalize_key(key)
-        self.cache[key] = value
-        self.loaded_keys.add(key)
-        BotSession.set_bucket(key, self.bucket_name, value)
+        with self._lock_for(key):
+            self.cache[key] = value
+            self.loaded_keys.add(key)
+            BotSession.set_bucket(key, self.bucket_name, value)
 
     def __delitem__(self, key):
         key = self._normalize_key(key)
-        self.cache.pop(key, None)
-        self.loaded_keys.add(key)
-        BotSession.clear_bucket(key, self.bucket_name)
+        with self._lock_for(key):
+            self.cache.pop(key, None)
+            self.loaded_keys.add(key)
+            BotSession.clear_bucket(key, self.bucket_name)
 
     def __iter__(self):
         return iter(self.cache)
@@ -91,16 +108,26 @@ class PersistentBucket(MutableMapping):
 
     def pop(self, key, default=None):
         key = self._normalize_key(key)
-        value = self._load(key)
-        if value is None:
-            return default
-        self.__delitem__(key)
-        return value
+        with self._lock_for(key):
+            value = self._load(key)
+            if value is None:
+                return default
+            self.__delitem__(key)
+            return value
 
     def setdefault(self, key, default=None):
         key = self._normalize_key(key)
-        value = self._load(key)
-        if value is None:
-            value = default if default is not None else {}
-            self[key] = value
-        return self._wrap(key, value)
+        with self._lock_for(key):
+            value = self._load(key)
+            if value is None:
+                value = default if default is not None else {}
+                self[key] = value
+            return self._wrap(key, value)
+
+    def update_dict(self, key, updates=None, delete_keys=None):
+        key = self._normalize_key(key)
+        with self._lock_for(key):
+            value = BotSession.update_bucket_dict(key, self.bucket_name, updates, delete_keys)
+            self.cache[key] = value
+            self.loaded_keys.add(key)
+            return self._wrap(key, value)

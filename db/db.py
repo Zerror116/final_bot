@@ -11,6 +11,18 @@ from database.env_loader import load_dotenv
 load_dotenv()
 
 
+def _optional_int(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def _build_engine_url():
     database_url = os.environ.get("DATABASE_URL")
     if database_url:
@@ -28,7 +40,7 @@ def _build_engine_url():
             username=db_user,
             password=db_password or None,
             host=db_host,
-            port=int(db_port) if db_port else None,
+            port=_optional_int(db_port),
             database=db_name,
         )
 
@@ -51,7 +63,7 @@ def _build_engine_url():
         username=database_config["username"],
         password=database_config.get("password") or None,
         host=database_config["host"],
-        port=int(database_config["port"]) if database_config.get("port") else None,
+        port=_optional_int(database_config.get("port")),
         database=database_config["name"],
     )
 
@@ -62,4 +74,3 @@ engine = create_engine(_build_engine_url(), pool_pre_ping=True, pool_recycle=300
 
 @as_declarative()
 class AbstractModel: pass
-
