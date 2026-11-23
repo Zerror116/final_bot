@@ -71,6 +71,7 @@ def run_schema_migrations():
     run_migration("029_posts_audit_status", ensure_posts_audit_status)
     run_migration("030_posts_shelf_width", ensure_posts_shelf_width)
     run_migration("031_delivery_broadcast_summary_parts", ensure_delivery_broadcast_summary_parts)
+    run_migration("032_posts_first_created_at", ensure_posts_first_created_at)
 
 
 def ensure_schema_migrations():
@@ -398,6 +399,86 @@ def ensure_delivery_broadcast_campaigns():
 def ensure_delivery_broadcast_summary_parts():
     AbstractModel.metadata.create_all(engine)
     add_column_if_missing("delivery_broadcast_campaigns", "summary_message_ids", "TEXT")
+
+
+def ensure_posts_first_created_at():
+    """Неизменная дата создания поста работником (для выработки) + оценка для старых записей.
+
+    Для уже существующих постов created_at мог быть перезаписан ревизией, расформировкой
+    или ручной ревизией, поэтому берём самую раннюю известную отметку:
+    текущий created_at, первую бронь товара и дату, под которой товар ушёл в ревизию.
+    Посты без автора-работника (chat_id <= 0, например возвраты из пропажи) не получают дату.
+    """
+    from datetime import time as datetime_time
+
+    AbstractModel.metadata.create_all(engine)
+    timestamp_type = (
+        "TIMESTAMP WITHOUT TIME ZONE"
+        if engine.dialect.name == "postgresql"
+        else "DATETIME"
+    )
+    add_column_if_missing("posts", "first_created_at", timestamp_type)
+    add_column_if_missing("deleted_post_snapshots", "first_created_at", timestamp_type)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_posts_first_created_at ON posts (first_created_at)"
+        ))
+
+    def as_datetime(value):
+        if value is None or isinstance(value, datetime):
+            return value
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    with engine.begin() as connection:
+        earliest = {}
+
+        def remember(post_id, value):
+            value = as_datetime(value)
+            if post_id is None or value is None:
+                return
+            current = earliest.get(post_id)
+            if current is None or value < current:
+                earliest[post_id] = value
+
+        for post_id, value in connection.execute(text(
+            "SELECT post_id, MIN(created_at) FROM reservation_stat_events GROUP BY post_id"
+        )):
+            remember(post_id, value)
+        for post_id, value in connection.execute(text(
+            "SELECT post_id, MIN(created_at) FROM reservations GROUP BY post_id"
+        )):
+            remember(post_id, value)
+        for post_id, value in connection.execute(text(
+            "SELECT post_id, MIN(selected_date) FROM revision_logs GROUP BY post_id"
+        )):
+            value = as_datetime(value)
+            if value is not None and value.time() == datetime_time(0, 0):
+                # В ревизии хранится только дата; ставим середину дня, чтобы не попасть
+                # под исключение «старых» постов с временем 00:00.
+                value = value.replace(hour=12)
+            remember(post_id, value)
+
+        for table, where in (
+            ("posts", "chat_id > 0"),
+            ("deleted_post_snapshots", "chat_id > 0 AND reason LIKE 'delivery_cleanup%'"),
+        ):
+            id_column = "id" if table == "posts" else "post_id"
+            rows = connection.execute(text(
+                f"SELECT {id_column}, created_at FROM {table} "
+                f"WHERE first_created_at IS NULL AND {where}"
+            )).fetchall()
+            for post_id, created_at in rows:
+                created_at = as_datetime(created_at)
+                candidates = [value for value in (created_at, earliest.get(post_id)) if value is not None]
+                if not candidates:
+                    continue
+                connection.execute(
+                    text(f"UPDATE {table} SET first_created_at = :value WHERE {id_column} = :post_id"),
+                    {"value": min(candidates), "post_id": post_id},
+                )
 
 
 def ensure_delivery_broadcast_summary_tracking():

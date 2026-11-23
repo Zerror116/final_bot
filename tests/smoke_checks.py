@@ -1515,7 +1515,8 @@ def test_post_dates_use_samara_and_shift_sunday():
         "if value.weekday() == 6:",
         "value = value + timedelta(days=1)",
         "default=default_post_created_at",
-        "created_at=normalize_post_created_at(created_at)",
+        "post_created_at = normalize_post_created_at(created_at)",
+        "first_created_at=post_created_at,",
         "def next_created_at(value=None):",
     ]:
         if marker not in posts_text:
@@ -1640,19 +1641,21 @@ def test_statistic_excludes_revision_posts_from_created_posts():
         1,
     )[0]
     for marker in [
-        "revision_post_ids_by_period",
-        "revision_post_ids_by_period[key].add(revision_log.post_id)",
-        "if post.id in revision_post_ids_by_period[key]:",
+        "all_posts = load_payroll_post_rows(session, query_start, query_end)",
         "Общее количество созданных товаров",
         "{count} товаров",
     ]:
         if marker not in statistic_block:
-            raise AssertionError(f"statistic revision exclusion marker missing {marker}")
-
-    post_skip_index = statistic_block.index("if post.id in revision_post_ids_by_period[key]:")
-    post_count_index = statistic_block.index("total_posts[key] += 1")
-    if post_skip_index > post_count_index:
-        raise AssertionError("revision posts must be skipped before incrementing created-post totals")
+            raise AssertionError(f"statistic created posts marker missing {marker}")
+    payroll_block = text.split("def load_payroll_post_rows(", 1)[1].split("@bot.message_handler", 1)[0]
+    for marker in [
+        "Posts.first_created_at >= start_at",
+        "DeletedPostSnapshot.first_created_at >= start_at",
+    ]:
+        if marker not in payroll_block:
+            raise AssertionError(f"created posts must be counted by first_created_at: {marker}")
+    if "Posts.created_at >= start_at" in payroll_block:
+        raise AssertionError("created posts must not be counted by the mutable created_at")
 
 
 def test_delivery_cleanup_schedule_markers():

@@ -118,6 +118,7 @@ class Posts(AbstractModel):
         Index("ix_posts_message_id", "message_id"),
         Index("ix_posts_shelf", "shelf"),
         Index("ix_posts_audit_status", "audit_status"),
+        Index("ix_posts_first_created_at", "first_created_at"),
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -131,6 +132,9 @@ class Posts(AbstractModel):
     audit_status = mapped_column(String(16), nullable=True)
     is_sent = mapped_column(Boolean, nullable=False, default=0)
     created_at = mapped_column(DateTime, nullable=False, default=default_post_created_at)
+    # Дата, когда работник сам выложил пост. Ставится один раз в insert и больше не меняется:
+    # ревизия, расформировка и возвраты двигают только created_at. По ней считается выработка.
+    first_created_at = mapped_column(DateTime, nullable=True)
 
     @staticmethod
     def next_created_at(value=None):
@@ -262,6 +266,7 @@ class Posts(AbstractModel):
                 raise ValueError(f"ID {post_id} уже используется в истории товара.")
 
             normalized_shelf = normalize_shelf(shelf)
+            post_created_at = normalize_post_created_at(created_at)
             posts = Posts(
                 id=post_id,
                 chat_id=chat_id,
@@ -271,7 +276,8 @@ class Posts(AbstractModel):
                 quantity=quantity,
                 shelf=normalized_shelf,
                 audit_status=AUDIT_STATUS_FOUND if normalized_shelf else None,
-                created_at=normalize_post_created_at(created_at),
+                created_at=post_created_at,
+                first_created_at=post_created_at,
             )
             session.add(posts)
             if reservation:

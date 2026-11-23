@@ -5939,19 +5939,26 @@ def send_new_posts_to_channel(message):
     publish_unsent_posts_to_channel(notify_chat_id=user_id, source="manual")
 
 def load_payroll_post_rows(session, start_at, end_at):
-    """Посты для выработки: живые плюс удалённые автоочисткой после доставки."""
-    rows = session.query(Posts.id, Posts.chat_id, Posts.created_at).filter(
-        Posts.created_at >= start_at,
-        Posts.created_at < end_at,
+    """Посты, которые работники выложили сами за период.
+
+    Считаем только по first_created_at: эта дата ставится один раз при создании поста
+    и не меняется при ревизии, расформировке корзины или возврате товара на канал.
+    Удалённые автоочисткой после доставки посты берём из снимков.
+    """
+    rows = session.query(Posts.id, Posts.chat_id, Posts.first_created_at).filter(
+        Posts.first_created_at != None,
+        Posts.first_created_at >= start_at,
+        Posts.first_created_at < end_at,
     ).all()
     live_ids = {row[0] for row in rows}
     deleted_rows = session.query(
         DeletedPostSnapshot.post_id,
         DeletedPostSnapshot.chat_id,
-        DeletedPostSnapshot.created_at,
+        DeletedPostSnapshot.first_created_at,
     ).filter(
-        DeletedPostSnapshot.created_at >= start_at,
-        DeletedPostSnapshot.created_at < end_at,
+        DeletedPostSnapshot.first_created_at != None,
+        DeletedPostSnapshot.first_created_at >= start_at,
+        DeletedPostSnapshot.first_created_at < end_at,
         DeletedPostSnapshot.reason.like("delivery_cleanup%"),
     ).all()
     result = [SimpleNamespace(id=row[0], chat_id=row[1], created_at=row[2]) for row in rows]
@@ -6043,7 +6050,6 @@ def handle_statistic(message):
     else:
         raise TypeError(f"Unsupported data type for 'all_clients': {type(all_clients)}")
 
-    revision_post_ids_by_period = {"today": set(), "week": set(), "last_week": set()}
 
     # Генерация статистики ревизии и списка товаров, которые нужно исключить из созданных постов
     for key, date_range in days_range.items():
@@ -6052,7 +6058,6 @@ def handle_statistic(message):
                 continue
             revision_date = revision_log.created_at.date()
             if date_range[0] <= revision_date <= date_range[1]:
-                revision_post_ids_by_period[key].add(revision_log.post_id)
                 auditor_name = clients_dict.get(revision_log.auditor_user_id, "Неизвестный пользователь")
                 if auditor_name not in revision_statistics[key]:
                     revision_statistics[key][auditor_name] = 0
@@ -6084,8 +6089,6 @@ def handle_statistic(message):
 
         for post in all_posts:
             if not post.created_at:
-                continue
-            if post.id in revision_post_ids_by_period[key]:
                 continue
 
             created_at_date = post.created_at.date()
@@ -6243,20 +6246,10 @@ def calculate_payroll_week_counts(current=None):
             client.user_id: client.name or "Неизвестный пользователь"
             for client in session.query(Clients).all()
         }
-        revision_post_ids = {
-            row[0]
-            for row in session.query(RevisionLog.post_id).filter(
-                RevisionLog.created_at >= week_start,
-                RevisionLog.created_at < week_end,
-            ).all()
-        }
-
         post_counts = {}
         posts = load_payroll_post_rows(session, week_start, week_end)
         for post_id, chat_id, created_at in ((post.id, post.chat_id, post.created_at) for post in posts):
             if not created_at:
-                continue
-            if post_id in revision_post_ids:
                 continue
             if created_at.time() == datetime.min.time():
                 continue
@@ -7885,6 +7878,7 @@ def ensure_deleted_post_snapshot(session, post, reason):
         quantity=post.quantity,
         is_sent=post.is_sent,
         created_at=post.created_at,
+        first_created_at=getattr(post, "first_created_at", None),
         deleted_at=now_local(),
         reason=reason,
     ))

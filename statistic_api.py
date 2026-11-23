@@ -189,7 +189,6 @@ def calculate_statistics_snapshot(current=None):
     total_revisions = {key: 0 for key in period_ranges}
     total_delivery_collections = {key: 0 for key in period_ranges}
     total_delivery_collection_items = {key: 0 for key in period_ranges}
-    revision_post_ids_by_period = {key: set() for key in period_ranges}
     first_period_date = min(start for start, _end in period_ranges.values())
     last_period_date = max(end for _start, end in period_ranges.values())
     query_start = datetime.combine(first_period_date, datetime.min.time())
@@ -201,14 +200,16 @@ def calculate_statistics_snapshot(current=None):
             cursor.execute("SELECT user_id, name FROM clients")
             clients_dict = rows_to_clients_dict(cursor.fetchall())
 
+            # Только посты, выложенные работниками: first_created_at не меняется
+            # при ревизии, расформировке и возврате товара на канал.
             cursor.execute(
-                "SELECT id, chat_id, created_at FROM posts "
-                "WHERE created_at >= %s AND created_at < %s "
-                "AND created_at::time <> TIME '00:00:00' "
+                "SELECT id, chat_id, first_created_at FROM posts "
+                "WHERE first_created_at >= %s AND first_created_at < %s "
+                "AND first_created_at::time <> TIME '00:00:00' "
                 "UNION ALL "
-                "SELECT s.post_id, s.chat_id, s.created_at FROM deleted_post_snapshots s "
-                "WHERE s.created_at >= %s AND s.created_at < %s "
-                "AND s.created_at::time <> TIME '00:00:00' "
+                "SELECT s.post_id, s.chat_id, s.first_created_at FROM deleted_post_snapshots s "
+                "WHERE s.first_created_at >= %s AND s.first_created_at < %s "
+                "AND s.first_created_at::time <> TIME '00:00:00' "
                 "AND s.reason LIKE 'delivery_cleanup%%' "
                 "AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.id = s.post_id)",
                 (query_start, query_end, query_start, query_end),
@@ -253,7 +254,6 @@ def calculate_statistics_snapshot(current=None):
                 continue
             revision_date = created_at.date()
             if start_date <= revision_date <= end_date:
-                revision_post_ids_by_period[key].add(post_id)
                 auditor_name = clients_dict.get(auditor_user_id, UNKNOWN_USER)
                 revision_statistics[key][auditor_name] = revision_statistics[key].get(auditor_name, 0) + 1
                 total_revisions[key] += 1
@@ -283,8 +283,6 @@ def calculate_statistics_snapshot(current=None):
 
         for post_id, chat_id, created_at in posts:
             if not created_at:
-                continue
-            if post_id in revision_post_ids_by_period[key]:
                 continue
 
             created_at_date = created_at.date()

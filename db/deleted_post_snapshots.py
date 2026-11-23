@@ -32,5 +32,6 @@ class DeletedPostSnapshot(AbstractModel):
     quantity = mapped_column(Integer, nullable=False)
     is_sent = mapped_column(Boolean, nullable=False, default=0)
     created_at = mapped_column(DateTime, nullable=False)
+    first_created_at = mapped_column(DateTime, nullable=True)
     deleted_at = mapped_column(DateTime, nullable=False, default=local_now_naive)
     reason = mapped_column(String, nullable=False)
