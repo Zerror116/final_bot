@@ -54,6 +54,7 @@ from db.bot_session import BotSession
 from services.pricing import calculate_audit_price
 from services.session_store import PersistentBucket
 from services.telegram_safe import (
+    safe_delete_messages,
     call_telegram_with_retries,
     edit_message_media_with_retries,
     is_safe_to_resend_error,
@@ -141,6 +142,7 @@ MISSING_DELIVERY_STATUS_MISSING = "missing"
 MISSING_DELIVERY_STATUS_RETURNED_CHANNEL = "returned_channel"
 MISSING_DELIVERY_STATUS_RETURNED_CART = "returned_cart"
 MISSING_DELIVERY_STATUS_FOUND = "found"
+MISSING_DELIVERY_SEARCH_STATE = "WAITING_FOR_MISSING_ITEM_ID"
 MISSING_DELIVERY_STATUS_LABELS = {
     MISSING_DELIVERY_STATUS_MISSING: "В пропаже",
     MISSING_DELIVERY_STATUS_RETURNED_CHANNEL: "Вернули на канал",
@@ -170,8 +172,19 @@ AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
 AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 CHANNEL_POST_SEND_ATTEMPTS = 3
 CHANNEL_POST_SEND_RETRY_SECONDS = 5
-POST_PREVIEW_PAGE_SIZE = 8
-POST_PREVIEW_SEND_DELAY_SECONDS = 5
+# Скорость отправки «📄 Посты» подбирается под лимиты Telegram (≈1 сообщение/сек в личный чат,
+# при длинных сериях фото Telegram начинает тормозить раньше).
+POST_PREVIEW_DELAY_STEPS = (
+    (10, 1.5),
+    (30, 2.5),
+    (60, 3.5),
+)
+POST_PREVIEW_MAX_DELAY_SECONDS = 4.5
+POST_PREVIEW_BATCH_SIZE = 20
+POST_PREVIEW_BATCH_PAUSE_SECONDS = 15
+POST_PREVIEW_SLOWDOWN_STEP_SECONDS = 1.0
+POST_PREVIEW_SLOWDOWN_LIMIT_SECONDS = 8.0
+POST_PREVIEW_MAX_RETRY_AFTER_SECONDS = 120
 REVISION_CHANNEL_DELETE_DELAY_SECONDS = 0.35
 TELEGRAM_STARTUP_RETRY_SECONDS = env_float("TELEGRAM_STARTUP_RETRY_SECONDS", 5, minimum=0)
 TELEGRAM_STARTUP_MAX_RETRY_SECONDS = env_float("TELEGRAM_STARTUP_MAX_RETRY_SECONDS", 60, minimum=1)
@@ -5276,16 +5289,30 @@ def load_posts_for_preview(user_id):
     return [post for post in posts if post.id not in revised_ids]
 
 
-def build_posts_preview_keyboard(page, total_count):
-    keyboard = InlineKeyboardMarkup()
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"posts_preview_page_{page - 1}"))
-    if (page + 1) * POST_PREVIEW_PAGE_SIZE < total_count:
-        nav_buttons.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"posts_preview_page_{page + 1}"))
-    if nav_buttons:
-        keyboard.row(*nav_buttons)
-    return keyboard
+def posts_preview_delay_seconds(total_count):
+    for max_count, delay in POST_PREVIEW_DELAY_STEPS:
+        if total_count <= max_count:
+            return delay
+    return POST_PREVIEW_MAX_DELAY_SECONDS
+
+
+def posts_preview_batch_pause_seconds(total_count):
+    # Передышка нужна только длинным сериям, короткие уходят без неё.
+    return POST_PREVIEW_BATCH_PAUSE_SECONDS if total_count > 30 else 0
+
+
+def estimate_posts_preview_seconds(total_count):
+    if total_count <= 1:
+        return 0
+    delay = posts_preview_delay_seconds(total_count)
+    batch_pauses = (total_count - 1) // POST_PREVIEW_BATCH_SIZE
+    return int((total_count - 1) * delay + batch_pauses * posts_preview_batch_pause_seconds(total_count))
+
+
+def format_posts_preview_duration(seconds):
+    if seconds < 60:
+        return f"~{max(int(seconds), 1)} сек."
+    return f"~{(int(seconds) + 59) // 60} мин."
 
 
 def remember_posts_preview_message(user_id, sent_message):
@@ -5297,8 +5324,8 @@ def remember_posts_preview_message(user_id, sent_message):
 def clear_posts_preview_messages(user_id):
     with posts_preview_lock:
         old_ids = posts_preview_message_ids.pop(user_id, [])
-    for msg_id in old_ids[-30:]:
-        safe_delete_message(bot, user_id, msg_id, logger=logger)
+    if old_ids:
+        safe_delete_messages(bot, user_id, old_ids, logger=logger)
 
 
 def send_post_preview_item(user_id, post):
@@ -5321,8 +5348,18 @@ def send_post_preview_item(user_id, post):
             caption=caption,
             reply_markup=markup,
             logger=logger,
+            attempts=4,
+            max_retry_after=POST_PREVIEW_MAX_RETRY_AFTER_SECONDS,
         )
-    return safe_send_message(bot, user_id, caption, reply_markup=markup, logger=logger)
+    return safe_send_message(
+        bot,
+        user_id,
+        caption,
+        reply_markup=markup,
+        logger=logger,
+        attempts=4,
+        max_retry_after=POST_PREVIEW_MAX_RETRY_AFTER_SECONDS,
+    )
 
 
 def start_posts_preview_generation(user_id):
@@ -5337,7 +5374,8 @@ def posts_preview_is_current(user_id, generation):
         return posts_preview_generation.get(user_id) == generation
 
 
-def show_posts_preview(user_id, page=0):
+def show_posts_preview(user_id):
+    """Отправляет все посты подряд; пауза между ними зависит от их количества."""
     generation = start_posts_preview_generation(user_id)
     clear_posts_preview_messages(user_id)
     try:
@@ -5355,47 +5393,61 @@ def show_posts_preview(user_id, page=0):
         return
 
     total_count = len(posts)
-    total_pages = max(1, (total_count + POST_PREVIEW_PAGE_SIZE - 1) // POST_PREVIEW_PAGE_SIZE)
-    page = max(0, min(int(page or 0), total_pages - 1))
-    chunk = posts[page * POST_PREVIEW_PAGE_SIZE:(page + 1) * POST_PREVIEW_PAGE_SIZE]
+    delay = posts_preview_delay_seconds(total_count)
+    batch_pause = posts_preview_batch_pause_seconds(total_count)
     remember_posts_preview_message(user_id, safe_send_message(
         bot,
         user_id,
-        f"Неотправленные посты: {total_count}. Страница {page + 1}/{total_pages}.\n"
-        f"Посты приходят по одному раз в {POST_PREVIEW_SEND_DELAY_SECONDS} сек.",
+        f"Неотправленные посты: {total_count}.\n"
+        f"Отправляю все по одному, раз в {delay:g} сек. "
+        f"Это займёт {format_posts_preview_duration(estimate_posts_preview_seconds(total_count))}",
         logger=logger,
     ))
 
-    for index, post in enumerate(chunk):
+    sent_count = 0
+    failed_ids = []
+    for index, post in enumerate(posts):
         if index:
-            time.sleep(POST_PREVIEW_SEND_DELAY_SECONDS)
+            pause = delay
+            if batch_pause and index % POST_PREVIEW_BATCH_SIZE == 0:
+                pause += batch_pause
+            time.sleep(pause)
         if not posts_preview_is_current(user_id, generation):
             return
+
+        started = time.monotonic()
+        sent_message = None
         try:
-            remember_posts_preview_message(user_id, send_post_preview_item(user_id, post))
+            sent_message = send_post_preview_item(user_id, post)
         except Exception as exc:
             logger.warning("Post preview send failed for user_id=%s post_id=%s: %s", user_id, post.id, exc)
-            remember_posts_preview_message(user_id, safe_send_message(
-                bot,
-                user_id,
-                f"Не удалось отправить предпросмотр поста #{post.id}.",
-                logger=logger,
-            ))
+        elapsed = time.monotonic() - started
 
-    if posts_preview_is_current(user_id, generation):
-        remember_posts_preview_message(user_id, safe_send_message(
-            bot,
-            user_id,
-            f"Страница {page + 1}/{total_pages} показана.",
-            reply_markup=build_posts_preview_keyboard(page, total_count),
-            logger=logger,
-        ))
+        if sent_message:
+            sent_count += 1
+            remember_posts_preview_message(user_id, sent_message)
+        else:
+            failed_ids.append(post.id)
+
+        # Отправка шла дольше обычного — значит Telegram просил подождать. Сбавляем скорость.
+        if elapsed > delay + 3:
+            delay = min(delay + POST_PREVIEW_SLOWDOWN_STEP_SECONDS, POST_PREVIEW_SLOWDOWN_LIMIT_SECONDS)
+            logger.info("Posts preview slowed down for user_id=%s: delay=%ss", user_id, delay)
+
+    if not posts_preview_is_current(user_id, generation):
+        return
+    summary = f"Готово: показаны все посты ({sent_count} из {total_count})."
+    if failed_ids:
+        preview = ", ".join(f"#{post_id}" for post_id in failed_ids[:20])
+        extra = "" if len(failed_ids) <= 20 else f" и ещё {len(failed_ids) - 20}"
+        summary += f"\nНе удалось отправить: {preview}{extra}. Нажмите «📄 Посты» ещё раз позже."
+    remember_posts_preview_message(user_id, safe_send_message(bot, user_id, summary, logger=logger))
 
 
-def start_posts_preview(user_id, page=0):
+def start_posts_preview(user_id):
     thread = threading.Thread(
         target=show_posts_preview,
-        args=(user_id, page),
+        args=(user_id,),
         name=f"posts-preview-{user_id}",
         daemon=True,
     )
@@ -5411,19 +5463,17 @@ def manage_posts(message):
     if get_client_role(user_id) not in POST_EDITOR_ROLES:
         safe_send_message(bot, user_id, "У вас нет прав доступа к этой функции.", logger=logger)
         return
-    start_posts_preview(user_id, page=0)
+    start_posts_preview(user_id)
 
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "posts_preview_page_"))
 def paginate_posts_preview(call):
+    # Кнопки страниц из старых сообщений: страниц больше нет, показываем все посты заново.
     if not has_role(call.from_user.id, POST_EDITOR_ROLES):
         safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
-    page = parse_callback_int_suffix(call, "posts_preview_page_", "Некорректная страница.")
-    if page is None:
-        return
-    safe_answer_callback_query(call.id)
-    start_posts_preview(call.message.chat.id, page=page)
+    safe_answer_callback_query(call.id, "Страниц больше нет — показываю все посты.")
+    start_posts_preview(call.message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "edit_post_"))
 def edit_post(call):
@@ -12101,6 +12151,8 @@ def build_missing_delivery_keyboard(session, page=0):
     ).offset(page * MISSING_DELIVERY_PAGE_SIZE).limit(MISSING_DELIVERY_PAGE_SIZE).all()
 
     keyboard = InlineKeyboardMarkup()
+    if total_count:
+        keyboard.add(InlineKeyboardButton("🔎 Найти по ID", callback_data="missing_delivery_search"))
     for item in items:
         keyboard.add(InlineKeyboardButton(
             build_missing_delivery_button_text(item),
@@ -12309,6 +12361,91 @@ def paginate_missing_delivery(call):
         return
     safe_answer_callback_query(call.id)
     show_missing_delivery_list(call.message.chat.id, call.message.message_id, page=page)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "missing_delivery_search")
+def start_missing_delivery_search(call):
+    if not has_role(call.from_user.id, DELIVERY_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    safe_answer_callback_query(call.id)
+    chat_id = callback_message_chat_id(call) or call.from_user.id
+    set_user_state(chat_id, MISSING_DELIVERY_SEARCH_STATE)
+    safe_send_message(
+        bot,
+        chat_id,
+        "Введите ID товара из списка пропажи.\nЧтобы выйти из поиска, нажмите «⬅️ Назад».",
+        logger=logger,
+    )
+
+
+def find_missing_delivery_items_by_post_id(post_id):
+    with Session(bind=engine) as session:
+        missing_items = session.query(MissingDeliveryItem).filter(
+            MissingDeliveryItem.post_id == post_id,
+            MissingDeliveryItem.status == MISSING_DELIVERY_STATUS_MISSING,
+        ).order_by(
+            MissingDeliveryItem.missing_at.desc(),
+            MissingDeliveryItem.id.desc(),
+        ).all()
+        resolved_item = None
+        if not missing_items:
+            resolved_item = session.query(MissingDeliveryItem).filter(
+                MissingDeliveryItem.post_id == post_id,
+            ).order_by(
+                MissingDeliveryItem.resolved_at.desc(),
+                MissingDeliveryItem.id.desc(),
+            ).first()
+    return missing_items, resolved_item
+
+
+@bot.message_handler(func=lambda message: message_user_state_is(message, MISSING_DELIVERY_SEARCH_STATE))
+def handle_missing_delivery_search(message):
+    if not require_role(message, DELIVERY_ROLES):
+        clear_user_state(message.chat.id)
+        return
+    text = require_text_message(message, "Введите ID товара числом.")
+    if text is None:
+        return
+    post_id_text = re.sub(r"\D", "", text)
+    if not post_id_text:
+        safe_send_message(bot, message.chat.id, "Введите ID товара числом, например 1234.", logger=logger)
+        return
+
+    post_id = int(post_id_text)
+    missing_items, resolved_item = find_missing_delivery_items_by_post_id(post_id)
+    if not missing_items:
+        if resolved_item:
+            status_label = MISSING_DELIVERY_STATUS_LABELS.get(resolved_item.status, resolved_item.status)
+            reply = (
+                f"Товар с ID {post_id} уже обработан: {status_label} "
+                f"({format_datetime(resolved_item.resolved_at)}).\n"
+                "Введите другой ID или нажмите «⬅️ Назад»."
+            )
+        else:
+            reply = f"Товара с ID {post_id} нет в списке пропажи. Введите другой ID или нажмите «⬅️ Назад»."
+        safe_send_message(bot, message.chat.id, reply, logger=logger)
+        return
+
+    clear_user_state(message.chat.id)
+    if len(missing_items) == 1:
+        show_missing_delivery_item(message.chat.id, missing_items[0].id, page=0)
+        return
+
+    keyboard = InlineKeyboardMarkup()
+    for item in missing_items[:MISSING_DELIVERY_PAGE_SIZE]:
+        keyboard.add(InlineKeyboardButton(
+            build_missing_delivery_button_text(item),
+            callback_data=f"missing_delivery_item_{item.id}_0",
+        ))
+    keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data="missing_delivery_page_0"))
+    safe_send_message(
+        bot,
+        message.chat.id,
+        f"С ID {post_id} в пропаже несколько товаров: {len(missing_items)}. Выберите нужный.",
+        reply_markup=keyboard,
+        logger=logger,
+    )
 
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "missing_delivery_item_"))

@@ -290,12 +290,13 @@ def edit_message_media_with_retries(bot, logger=None, attempts=3, **kwargs):
     )
 
 
-def safe_send_message(bot, chat_id, text, logger=None, attempts=3, **kwargs):
+def safe_send_message(bot, chat_id, text, logger=None, attempts=3, max_retry_after=30, **kwargs):
     try:
         return call_telegram_with_retries(
             lambda: bot.send_message(chat_id=chat_id, text=text, **kwargs),
             logger=logger,
             attempts=attempts,
+            max_retry_after=max_retry_after,
             description="Telegram send_message",
             idempotent=False,
         )
@@ -305,12 +306,13 @@ def safe_send_message(bot, chat_id, text, logger=None, attempts=3, **kwargs):
         return None
 
 
-def safe_send_photo(bot, chat_id, photo, logger=None, attempts=3, **kwargs):
+def safe_send_photo(bot, chat_id, photo, logger=None, attempts=3, max_retry_after=30, **kwargs):
     try:
         return call_telegram_with_retries(
             lambda: bot.send_photo(chat_id=chat_id, photo=photo, **kwargs),
             logger=logger,
             attempts=attempts,
+            max_retry_after=max_retry_after,
             description="Telegram send_photo",
             idempotent=False,
         )
@@ -395,3 +397,30 @@ def send_document_file(bot, chat_id, file_path, caption=None, logger=None, attem
         description="Telegram send_document file",
         idempotent=False,
     )
+
+
+def safe_delete_messages(bot, chat_id, message_ids, logger=None, chunk_size=100):
+    """Удаляет много сообщений пачками (до 100 за запрос), при ошибке — по одному."""
+    message_ids = [int(message_id) for message_id in message_ids if message_id]
+    deleted = 0
+    for start in range(0, len(message_ids), chunk_size):
+        chunk = message_ids[start:start + chunk_size]
+        try:
+            call_telegram_with_retries(
+                lambda chunk=chunk: bot.delete_messages(chat_id, chunk),
+                logger=logger,
+                attempts=2,
+                description="Telegram delete_messages",
+            )
+            deleted += len(chunk)
+        except Exception as exc:
+            if logger:
+                logger.debug(
+                    "Telegram delete_messages failed for chat=%s, deleting one by one: %s",
+                    chat_id,
+                    sanitize_telegram_error_text(exc),
+                )
+            for message_id in chunk:
+                if safe_delete_message(bot, chat_id, message_id, logger=logger):
+                    deleted += 1
+    return deleted
