@@ -204,8 +204,14 @@ def calculate_statistics_snapshot(current=None):
             cursor.execute(
                 "SELECT id, chat_id, created_at FROM posts "
                 "WHERE created_at >= %s AND created_at < %s "
-                "AND created_at::time <> TIME '00:00:00'",
-                (query_start, query_end),
+                "AND created_at::time <> TIME '00:00:00' "
+                "UNION ALL "
+                "SELECT s.post_id, s.chat_id, s.created_at FROM deleted_post_snapshots s "
+                "WHERE s.created_at >= %s AND s.created_at < %s "
+                "AND s.created_at::time <> TIME '00:00:00' "
+                "AND s.reason LIKE 'delivery_cleanup%%' "
+                "AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.id = s.post_id)",
+                (query_start, query_end, query_start, query_end),
             )
             posts = cursor.fetchall()
 

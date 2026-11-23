@@ -1,3 +1,4 @@
+import os
 import re
 import time
 
@@ -11,6 +12,8 @@ EXPECTED_DELETE_ERRORS = (
 )
 
 MESSAGE_NOT_MODIFIED = "message is not modified"
+NO_TEXT_IN_MESSAGE = "there is no text in the message to edit"
+NO_CAPTION_IN_MESSAGE = "there is no caption in the message to edit"
 TRANSIENT_TELEGRAM_ERROR_CODES = {500, 502, 503, 504}
 TRANSIENT_TELEGRAM_ERRORS = (
     "connect timeout",
@@ -40,6 +43,14 @@ def _error_text(exc):
 
 def is_message_not_modified_error(exc):
     return MESSAGE_NOT_MODIFIED in _error_text(exc)
+
+
+def is_no_text_in_message_error(exc):
+    return NO_TEXT_IN_MESSAGE in _error_text(exc)
+
+
+def is_no_caption_in_message_error(exc):
+    return NO_CAPTION_IN_MESSAGE in _error_text(exc)
 
 
 def is_expected_delete_error(exc):
@@ -90,6 +101,26 @@ def is_transient_telegram_error(exc):
     return any(marker in text for marker in TRANSIENT_TELEGRAM_ERRORS)
 
 
+# Ошибки, при которых запрос точно не дошёл до Telegram: повтор отправки не создаст дубль.
+REQUEST_NOT_DELIVERED_ERRORS = (
+    "connect timeout",
+    "connecttimeout",
+    "failed to establish a new connection",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+    "connection refused",
+)
+
+
+def is_safe_to_resend_error(exc):
+    """Для отправки сообщений повторяем только если запрос гарантированно не был доставлен."""
+    if telegram_retry_after_seconds(exc) is not None:
+        return True
+    text = _error_text(exc)
+    return any(marker in text for marker in REQUEST_NOT_DELIVERED_ERRORS)
+
+
 def call_telegram_with_retries(
     operation,
     logger=None,
@@ -97,6 +128,7 @@ def call_telegram_with_retries(
     base_delay=2,
     max_retry_after=30,
     description="Telegram request",
+    idempotent=True,
 ):
     last_error = None
     for attempt in range(1, attempts + 1):
@@ -105,9 +137,10 @@ def call_telegram_with_retries(
         except Exception as exc:
             last_error = exc
             retry_after = telegram_retry_after_seconds(exc)
+            retryable = is_transient_telegram_error(exc) if idempotent else is_safe_to_resend_error(exc)
             should_retry = (
                 attempt < attempts
-                and is_transient_telegram_error(exc)
+                and retryable
                 and (retry_after is None or retry_after <= max_retry_after)
             )
             if not should_retry:
@@ -169,7 +202,7 @@ def safe_edit_message_text(bot, logger=None, **kwargs):
         )
     except Exception as exc:
         if logger:
-            if is_message_not_modified_error(exc):
+            if is_message_not_modified_error(exc) or is_no_text_in_message_error(exc):
                 logger.debug("Telegram edit_message_text skipped: %s", sanitize_telegram_error_text(exc))
             else:
                 logger.warning("Telegram edit_message_text failed: %s", sanitize_telegram_error_text(exc))
@@ -186,11 +219,66 @@ def safe_edit_message_caption(bot, logger=None, **kwargs):
         )
     except Exception as exc:
         if logger:
-            if is_message_not_modified_error(exc):
+            if is_message_not_modified_error(exc) or is_no_caption_in_message_error(exc):
                 logger.debug("Telegram edit_message_caption skipped: %s", sanitize_telegram_error_text(exc))
             else:
                 logger.warning("Telegram edit_message_caption failed: %s", sanitize_telegram_error_text(exc))
         return None
+
+
+def safe_edit_message_text_or_caption(bot, logger=None, prefer_caption=False, **kwargs):
+    text = kwargs.pop("text", None)
+    caption = kwargs.pop("caption", None)
+    content = caption if caption is not None else text
+    if content is None:
+        return None
+
+    kinds = ("caption", "text") if prefer_caption else ("text", "caption")
+    for index, kind in enumerate(kinds):
+        try:
+            if kind == "text":
+                return call_telegram_with_retries(
+                    lambda value=content: bot.edit_message_text(text=value, **kwargs),
+                    logger=logger,
+                    attempts=3,
+                    description="Telegram edit_message_text",
+                )
+            return call_telegram_with_retries(
+                lambda value=content: bot.edit_message_caption(caption=value, **kwargs),
+                logger=logger,
+                attempts=3,
+                description="Telegram edit_message_caption",
+            )
+        except Exception as exc:
+            expected_switch = (
+                (kind == "text" and is_no_text_in_message_error(exc))
+                or (kind == "caption" and is_no_caption_in_message_error(exc))
+            )
+            if expected_switch and index == 0:
+                if logger:
+                    logger.debug(
+                        "Telegram edit_message_%s skipped, retrying as %s: %s",
+                        kind,
+                        kinds[1],
+                        sanitize_telegram_error_text(exc),
+                    )
+                continue
+            if is_message_not_modified_error(exc):
+                if logger:
+                    logger.debug(
+                        "Telegram edit_message_%s skipped: %s",
+                        kind,
+                        sanitize_telegram_error_text(exc),
+                    )
+                return True
+            if logger:
+                logger.warning(
+                    "Telegram edit_message_%s failed: %s",
+                    kind,
+                    sanitize_telegram_error_text(exc),
+                )
+            return None
+    return None
 
 
 def edit_message_media_with_retries(bot, logger=None, attempts=3, **kwargs):
@@ -209,6 +297,7 @@ def safe_send_message(bot, chat_id, text, logger=None, attempts=3, **kwargs):
             logger=logger,
             attempts=attempts,
             description="Telegram send_message",
+            idempotent=False,
         )
     except Exception as exc:
         if logger:
@@ -223,6 +312,7 @@ def safe_send_photo(bot, chat_id, photo, logger=None, attempts=3, **kwargs):
             logger=logger,
             attempts=attempts,
             description="Telegram send_photo",
+            idempotent=False,
         )
     except Exception as exc:
         if logger:
@@ -237,6 +327,7 @@ def safe_send_animation(bot, chat_id, animation, logger=None, attempts=3, **kwar
             logger=logger,
             attempts=attempts,
             description="Telegram send_animation",
+            idempotent=False,
         )
     except Exception as exc:
         if logger:
@@ -251,6 +342,7 @@ def safe_send_document(bot, chat_id, document, logger=None, attempts=3, **kwargs
             logger=logger,
             attempts=attempts,
             description="Telegram send_document",
+            idempotent=False,
         )
     except Exception as exc:
         if logger:
@@ -264,6 +356,7 @@ def send_photo_or_text(bot, chat_id, photo, text, reply_markup=None, caption_lim
             lambda: bot.send_photo(chat_id, photo=photo, caption=text, reply_markup=reply_markup),
             attempts=3,
             description="Telegram send_photo",
+            idempotent=False,
         )
 
     if photo:
@@ -271,10 +364,34 @@ def send_photo_or_text(bot, chat_id, photo, text, reply_markup=None, caption_lim
             lambda: bot.send_photo(chat_id, photo=photo),
             attempts=3,
             description="Telegram send_photo",
+            idempotent=False,
         )
 
     return call_telegram_with_retries(
         lambda: bot.send_message(chat_id, text, reply_markup=reply_markup),
         attempts=3,
         description="Telegram send_message",
+        idempotent=False,
+    )
+
+
+def send_document_file(bot, chat_id, file_path, caption=None, logger=None, attempts=3, timeout=300):
+    """Отправляет файл с диска; на каждой попытке файл открывается заново, чтобы повтор не ушёл пустым."""
+    from telebot.types import InputFile
+
+    def operation():
+        with open(file_path, "rb") as document_file:
+            return bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(document_file, file_name=os.path.basename(file_path)),
+                caption=caption,
+                timeout=timeout,
+            )
+
+    return call_telegram_with_retries(
+        operation,
+        logger=logger,
+        attempts=attempts,
+        description="Telegram send_document file",
+        idempotent=False,
     )

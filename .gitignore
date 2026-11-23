@@ -26,3 +26,16 @@ android_post_stats/local.properties
 android_post_stats/web_preview/config.local.js
 tools/button_restart_agent/button_restart_agent.config.json
 tools/button_restart_agent/*.log
+
+# Секреты сервисных аккаунтов
+google_service_account.json
+*service_account*.json
+
+# Локальные бэкапы и мусор
+backups/
+deploy_backups/
+*.bak_*
+*.dump
+config.
+sage.chat.id,
+ystemctl*

@@ -114,20 +114,3 @@ class Temp_Fulfilled(AbstractModel):
             session.rollback()
             logger.exception("Temp fulfilled update failed for record_id=%s: %s", record_id, e)
             return False
-
-    @staticmethod
-    def cleanup_old_records(session: Session) -> int:
-        """Удаляет записи, которые старше 7 дней."""
-        try:
-            limit_date = local_now_naive() - datetime.timedelta(days=7)
-            old_records = session.query(Temp_Fulfilled).filter(Temp_Fulfilled.created_at < limit_date).all()
-
-            deleted_count = len(old_records)
-            for record in old_records:
-                session.delete(record)
-            session.commit()
-            return deleted_count
-        except SQLAlchemyError as e:
-            session.rollback()
-            logger.exception("Temp fulfilled cleanup failed: %s", e)
-            return 0

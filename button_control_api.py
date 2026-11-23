@@ -372,7 +372,9 @@ class ButtonControlServer(ThreadingHTTPServer):
 
 
 def main():
-    host = os.environ.get("FINAL_BOT_BUTTON_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    # По умолчанию только локально: токен передаётся по обычному HTTP.
+    # Для доступа из сети задайте FINAL_BOT_BUTTON_HOST явно (лучше за HTTPS-прокси или VPN).
+    host = os.environ.get("FINAL_BOT_BUTTON_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = get_int_env("FINAL_BOT_BUTTON_PORT", 8092)
     token = get_required_env("FINAL_BOT_BUTTON_TOKEN")
     server = ButtonControlServer((host, port), ButtonControlHandler, token)

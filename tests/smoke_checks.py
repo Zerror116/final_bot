@@ -338,8 +338,7 @@ def test_callback_answers_are_safe():
         'delivery_id = parse_callback_int_suffix(call, "delivery_finish_continue_")',
         'page = parse_callback_int_suffix(call, "missing_delivery_page_", "Некорректная страница.")',
         'item_id = parse_callback_int_suffix(call, "select_defective_")',
-        'item_id = parse_callback_int_suffix(call, "confirm_discount_", "Ошибка: некорректные данные.")',
-        'item_id = parse_callback_int_suffix(call, "return_discount_", "Ошибка: некорректные данные.")',
+        'match = re.match(r"^(confirm_discount|return_discount)_(\\d+)(?:_(\\d+))?$", str(call.data or ""))',
         'and not callback_data_startswith(call, "select_defective_")',
         "def is_admin_defect_action_callback(call):",
         'data.startswith("defect_") and not data.startswith("defect_items_page_")',
@@ -1077,16 +1076,12 @@ def test_phoenix_broadcast_markers():
 
     if not qr_path.exists():
         raise AssertionError("Phoenix QR image is missing")
-    if not channel_footer_path.exists():
-        raise AssertionError("Phoenix channel footer image is missing")
+    if channel_footer_path.exists():
+        raise AssertionError("Phoenix channel footer image must be removed")
 
     for marker in [
         'PHOENIX_BROADCAST_BUTTON = "Рассылка о Фениксе"',
         'PHOENIX_BROADCAST_BATCH_SIZE = env_int("PHOENIX_BROADCAST_BATCH_SIZE", 50, minimum=1)',
-        "PHOENIX_CHANNEL_FOOTER_IMAGE_PATH",
-        "PHOENIX_CHANNEL_FOOTER_TEXT",
-        "Возвращение Феникса, большое обновление ВК",
-        "https://vk.ru/club239413025",
         "def require_creator",
         "def get_phoenix_broadcast_recipients",
         "def run_phoenix_broadcast",
@@ -1240,7 +1235,7 @@ def test_channel_post_auto_publish_markers():
         "channel_post_publish_lock = threading.Lock()",
         "CHANNEL_POST_SEND_ATTEMPTS = 3",
         "def send_channel_post_with_retries(post, caption, markup, source):",
-        "is_transient_telegram_error(exc)",
+        "is_safe_to_resend_error(exc)",
         "def send_archive_post_copy_best_effort(post_id, photo, group_caption):",
         "Archive copy failed for post_id=%s",
         "Archive copy returned no message for post_id=%s",
@@ -1253,20 +1248,18 @@ def test_channel_post_auto_publish_markers():
         "value.minute == 0",
         "def start_channel_post_auto_publish_worker():",
         "start_channel_post_auto_publish_worker()",
-        "def send_phoenix_channel_footer():",
-        "PHOENIX_CHANNEL_FOOTER_IMAGE_PATH",
-        "PHOENIX_CHANNEL_FOOTER_TEXT",
         "send_photo_or_text(",
-        'if source == "auto" and sent_count and not failed_post_ids:',
-        "send_phoenix_channel_footer()",
-        "Phoenix footer sent to channel after post publish",
-        "group_caption = f\"Id товара: {post_id}\\nПост был создан пользователем: {creator_name}",
+        'archive_lines = [f"Id товара: {post_id}"]',
+        'archive_lines.append(f"Пост был создан пользователем: {creator_name}")',
     ]:
         if marker not in text:
             raise AssertionError(f"channel post auto publish marker missing {marker}")
+    for marker in ["PHOENIX_CHANNEL_FOOTER", "send_phoenix_channel_footer"]:
+        if marker in text:
+            raise AssertionError(f"Phoenix channel footer must be removed: {marker}")
 
     publish_block = text.split("def publish_unsent_posts_to_channel(", 1)[1].split(
-        "def send_phoenix_channel_footer(",
+        "def should_auto_publish_channel_posts(",
         1,
     )[0]
     if "send_archive_post_copy_best_effort(post_id, photo, group_caption)" not in publish_block:
@@ -1274,7 +1267,6 @@ def test_channel_post_auto_publish_markers():
     if "archive_message = send_photo_or_text(" in publish_block:
         raise AssertionError("archive copy must not interrupt channel post publish loop")
     for marker in [
-        "post_has_active_links(session, post_id)",
         "Channel post publish skipped unavailable post_id=",
         "int(live.quantity or 0) <= 0",
     ]:
@@ -1602,7 +1594,7 @@ def test_revision_excludes_linked_posts_and_logs_work():
         "MissingDeliveryItem.status == MISSING_DELIVERY_STATUS_MISSING",
         "Posts.quantity > 0",
         "session.add(RevisionLog(",
-        "Исключено из-за корзины/доставки/очереди",
+        "Из них с бронями (уценён только свободный остаток)",
         "new_price = calculate_audit_price(old_price)",
         "post.price = new_price",
         "disable_reason=\"Товар на ревизии\"",
@@ -1682,32 +1674,10 @@ def test_delivery_cleanup_schedule_markers():
 
 def test_midnight_posts_are_snapshotted_before_delete():
     text = MAIN.read_text(encoding="utf-8")
-    for marker in [
-        "def ensure_deleted_post_snapshot(session, post, reason):",
-        "def cleanup_midnight_posts_after_snapshot",
-        "post.created_at.time() == datetime.min.time()",
-        "session.delete(post)",
-        "with_reservations",
-        "with_in_delivery",
-        "with_temp_fulfilled",
-        "with_wait_queue",
-        "with_collection_items",
-        "with_missing_delivery",
-        "skipped_active",
-        "if post_has_active_links(session, post.id):",
-    ]:
-        if marker not in text:
-            raise AssertionError(f"midnight cleanup marker missing {marker}")
-    cleanup_block = text.split("def cleanup_midnight_posts_after_snapshot", 1)[1].split(
-        "def keyboard_for_editing",
-        1,
-    )[0]
-    assert_marker_order(
-        cleanup_block,
-        "if post_has_active_links(session, post.id):",
-        "session.delete(post)",
-        "midnight cleanup must skip active linked posts before deleting",
-    )
+    if "def ensure_deleted_post_snapshot(session, post, reason):" not in text:
+        raise AssertionError("deleted post snapshot helper is missing")
+    if "def cleanup_midnight_posts_after_snapshot" in text:
+        raise AssertionError("unused midnight cleanup must stay removed")
 
 
 def test_cart_clear_processed_is_available():
@@ -1783,7 +1753,8 @@ def test_client_delete_uses_safe_cart_cleanup():
         "remove_reservation_from_cart(session, reservation, stats, queued_notifications)",
         "cleanup_or_refresh_for_delivery_by_phone(session, phone)",
         "send_queue_transfer_notifications(queued_notifications)",
-        "cleanup_stats = delete_client_active_records(client_user_id, phone)",
+        "merge_cart_cleanup_stats(cleanup_stats, delete_client_active_records(client.user_id, phone))",
+        "clients = Clients.get_rows_by_phone(phone) if phone else []",
         "format_cart_cleanup_result(cleanup_stats)",
     ]:
         if marker not in text:
@@ -1911,10 +1882,10 @@ def test_delivery_cart_merge_works_without_for_delivery_rows():
         "def find_client_by_phone_input(session, raw_phone):",
         "def merge_or_unmerge_delivery_carts(session, main_phone, extra_phone_text):",
         "def unmerge_delivery_carts(session, main_phone, extra_phone):",
-        "def apply_persistent_cart_merges_for_phone(session, phone):",
+        "def apply_persistent_cart_merges_for_phone(session, phone, lock=False):",
         "apply_merges=True",
         "apply_persistent_cart_merges_for_phone(session, delivery_entry.phone)",
-        "apply_persistent_cart_merges_for_phone(session, root_entry.phone)",
+        "apply_persistent_cart_merges_for_phone(session, main_phone, lock=True)",
         "Корзины разъединены.",
         "Когда основная корзина попадёт в список сборки, дополнительная тоже будет добавлена.",
         "Если введёте уже объединённый номер, корзины разъединятся.",
@@ -2373,12 +2344,42 @@ def test_delivery_collection_item_and_missing_markers():
         1,
     )[0]
     for marker in [
-        "deduplicate_for_delivery_entries(session)",
-        "ForDelivery.merged_into_delivery_id == None",
-        "sync_delivery_entry_total_sum(session, row)",
+        "visible_delivery_collection_query(session)",
+        "extra_delivery_collection_phones(session)",
+        "~ForDelivery.phone.in_(list(extra_phones))",
+        "calculate_delivery_entry_list_total(session, row)",
     ]:
-        if marker not in keyboard_block:
+        if marker not in keyboard_block and marker not in main_text:
             raise AssertionError(f"delivery collection list marker missing {marker}")
+    if "apply_persistent_cart_merges_for_phone(session, entry.phone, lock=True)" in keyboard_block:
+        raise AssertionError("delivery collection list must not lock all carts with merge apply")
+    if "deduplicate_for_delivery_entries(session)" in keyboard_block:
+        raise AssertionError("delivery collection list must not rewrite all carts on every open")
+
+    list_block = main_text.split("def show_delivery_collection_list(", 1)[1].split(
+        "def paginate_delivery_collection(",
+        1,
+    )[0]
+    for marker in [
+        "is_transient_database_error(exc)",
+        "Список сборки сейчас занят. Нажмите «Собрать доставку» ещё раз.",
+    ]:
+        if marker not in list_block:
+            raise AssertionError(f"delivery collection list lock timeout marker missing {marker}")
+
+    open_block = main_text.split("def show_delivery_collection_client(", 1)[1].split(
+        "def build_delivery_collection_finish_keyboard(",
+        1,
+    )[0]
+    for marker in [
+        "is_transient_database_error(exc)",
+        "Корзина сейчас занята. Нажмите на клиента ещё раз.",
+        "resolve_delivery_collection_root_entry(session, delivery_entry, lock=True)",
+        "apply_persistent_cart_merges_for_phone(session, delivery_entry.phone, lock=False)",
+        "refresh_stale_uncollected_delivery_entry(session, delivery_entry)",
+    ]:
+        if marker not in open_block:
+            raise AssertionError(f"delivery collection open lock timeout marker missing {marker}")
 
     dedupe_block = main_text.split("def deduplicate_for_delivery_entries(", 1)[1].split(
         "@bot.message_handler(func=lambda message: message.text == \"👨‍🦯 Засунуть в доставку\")",
@@ -2652,7 +2653,7 @@ def test_delivery_collection_report_group_markers():
         "SELECT pg_advisory_lock(:lock_key)",
         "def release_delivery_collection_report_db_lock(connection):",
         "SELECT pg_advisory_unlock(:lock_key)",
-        "is_transient_telegram_error(exc) and attempt < attempts",
+        "is_safe_to_resend_error(exc) and attempt < attempts",
         "Delivery collection report header send failed attempt=%s/%s, retrying in %ss: %s",
         "Delivery collection report item send failed attempt=%s/%s, retrying in %ss: %s",
         "DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS * attempt",
@@ -2767,27 +2768,23 @@ def test_defect_pagination_and_menu_markers():
         "discount_message = safe_send_message(",
         "if not discount_message:",
         "Не удалось отправить предложение скидки клиенту. Попробуйте позже.",
-        "clear_user_state(client.user_id)",
+        "item.skidka_price = discount_amount",
     ]:
         if marker not in discount_amount_block:
             raise AssertionError(f"discount amount state marker missing {marker}")
-    assert_marker_order(
-        discount_amount_block,
-        "discount_message = safe_send_message(",
-        "set_user_state(\n            client.user_id,",
-        "client discount state must be set only after the offer message is sent",
-    )
+    if "set_user_state(\n            client.user_id," in discount_amount_block:
+        raise AssertionError("discount offer must not overwrite the client's current state")
 
     discount_confirmation_block = main_text.split("def handle_discount_confirmation(call):", 1)[1].split(
         "def contact_client(call, user_id):",
         1,
     )[0]
     for marker in [
-        'state.get("action") != "confirm_discount"',
+        "discount_amount = int(item.skidka_price or 0)",
         "with_for_update().first()",
         "if item.defect or item.skidka:",
         'safe_answer_callback_query(call.id, "Этот товар уже обработан.", show_alert=True)',
-        "clear_user_state(user_id)",
+        "get_related_user_ids_by_full_phone(user_id)",
     ]:
         if marker not in discount_confirmation_block:
             raise AssertionError(f"discount confirmation idempotency marker missing {marker}")
@@ -3079,7 +3076,7 @@ def test_env_example_documents_runtime_options():
         "# TELEGRAM_PROXY_PASSWORD=",
         "# TELEGRAM_STARTUP_RETRY_SECONDS=5",
         "# TELEGRAM_STARTUP_MAX_RETRY_SECONDS=60",
-        "# TELEGRAM_API_RETRY_ON_ERROR=true",
+        "# TELEGRAM_API_RETRY_ON_ERROR=false",
         "# TELEGRAM_API_MAX_RETRIES=3",
         "# TELEGRAM_API_RETRY_TIMEOUT_SECONDS=2",
         "# TELEGRAM_POLLING_TIMEOUT_SECONDS=15",
@@ -3090,7 +3087,7 @@ def test_env_example_documents_runtime_options():
         "# STATISTIC_API_REFRESH_SECONDS=3600",
         "# STATISTIC_API_CORS_ORIGIN=http://127.0.0.1:8765,http://localhost:8765",
         "# FINAL_BOT_BUTTON_TOKEN=",
-        "# FINAL_BOT_BUTTON_HOST=0.0.0.0",
+        "# FINAL_BOT_BUTTON_HOST=127.0.0.1",
         "# FINAL_BOT_BUTTON_PORT=8092",
         "# FINAL_BOT_SERVICE_NAME=final_bot.service",
         "# FINAL_BOT_BUTTON_RESTART_COOLDOWN_SECONDS=30",
@@ -3349,7 +3346,7 @@ def test_post_creation_state_updates_are_atomic():
         "temp_post_data.update_dict(message.chat.id, {\"photo\": photos[-1].file_id})",
         "temp_post_data.update_dict(chat_id, {\"price\": text})",
         "temp_post_data.update_dict(chat_id, {\"description\": description})",
-        "data = dict(temp_post_data.update_dict(chat_id, {\"quantity\": quantity}))",
+        "data = dict(temp_post_data.update_dict(chat_id, {\"shelf\": shelf}))",
         "Сначала отправьте фото товара.",
     ]:
         if marker not in main_text:
@@ -3399,7 +3396,7 @@ def test_temp_user_data_flows_reset_when_memory_is_missing():
         ],
         "def handle_new_phone(message):": [
             'required_fields=("name", "phone", "address", "final_sum", "delivery_cutoff_at")',
-            "flow_data[\"phone\"] = new_phone",
+            "flow_data[\"contact_phone\"] = new_phone",
         ],
         "def handle_confirmation(call):": [
             'required_fields=("name", "phone", "address", "final_sum", "delivery_cutoff_at")',
@@ -4025,7 +4022,7 @@ def test_direct_send_photo_is_limited_to_channel_retry_loop():
         "return bot.send_message(",
         "return bot.send_photo(",
         "telegram_retry_after_seconds(exc)",
-        "is_transient_telegram_error(exc)",
+        "is_safe_to_resend_error(exc)",
     ]:
         if marker not in channel_send_block:
             raise AssertionError(f"channel send retry marker missing {marker}")

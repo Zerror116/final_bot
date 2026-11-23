@@ -1,7 +1,12 @@
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
+from database.config import ADMIN_USER_ID
 
-def supreme_leader_main_menu():
+
+CREATOR_USER_ID = ADMIN_USER_ID
+
+
+def supreme_leader_main_menu(user_id=None):
     leader_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     create_new_post = KeyboardButton("➕ Новый пост")
     manage_posts = KeyboardButton("📄 Посты")
@@ -18,13 +23,17 @@ def supreme_leader_main_menu():
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
                         delivery_management, orders_in_delivery, manage_workers, audit_manage, i_have_a_defect,
                         phoenix_broadcast, reservation_stats)
+    try:
+        if user_id is not None and int(user_id) == int(CREATOR_USER_ID):
+            leader_keyboard.add(KeyboardButton("DOOM"))
+    except (TypeError, ValueError):
+        pass
     return leader_keyboard
 
 def client_main_menu():
     client_keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     my_orders = KeyboardButton("🛒 Мои заказы")
-    i_have_a_defect = KeyboardButton("😞 У меня брак")
-    client_keyboard.add(my_orders, i_have_a_defect)
+    client_keyboard.add(my_orders)
     return client_keyboard
 
 def worker_main_menu():
@@ -54,6 +63,7 @@ def admin_main_menu():
     manage_clients = KeyboardButton("⚙️ Клиенты")
     delivery_management = KeyboardButton("🚚 Управление доставкой")
     manage_workres = KeyboardButton("👔 Назначить работника")
+    audit_manage = KeyboardButton("Ревизия")
     admin_keyboard.add(
         create_new_post,
         my_orders,
@@ -62,6 +72,7 @@ def admin_main_menu():
         manage_clients,
         delivery_management,
         manage_workres,
+        audit_manage,
     )
     return admin_keyboard
 def unknown_main_menu():

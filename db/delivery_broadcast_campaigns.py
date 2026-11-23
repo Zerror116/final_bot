@@ -1,7 +1,7 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import BIGINT, Date, DateTime, Index, Integer, String
+from sqlalchemy import BIGINT, Date, DateTime, Index, Integer, String, Text
 from sqlalchemy.orm import mapped_column
 
 from .db import AbstractModel
@@ -29,5 +29,6 @@ class DeliveryBroadcastCampaign(AbstractModel):
     started_by_user_id = mapped_column(BIGINT, nullable=True)
     summary_chat_id = mapped_column(BIGINT, nullable=True)
     summary_message_id = mapped_column(BIGINT, nullable=True)
+    summary_message_ids = mapped_column(Text, nullable=True)
     last_scan_at = mapped_column(DateTime, nullable=True)
     finished_at = mapped_column(DateTime, nullable=True)

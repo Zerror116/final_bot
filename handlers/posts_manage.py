@@ -1,8 +1,8 @@
-from db import Posts
+from db.posts import Posts, normalize_shelf
 
 
 # Сохранение поста
-def save_post(chat_id: int, photo: str, price: str, description: str, quantity: int, post_id: int = None):
+def save_post(chat_id: int, photo: str, price: str, description: str, quantity: int, post_id: int = None, shelf: str = None):
     """Сохранение поста в базу данных."""
     return Posts.insert(
         chat_id=chat_id,
@@ -11,6 +11,7 @@ def save_post(chat_id: int, photo: str, price: str, description: str, quantity: 
         description=description,
         quantity=quantity,
         post_id=post_id,
+        shelf=shelf,
     )
 
 

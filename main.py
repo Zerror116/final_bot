@@ -1,7 +1,10 @@
+import hmac
 import io
 import logging
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import telebot
@@ -11,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from bot import admin_main_menu, client_main_menu, worker_main_menu, unknown_main_menu, supreme_leader_main_menu, audit_main_menu
+from bot.keyboard import CREATOR_USER_ID
 from telebot import types, apihelper
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputFile, InputMediaAnimation
 from database.config import *
@@ -22,6 +26,14 @@ from db.deleted_post_snapshots import DeletedPostSnapshot
 from db.delivery_cleanup_runs import DeliveryCleanupRun
 from db.revision_logs import RevisionLog
 from db.reservation_stat_events import ReservationStatEvent
+from db.post_id_reservations import PostIdReservation
+from db.posts import (
+    AUDIT_STATUS_FOUND,
+    AUDIT_STATUS_NOT_FOUND,
+    mark_shelf_not_found,
+    parse_shelf_from_description,
+    resolve_post_shelf,
+)
 from db.delivery_broadcast_campaigns import DeliveryBroadcastCampaign
 from db.delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from db.delivery_collection_items import DeliveryCollectionItem
@@ -44,16 +56,19 @@ from services.session_store import PersistentBucket
 from services.telegram_safe import (
     call_telegram_with_retries,
     edit_message_media_with_retries,
+    is_safe_to_resend_error,
     is_transient_telegram_error,
     is_message_not_modified_error,
     safe_delete_message,
     safe_edit_message_caption,
     safe_edit_message_text,
+    safe_edit_message_text_or_caption,
     safe_send_animation,
     safe_send_document,
     safe_send_message,
     safe_send_photo,
     sanitize_telegram_error_text,
+    send_document_file,
     send_photo_or_text,
 )
 from services.google_sheets_delivery import (
@@ -62,6 +77,7 @@ from services.google_sheets_delivery import (
     sync_payroll_sheet_week,
     write_delivery_collector_name,
 )
+from services.db_backup import DatabaseBackupError, create_database_backup
 
 
 def env_bool(name, default=False):
@@ -97,6 +113,7 @@ def env_float(name, default, minimum=None):
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ADMIN_ROLES = {"admin", "supreme_leader"}
 POST_EDITOR_ROLES = {"worker", "admin", "supreme_leader", "audit"}
+REVISION_ROLES = {"audit", "admin", "supreme_leader"}
 DELIVERY_ROLES = {"admin", "supreme_leader"}
 DELIVERY_COLLECTION_ROLES = DELIVERY_ROLES | {"audit"}
 DELIVERY_THRESHOLD = 1500
@@ -147,13 +164,18 @@ DELIVERY_RECIPIENT_RESPONSE_LABELS = {
     DELIVERY_RECIPIENT_RESPONSE_ACCEPTED: "Согласился",
     DELIVERY_RECIPIENT_RESPONSE_DECLINED: "Отказался",
 }
+DELIVERY_RECIPIENT_RESPONSE_WAITING_LABEL = "Не ответил"
+TELEGRAM_TEXT_SAFE_LIMIT = 3800
 AUTO_CHANNEL_POST_HOURS = {10, 12, 14, 16}
 AUTO_CHANNEL_POST_CHECK_SECONDS = 30
 CHANNEL_POST_SEND_ATTEMPTS = 3
 CHANNEL_POST_SEND_RETRY_SECONDS = 5
+POST_PREVIEW_PAGE_SIZE = 8
+POST_PREVIEW_SEND_DELAY_SECONDS = 5
+REVISION_CHANNEL_DELETE_DELAY_SECONDS = 0.35
 TELEGRAM_STARTUP_RETRY_SECONDS = env_float("TELEGRAM_STARTUP_RETRY_SECONDS", 5, minimum=0)
 TELEGRAM_STARTUP_MAX_RETRY_SECONDS = env_float("TELEGRAM_STARTUP_MAX_RETRY_SECONDS", 60, minimum=1)
-TELEGRAM_API_RETRY_ON_ERROR = env_bool("TELEGRAM_API_RETRY_ON_ERROR", True)
+TELEGRAM_API_RETRY_ON_ERROR = env_bool("TELEGRAM_API_RETRY_ON_ERROR", False)
 TELEGRAM_API_MAX_RETRIES = env_int("TELEGRAM_API_MAX_RETRIES", 3, minimum=1)
 TELEGRAM_API_RETRY_TIMEOUT_SECONDS = env_float("TELEGRAM_API_RETRY_TIMEOUT_SECONDS", 2, minimum=0)
 TELEGRAM_POLLING_TIMEOUT_SECONDS = env_int("TELEGRAM_POLLING_TIMEOUT_SECONDS", 15, minimum=1)
@@ -175,6 +197,14 @@ PAYROLL_SHEET_SYNC_WEEKDAY = 4
 PAYROLL_SHEET_SYNC_HOUR = 23
 PAYROLL_SHEET_SYNC_MINUTE = 0
 PAYROLL_SHEET_SYNC_CHECK_SECONDS = 60
+DB_BACKUP_STATE_KEY = 4
+DB_BACKUP_HOUR = env_int("DB_BACKUP_HOUR", 18, minimum=0)
+DB_BACKUP_MINUTE = env_int("DB_BACKUP_MINUTE", 0, minimum=0)
+DB_BACKUP_CHECK_SECONDS = 60
+DB_BACKUP_RETRY_MINUTES = 30
+DB_BACKUP_MAX_ATTEMPTS_PER_DAY = 3
+DB_BACKUP_TIMEOUT_SECONDS = env_int("DB_BACKUP_TIMEOUT_SECONDS", 600, minimum=60)
+TELEGRAM_BOT_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024
 RESERVATION_DB_RETRY_ATTEMPTS = env_int("RESERVATION_DB_RETRY_ATTEMPTS", 5, minimum=1)
 RESERVATION_DB_RETRY_BASE_SECONDS = env_float("RESERVATION_DB_RETRY_BASE_SECONDS", 0.5, minimum=0)
 RESERVED_GROUP_FLOW_STATE_KEY = 0
@@ -199,11 +229,6 @@ PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS = env_float(
     "PHOENIX_BROADCAST_BATCH_PAUSE_SECONDS", 10, minimum=0
 )
 PHOENIX_QR_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "phoenix_qr.jpg")
-PHOENIX_CHANNEL_FOOTER_IMAGE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "images",
-    "phoenix_channel_footer.jpg",
-)
 ORDER_CART_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "my_cart.jpg")
 DELIVERY_ORDER_GIF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "delivery_order.gif")
 PHOENIX_BROADCAST_TEXT = (
@@ -213,33 +238,6 @@ PHOENIX_BROADCAST_TEXT = (
     "В ближайшее время полностью перейдем в Феникс, так же будут разыгрываться призы среди пользователей Феникса\n"
     "Сайт: https://garphoenix.com/join/INV-R9JQ-F8UW?tenant=default (скопируйте и вставьте в браузер, т.к телеграмм может не пропустить на сайт)\n"
     "Или можете перейти через QR-код"
-)
-PHOENIX_CHANNEL_FOOTER_TEXT = (
-    "🔥 Важные новости от «Мега Скидки»: Возвращение Феникса, большое обновление ВК и наши запасные площадки!\n"
-    "Друзья, у нас накопилось много важных новостей и обновлений. Мы постоянно работаем над тем, чтобы наши сервисы были удобными и надежными для вас. Рассказываем по порядку, что изменилось:\n"
-    "🦅 Феникс снова в строю!\n"
-    "Мы исправили все ошибки, возобновили отгрузки и полностью перезапустили работу Феникса!\n"
-    "- Внимание: весь канал и все корзины в Фениксе были очищены. Мы начали с чистого листа!\n"
-    "- Уже стартовала новая выкладка товаров, и они прямо сейчас доступны к бронированию.\n"
-    "💙 Глобальное обновление ВКонтакте\n"
-    "Мы активно улучшаем наше сообщество в ВК, чтобы сделать его таким же удобным, как наш Телеграм-канал.\n"
-    "- В ближайшее время мы запустим там точно такого же бота, к которому вы привыкли здесь.\n"
-    "- На странице сообщества появится кнопка «Перейти в канал». Там будет работать привычная выкладка: те же кнопочки «Забронировать», удобный просмотр корзин, рассылка на доставку и весь остальной функционал.\n"
-    "- Важно: Весь товар со стены сообщества будет удален и перенесен в этот канал для удобного бронирования кнопкой. На самой стене останутся только важные новости и правила.\n"
-    "🤔 Зачем нам так много разных каналов?\n"
-    "В последнее время мы получаем много вопросов на эту тему. Отвечаем честно: дальнейшая судьба Телеграма нам, как и всем, неизвестна.\n"
-    "Мы хотим предотвратить любые риски для наших клиентов. В случае, если Телеграм заблокируют или он перестанет работать, мы просто продолжим радовать вас скидками в Фениксе и ВКонтакте.\n"
-    "Кроме того, это вопрос вашего удобства:\n"
-    "- Кому-то нравится Феникс, но нет странички в ВК.\n"
-    "- Кому-то Феникс непривычен, и гораздо проще использовать ВКонтакте.\n"
-    "- У некоторых клиентов Телеграм уже сейчас работает с сильными перебоями, и они теряют с нами связь — для них новые площадки станут отличной альтернативой.\n"
-    "Наша команда делает всё, чтобы вам было комфортно с нами сотрудничать, независимо от внешних обстоятельств!\n"
-    "📌 Что будет с Телеграмом?\n"
-    "Телеграм ПОКА остается нашим основным каналом. Именно здесь сейчас будет происходить наибольшая выкладка товара. Но если с Телеграмом возникнет глобальная проблема, мы будем готовы за один день полностью перейти на ВК и Феникс без потери связи с вами.\n"
-    "👇 Обязательно подпишитесь и сохраните ссылки, чтобы мы с вами никогда не потерялись!\n"
-    "🔗 Наш Феникс: https://garphoenix.com/join/INV-R9JQ-F8UW?tenant=default\n"
-    "🔗 Наше сообщество ВК: https://vk.ru/club239413025\n"
-    "С заботой о вас, ваша команда «Мега Скидки»! ❤️"
 )
 
 
@@ -282,6 +280,16 @@ def now_samara():
 
 def build_channel_post_caption(post):
     return f"Цена: {post.price} ₽\nОписание: {post.description}\nОстаток: {post.quantity}"
+
+
+def resolve_shelf_label(post_id=None, description=None, post=None):
+    if post is not None:
+        return resolve_post_shelf(post)
+    if post_id:
+        live = Posts.get_row_by_id(int(post_id))
+        if live:
+            return resolve_post_shelf(live)
+    return parse_shelf_from_description(description)
 
 
 def build_bot_only_markup():
@@ -592,11 +600,15 @@ def configure_locale():
 init_db()
 configure_telegram_api_retries()
 configure_telegram_proxy()
+apihelper.ENABLE_MIDDLEWARE = True
 bot = telebot.TeleBot(TOKEN, exception_handler=TelegramPollingExceptionHandler())
 user_messages = {}
 user_pages = {}
 PAGE_SIZE = 5
 user_last_message_id = {}
+posts_preview_message_ids = {}
+posts_preview_generation = {}
+posts_preview_lock = threading.Lock()
 last_bot_message = {}
 user_data = PersistentBucket("user_data")
 user_states = {}
@@ -628,9 +640,47 @@ delivery_broadcast_scan_lock = threading.Lock()
 payroll_sheet_sync_started = False
 payroll_sheet_sync_stop_event = threading.Event()
 payroll_sheet_sync_lock = threading.Lock()
+db_backup_started = False
+db_backup_stop_event = threading.Event()
+db_backup_lock = threading.Lock()
 delivery_sheet_retry_started = False
 delivery_sheet_retry_stop_event = threading.Event()
 delivery_sheet_sync_lock = threading.Lock()
+
+
+MENU_BUTTON_TEXTS = {
+    "➕ Новый пост", "📄 Посты", "📢 Отправить посты в канал", "🛒 Мои заказы", "⚙️ Клиенты",
+    "🚚 Управление доставкой", "🚗 Заказы в доставке", "👔 Назначить работника", "Ревизия",
+    "😞 У меня брак", "Рассылка о Фениксе", "БроньСтатистик", "DOOM", "🧺 Собрать доставку",
+    "Регистрация", "🗑 Удалить клиента 📞", "🧺 Просмотреть корзину", "❌ Брак", "⬅️ Назад",
+    "📤 Отправить рассылку", "👨‍🦯 Засунуть в доставку", "📦 Список пропажи", "Список Клиентов",
+    "Объединить корзины", "🗄 Архив доставки", "Сделать ревизию", "Ручная Ревизия",
+    "Отменить ревизию", "📦 Заказы клиентов", "✅ Подтвердить доставку",
+}
+
+
+@bot.middleware_handler(update_types=["message"])
+def reset_flow_on_menu_button(bot_instance, message):
+    """Кнопка меню всегда прерывает незавершённый ввод, чтобы бот не принял её за ответ."""
+    try:
+        text = getattr(message, "text", None) or ""
+        if text not in MENU_BUTTON_TEXTS and not text.startswith("/start"):
+            return
+        chat_id = message.chat.id
+        bot.clear_step_handler_by_chat_id(chat_id)
+        state = get_user_state(chat_id)
+        if state is None:
+            return
+        if isinstance(state, str) and state in DELIVERY_CHECKOUT_STATES:
+            return
+        if state == CreatingPost.CREATING_POST:
+            payload = get_temp_post_payload(chat_id)
+            if payload.get("post_id"):
+                Posts.release_reserved_id(payload["post_id"], chat_id=chat_id)
+            temp_post_data.pop(chat_id, None)
+        clear_user_state(chat_id)
+    except Exception:
+        logger.exception("Menu button flow reset failed")
 
 
 def safe_answer_callback_query(*args, **kwargs):
@@ -762,7 +812,10 @@ def require_role(message, roles):
 
 
 def is_creator(user_id):
-    return int(user_id) == ADMIN_USER_ID
+    try:
+        return int(user_id) == int(CREATOR_USER_ID)
+    except (TypeError, ValueError):
+        return False
 
 
 def require_creator(message):
@@ -1131,7 +1184,7 @@ def close_live_reservation_stats(call):
         bot,
         chat_id,
         "Главное меню",
-        reply_markup=supreme_leader_main_menu(),
+        reply_markup=supreme_leader_main_menu(chat_id),
         logger=logger,
     )
 
@@ -1200,7 +1253,7 @@ def handle_start(message):
     elif role == "worker":
         reply_markup = worker_main_menu()
     elif role == "supreme_leader":
-        reply_markup = supreme_leader_main_menu()
+        reply_markup = supreme_leader_main_menu(user_id)
     else:
         reply_markup = unknown_main_menu()
 
@@ -1379,19 +1432,6 @@ https://t.me/+rzsgGsfbyPgyM2My
 
 Мы всегда на связи и готовы помочь! 😊
 """
-
-    # Telegram позволяет максимум 4096 символов в одном сообщении
-    max_length = 4096
-
-    for i in range(0, len(rules_text), max_length):
-        bot.send_message(
-            call.message.chat.id,
-            rules_text[i:i + max_length],
-            disable_web_page_preview=True
-        )
-
-    bot.answer_callback_query(call.id)
-
 
     # Создаём разметку с кнопкой "Назад"
     markup = InlineKeyboardMarkup()
@@ -2017,6 +2057,24 @@ def serialize_datetime(value):
 
 def get_delivery_cutoff_at(delivery_entry):
     return delivery_entry.delivery_cutoff_at or LEGACY_DELIVERY_CUTOFF_AT
+
+
+def refresh_stale_uncollected_delivery_entry(session, delivery_entry):
+    if not delivery_entry:
+        return delivery_entry
+    if delivery_entry.collector_user_id or delivery_entry_has_collection_items(session, delivery_entry):
+        return delivery_entry
+
+    campaign_cutoff = delivery_campaign_cutoff_at()
+    stored_cutoff = get_delivery_cutoff_at(delivery_entry)
+    if should_replace_delivery_cutoff(stored_cutoff, campaign_cutoff):
+        delivery_entry.delivery_cutoff_at = campaign_cutoff
+        delivery_entry.collector_user_id = None
+        delivery_entry.collector_name = None
+        delivery_entry.collection_started_at = None
+
+    delivery_entry.total_sum = calculate_delivery_entry_actual_total(session, delivery_entry)
+    return delivery_entry
 
 
 def build_reserved_group_caption(reservation, post, client):
@@ -3412,23 +3470,6 @@ def handle_role_change(call):
         safe_answer_callback_query(call.id, "Ошибка при обработке запроса.")
         logger.exception("Role change failed for call_data=%s: %s", call.data, e)
 
-# Поиск пользователя по имени и последним 4 цифрам номера
-def find_user_by_name_and_last_digits(name, last_digits):
-    try:
-        user = Clients.get_row_for_work_name_number(name=name, phone_ending=last_digits)
-        if not user:
-            logger.debug("User not found by name=%s phone_ending=%s", name, last_digits)
-            return None
-        # Возвращаем user_id, чтобы использовать его далее
-        return {
-            'user_id': user.user_id,
-            'name': user.name,
-            'role': user.role,
-        }
-    except Exception as e:
-        logger.exception("User search by name and phone failed: %s", e)
-        return None
-
 # Обработчик навигации между страницами для заказов в доставке
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_page_"))
 def paginate_delivery_orders(call):
@@ -3713,6 +3754,9 @@ def handle_defective_sum_entry(message):
 
     try:
         defective_sum = int(text.strip())
+        if defective_sum <= 0:
+            safe_send_message(bot, message.chat.id, "Сумма брака должна быть больше нуля.", logger=logger)
+            return
         user_id = flow_data["user_id"]  # Берем найденный user_id
 
         # Получаем заказы пользователя из таблицы Reservations
@@ -3783,9 +3827,19 @@ def handle_reservation_selection(call):
 
     # Обновляем return_order в базе данных
     with Session(bind=engine) as session:
-        reservation = session.query(Reservations).filter_by(id=reservation_id).first()
+        reservation = session.query(Reservations).filter_by(id=reservation_id).with_for_update().first()
         if reservation and reservation.user_id in related_user_ids:
-            reservation.return_order += defective_sum
+            remaining_amount = max(calculate_order_amount(reservation), 0)
+            if defective_sum > remaining_amount:
+                safe_send_message(
+                    bot,
+                    call.message.chat.id,
+                    f"Сумма брака {defective_sum} ₽ больше остатка суммы заказа ({remaining_amount} ₽). "
+                    "Выберите другой заказ или начните заново.",
+                    logger=logger,
+                )
+                return
+            reservation.return_order = int(reservation.return_order or 0) + defective_sum
             session.commit()
             safe_send_message(bot, call.message.chat.id, f"Сумма брака {defective_sum} успешно добавлена в заказ.", logger=logger)
         else:
@@ -3855,10 +3909,17 @@ def create_select_reservation_keyboard(reservations, page=0):
     keyboard = types.InlineKeyboardMarkup()
     start = max(int(page or 0), 0) * DEFECTIVE_RESERVATION_PAGE_SIZE
     selected_reservations = reservations[start:start + DEFECTIVE_RESERVATION_PAGE_SIZE]
+    with Session(bind=engine) as session:
+        products_by_id = get_posts_or_snapshots_by_ids(
+            session,
+            {reservation.post_id for reservation in selected_reservations},
+        )
     for reservation in selected_reservations:
+        product = products_by_id.get(reservation.post_id) or product_view_from_reservation(reservation)
         btn = types.InlineKeyboardButton(
             text=truncate_button_text(
-                f"Заказ ID {reservation.id} (Возврат: {reservation.return_order or 0})",
+                f"{calculate_order_amount(reservation, product)} ₽ | брак {reservation.return_order or 0} ₽ | "
+                f"{product.description}",
                 64,
             ),
             callback_data=f"select_{reservation.id}"
@@ -4425,12 +4486,15 @@ def cleanup_or_refresh_for_delivery_by_phone(session, phone):
 
     entries_to_remove = []
     for delivery_entry in delivery_entries:
+        refresh_stale_uncollected_delivery_entry(session, delivery_entry)
         processed_sum = calculate_delivery_total_for_user_ids(
             session,
             related_user_ids,
             get_delivery_cutoff_at(delivery_entry),
         )
         if processed_sum < DELIVERY_THRESHOLD:
+            if delivery_entry.collector_user_id or delivery_entry_has_collection_items(session, delivery_entry):
+                continue
             entries_to_remove.append(delivery_entry)
             continue
         if delivery_entry.total_sum != processed_sum:
@@ -4892,14 +4956,11 @@ def process_delete_client_phone(message):
     phone = normalize_phone(text)  # Убираем лишние пробелы
 
     try:
-        # Получаем клиента по номеру телефона
-        client = Clients.get_row_by_phone(phone)
+        # Все аккаунты, зарегистрированные на этот номер
+        clients = Clients.get_rows_by_phone(phone) if phone else []
 
-        if client:
-            client_user_id = client.user_id  # Извлекаем user_id клиента
-
-            # Проверяем, не выполняются ли действия с защищённым пользователем
-            if client_user_id == protected_user_id:
+        if clients:
+            if any(client.user_id == protected_user_id for client in clients):
                 safe_send_message(
                     bot,
                     user_id,
@@ -4908,20 +4969,18 @@ def process_delete_client_phone(message):
                 )
                 return
 
-            # Добавляем клиента в черный список (защищенный пользователь не будет добавлен)
-            if client_user_id != protected_user_id:
-                BlackList.insert(user_id=client_user_id, phone=phone)
+            cleanup_stats = empty_cart_cleanup_stats()
+            for client in clients:
+                BlackList.insert(user_id=client.user_id, phone=phone)
+                merge_cart_cleanup_stats(cleanup_stats, delete_client_active_records(client.user_id, phone))
+                Clients.delete_row(client.id)
 
-            cleanup_stats = delete_client_active_records(client_user_id, phone)
-
-            # Удаляем клиента из таблицы clients
-            Clients.delete_row(client.id)
-
+            accounts_text = f"Удалено аккаунтов: {len(clients)}. " if len(clients) > 1 else ""
             safe_send_message(
                 bot,
                 user_id,
-                f"Клиент с номером телефона {phone} успешно удалён. "
-                f"{format_cart_cleanup_result(cleanup_stats)}",
+                f"Клиент с номером телефона {phone} успешно удалён и добавлен в чёрный список. "
+                f"{accounts_text}{format_cart_cleanup_result(cleanup_stats)}",
                 logger=logger,
             )
         else:
@@ -4979,6 +5038,36 @@ def is_audit(user_id):
     role = get_client_role(user_id)
     return role and "audit" in role
 
+
+def doom_password_matches(raw):
+    expected = (os.environ.get("DOOM_PASSWORD") or "").encode("utf-8")
+    given = str(raw or "").encode("utf-8")
+    if not expected:
+        return False
+    return hmac.compare_digest(given, expected)
+
+def can_manage_post(user_id, post_id):
+    role = get_client_role(user_id)
+    if role in ADMIN_ROLES:
+        return True
+    if role not in POST_EDITOR_ROLES:
+        return False
+    post = Posts.get_row_by_id(int(post_id))
+    return bool(post and int(post.chat_id or 0) == int(user_id))
+
+
+def deny_post_callback(call):
+    if can_manage_post(call.from_user.id, parse_callback_post_id(call)):
+        return False
+    safe_answer_callback_query(call.id, "Этот пост можно менять только автору или администратору.", show_alert=True)
+    return True
+
+
+def parse_callback_post_id(call):
+    match = re.search(r"(\d+)$", str(getattr(call, "data", "") or ""))
+    return int(match.group(1)) if match else 0
+
+
 def get_temp_post_payload(user_id):
     payload = temp_post_data.get(user_id, {})
     return dict(payload) if isinstance(payload, dict) else {}
@@ -4987,8 +5076,13 @@ def get_temp_post_payload(user_id):
 def get_temp_post_id_or_reset(user_id):
     payload = get_temp_post_payload(user_id)
     post_id = payload.get("post_id")
-    if post_id:
+    if post_id and can_manage_post(user_id, post_id):
         return post_id
+    if post_id:
+        clear_user_state(user_id)
+        temp_post_data.pop(user_id, None)
+        safe_send_message(bot, user_id, "Этот пост можно менять только автору или администратору.", logger=logger)
+        return None
 
     clear_user_state(user_id)
     temp_post_data.pop(user_id, None)
@@ -5120,7 +5214,14 @@ def handle_post_details(message):
         if quantity <= 0:
             safe_send_message(bot, chat_id, "Ошибка: Количество должно быть больше нуля. Попробуйте снова.", logger=logger)
             return
-        data = dict(temp_post_data.update_dict(chat_id, {"quantity": quantity}))
+        temp_post_data.update_dict(chat_id, {"quantity": quantity})
+        safe_send_message(bot, chat_id, "Введите номер полки", logger=logger)
+    elif "shelf" not in data:
+        shelf = normalize_shelf(text)
+        if not shelf:
+            safe_send_message(bot, chat_id, "Введите номер полки", logger=logger)
+            return
+        data = dict(temp_post_data.update_dict(chat_id, {"shelf": shelf}))
 
         # Сохраняем пост
         try:
@@ -5131,6 +5232,7 @@ def handle_post_details(message):
                 data["description"],
                 data["quantity"],
                 post_id=data.get("post_id"),
+                shelf=data.get("shelf"),
             )
         except Exception as exc:
             Posts.release_reserved_id(data.get("post_id"), chat_id=chat_id)
@@ -5149,6 +5251,7 @@ def handle_post_details(message):
             bot,
             chat_id,
             f"Id товара: {created_post_id}\n"
+            f"Полка: {data.get('shelf')}\n"
             "Ваш пост успешно создан!",
             logger=logger,
         )
@@ -5157,113 +5260,170 @@ def handle_post_details(message):
         temp_post_data.pop(chat_id, None)
         clear_user_state(chat_id)
 
+def load_posts_for_preview(user_id):
+    """Неотправленные посты, которые работники создали сами (без вернувшихся с ревизии)."""
+    role = get_client_role(user_id)
+    posts = Posts.get_all_posts() if role in ADMIN_ROLES else Posts.get_user_posts(user_id)
+    if not posts:
+        return []
+    with Session(bind=engine) as session:
+        revised_ids = {
+            row[0]
+            for row in session.query(RevisionLog.post_id).filter(
+                RevisionLog.post_id.in_([post.id for post in posts]),
+            ).distinct().all()
+        }
+    return [post for post in posts if post.id not in revised_ids]
+
+
+def build_posts_preview_keyboard(page, total_count):
+    keyboard = InlineKeyboardMarkup()
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"posts_preview_page_{page - 1}"))
+    if (page + 1) * POST_PREVIEW_PAGE_SIZE < total_count:
+        nav_buttons.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"posts_preview_page_{page + 1}"))
+    if nav_buttons:
+        keyboard.row(*nav_buttons)
+    return keyboard
+
+
+def remember_posts_preview_message(user_id, sent_message):
+    if sent_message:
+        with posts_preview_lock:
+            posts_preview_message_ids.setdefault(user_id, []).append(sent_message.message_id)
+
+
+def clear_posts_preview_messages(user_id):
+    with posts_preview_lock:
+        old_ids = posts_preview_message_ids.pop(user_id, [])
+    for msg_id in old_ids[-30:]:
+        safe_delete_message(bot, user_id, msg_id, logger=logger)
+
+
+def send_post_preview_item(user_id, post):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✏️ Изменить", callback_data=f"edit_post_{post.id}"),
+        InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_post_{post.id}"),
+    )
+    caption = (
+        f"Пост #{post.id}:\n"
+        f"📍 Описание: {post.description}\n"
+        f"💰 Цена: {post.price} ₽\n"
+        f"📦 Количество: {post.quantity}"
+    )
+    if post.photo:
+        return safe_send_photo(
+            bot,
+            user_id,
+            post.photo,
+            caption=caption,
+            reply_markup=markup,
+            logger=logger,
+        )
+    return safe_send_message(bot, user_id, caption, reply_markup=markup, logger=logger)
+
+
+def start_posts_preview_generation(user_id):
+    with posts_preview_lock:
+        generation = posts_preview_generation.get(user_id, 0) + 1
+        posts_preview_generation[user_id] = generation
+        return generation
+
+
+def posts_preview_is_current(user_id, generation):
+    with posts_preview_lock:
+        return posts_preview_generation.get(user_id) == generation
+
+
+def show_posts_preview(user_id, page=0):
+    generation = start_posts_preview_generation(user_id)
+    clear_posts_preview_messages(user_id)
+    try:
+        posts = load_posts_for_preview(user_id)
+    except Exception as exc:
+        logger.exception("Post list fetch failed for user_id=%s: %s", user_id, exc)
+        remember_posts_preview_message(
+            user_id,
+            safe_send_message(bot, user_id, "Не удалось получить список постов. Попробуйте позже.", logger=logger),
+        )
+        return
+
+    if not posts:
+        remember_posts_preview_message(user_id, safe_send_message(bot, user_id, "Нет доступных постов.", logger=logger))
+        return
+
+    total_count = len(posts)
+    total_pages = max(1, (total_count + POST_PREVIEW_PAGE_SIZE - 1) // POST_PREVIEW_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    chunk = posts[page * POST_PREVIEW_PAGE_SIZE:(page + 1) * POST_PREVIEW_PAGE_SIZE]
+    remember_posts_preview_message(user_id, safe_send_message(
+        bot,
+        user_id,
+        f"Неотправленные посты: {total_count}. Страница {page + 1}/{total_pages}.\n"
+        f"Посты приходят по одному раз в {POST_PREVIEW_SEND_DELAY_SECONDS} сек.",
+        logger=logger,
+    ))
+
+    for index, post in enumerate(chunk):
+        if index:
+            time.sleep(POST_PREVIEW_SEND_DELAY_SECONDS)
+        if not posts_preview_is_current(user_id, generation):
+            return
+        try:
+            remember_posts_preview_message(user_id, send_post_preview_item(user_id, post))
+        except Exception as exc:
+            logger.warning("Post preview send failed for user_id=%s post_id=%s: %s", user_id, post.id, exc)
+            remember_posts_preview_message(user_id, safe_send_message(
+                bot,
+                user_id,
+                f"Не удалось отправить предпросмотр поста #{post.id}.",
+                logger=logger,
+            ))
+
+    if posts_preview_is_current(user_id, generation):
+        remember_posts_preview_message(user_id, safe_send_message(
+            bot,
+            user_id,
+            f"Страница {page + 1}/{total_pages} показана.",
+            reply_markup=build_posts_preview_keyboard(page, total_count),
+            logger=logger,
+        ))
+
+
+def start_posts_preview(user_id, page=0):
+    thread = threading.Thread(
+        target=show_posts_preview,
+        args=(user_id, page),
+        name=f"posts-preview-{user_id}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 # Управление постами
 @bot.message_handler(func=lambda message: message.text == "📄 Посты")
 def manage_posts(message):
     user_id = message.chat.id
-    message_id = message.message_id  # ID самого запроса
-
-    # Удаляем запрос пользователя сразу же
-    try:
-        safe_delete_message(bot, user_id, message_id, logger=logger)
-    except Exception as e:
-        logger.warning("Post list request message delete failed for user_id=%s: %s", user_id, e)
-
-    role = get_client_role(user_id)
-
-    # Проверяем, имеет ли пользователь соответствующую роль
-    if role not in POST_EDITOR_ROLES:
+    safe_delete_message(bot, user_id, message.message_id, logger=logger)
+    if get_client_role(user_id) not in POST_EDITOR_ROLES:
         safe_send_message(bot, user_id, "У вас нет прав доступа к этой функции.", logger=logger)
         return
+    start_posts_preview(user_id, page=0)
 
-    # Убедимся, что user_last_message_id[user_id] - это список
-    if user_id not in user_last_message_id:
-        user_last_message_id[user_id] = []
-    elif not isinstance(user_last_message_id[user_id], list):
-        user_last_message_id[user_id] = [user_last_message_id[user_id]]
 
-    # Удаляем предыдущие сообщения, если они есть
-    for msg_id in user_last_message_id[user_id]:
-        try:
-            safe_delete_message(bot, user_id, msg_id, logger=logger)
-        except Exception as e:
-            logger.warning("Post list old message delete failed for user_id=%s message_id=%s: %s", user_id, msg_id, e)
-
-    # Очищаем список сообщений пользователя после удаления
-    user_last_message_id[user_id] = []
-
-    try:
-        # Получаем посты в зависимости от роли пользователя
-        if role in ["admin", "supreme_leader"]:
-            posts = Posts.get_all_posts()  # Используем метод класса для получения всех постов
-        else:
-            posts = Posts.get_user_posts(
-                user_id)  # Используем метод класса для получения постов только текущего пользователя
-
-    except Exception as e:
-        logger.exception("Post list fetch failed for user_id=%s: %s", user_id, e)
-        error_msg = safe_send_message(bot, user_id, "Не удалось получить список постов. Попробуйте позже.", logger=logger)
-        if error_msg:
-            user_last_message_id[user_id].append(error_msg.message_id)
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "posts_preview_page_"))
+def paginate_posts_preview(call):
+    if not has_role(call.from_user.id, POST_EDITOR_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
         return
-
-    if not posts:
-        no_posts_msg = safe_send_message(bot, user_id, "Нет доступных постов.", logger=logger)
-        if no_posts_msg:
-            user_last_message_id[user_id].append(no_posts_msg.message_id)
+    page = parse_callback_int_suffix(call, "posts_preview_page_", "Некорректная страница.")
+    if page is None:
         return
-
-    # Выводим информацию о каждом посте
-    for post in posts:
-        post_id = post.id
-        description = post.description
-        price = post.price
-        quantity = post.quantity
-        photo = post.photo  # Если фото есть
-
-        # Создаем клавиатуру для управления постом
-        markup = InlineKeyboardMarkup()
-        edit_btn = InlineKeyboardButton(
-            "✏️ Изменить", callback_data=f"edit_post_{post_id}"
-        )
-        delete_btn = InlineKeyboardButton(
-            "🗑 Удалить", callback_data=f"delete_post_{post_id}"
-        )
-        markup.add(edit_btn, delete_btn)
-
-        # Отправляем сообщение с фото или текстом
-        try:
-            if photo:
-                msg = safe_send_photo(
-                    bot,
-                    user_id,
-                    photo,
-                    caption=f"Пост #{post_id}:\n"
-                            f"📍 Описание: {description}\n"
-                            f"💰 Цена: {price} ₽\n"
-                            f"📦 Количество: {quantity}",
-                    reply_markup=markup,
-                    logger=logger,
-                )
-            else:
-                msg = safe_send_message(
-                    bot,
-                    user_id,
-                    f"Пост #{post_id}:\n"
-                    f"📍 Описание: {description}\n"
-                    f"💰 Цена: {price} ₽\n"
-                    f"📦 Количество: {quantity}",
-                    reply_markup=markup,
-                    logger=logger,
-                )
-            # Сохраняем ID отправленных сообщений
-            if msg:
-                user_last_message_id[user_id].append(msg.message_id)
-        except Exception as e:
-            logger.warning("Post preview send failed for user_id=%s post_id=%s: %s", user_id, post_id, e)
-            error_msg = safe_send_message(bot, user_id, f"Не удалось отправить предпросмотр поста #{post_id}.", logger=logger)
-            if error_msg:
-                user_last_message_id[user_id].append(error_msg.message_id)
+    safe_answer_callback_query(call.id)
+    start_posts_preview(call.message.chat.id, page=page)
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "edit_post_"))
 def edit_post(call):
@@ -5272,14 +5432,8 @@ def edit_post(call):
         return
     user_id = call.from_user.id
 
-    # Проверяем права на редактирование
-    role = get_client_role(user_id)
-    if role not in POST_EDITOR_ROLES:
-        safe_answer_callback_query(
-            callback_query_id=call.id,
-            text="У вас нет прав доступа к этой функции.",
-            show_alert=True,
-        )
+    # Проверяем права на редактирование: работник — только свои посты.
+    if deny_post_callback(call):
         return
 
     # Сохраняем временные данные о посте, который редактируется
@@ -5312,7 +5466,7 @@ def edit_post(call):
             logger=logger,
         )
         if msg:
-            user_last_message_id.setdefault(user_id, []).append(msg.message_id)  # Сохраняем ID сообщения
+            remember_posts_preview_message(user_id, msg)
 
 # Обработчик кнопки "Редактировать цену"
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "edit_price_"))
@@ -5320,6 +5474,8 @@ def handle_edit_price(call):
     user_id = call.from_user.id
     post_id = parse_callback_int_suffix(call, "edit_price_")
     if post_id is None:
+        return
+    if deny_post_callback(call):
         return
 
     # Устанавливаем состояние пользователя
@@ -5337,6 +5493,8 @@ def handle_edit_description(call):
     post_id = parse_callback_int_suffix(call, "edit_description_")
     if post_id is None:
         return
+    if deny_post_callback(call):
+        return
 
     # Устанавливаем состояние пользователя
     set_user_state(user_id, CreatingPost.EDITING_POST_DESCRIPTION)
@@ -5352,6 +5510,8 @@ def handle_edit_quantity(call):
     user_id = call.from_user.id
     post_id = parse_callback_int_suffix(call, "edit_quantity_")
     if post_id is None:
+        return
+    if deny_post_callback(call):
         return
 
     # Устанавливаем состояние пользователя
@@ -5495,6 +5655,8 @@ def delete_post_handler(call):
     post_id = parse_callback_int_suffix(call, "delete_post_")
     if post_id is None:
         return
+    if deny_post_callback(call):
+        return
     callback_answered = False
     try:
         with Session(bind=engine) as session:
@@ -5545,46 +5707,27 @@ def delete_post_handler(call):
             safe_send_message(bot, call.message.chat.id, "Ошибка при удалении поста.", logger=logger)
 
 # Кнопка назад
+def get_main_menu_for_user(user_id):
+    role = get_client_role(user_id)
+    if role == "supreme_leader":
+        return supreme_leader_main_menu(user_id), "Возвращаюсь в главное меню лидера."
+    if role == "admin":
+        return admin_main_menu(), "Возвращаюсь в главное меню администратора."
+    if role == "audit":
+        return audit_main_menu(), "Возвращаюсь в главное меню"
+    if role == "worker":
+        return worker_main_menu(), "Возвращаюсь в главное меню"
+    if role == "client":
+        return client_main_menu(), "Возвращаюсь в главное меню."
+    return unknown_main_menu(), "Возвращаюсь в главное меню."
+
+
 @bot.message_handler(func=lambda message: message.text == "⬅️ Назад")
 def go_back(message):
     try:
-        # Проверяем роль пользователя и возвращаем соответствующее меню
-        if is_admin(message.chat.id):
-            markup = admin_main_menu()  # Получаем меню администратора
-            safe_send_message(
-                bot,
-                message.chat.id,
-                "Возвращаюсь в главное меню администратора.",
-                reply_markup=markup,
-                logger=logger,
-            )
-        elif is_leader(message.chat.id):
-            markup = supreme_leader_main_menu()  # Получаем меню лидера
-            safe_send_message(
-                bot,
-                message.chat.id,
-                "Возвращаюсь в главное меню лидера.",
-                reply_markup=markup,
-                logger=logger,
-            )
-        elif is_audit(message.chat.id):
-            markup = audit_main_menu()
-            safe_send_message(
-                bot,
-                message.chat.id,
-                "Возвращаюсь в главное меню",
-                reply_markup=markup,
-                logger=logger,
-            )
-        else:
-            markup = client_main_menu()  # Получаем меню клиента
-            safe_send_message(
-                bot,
-                message.chat.id,
-                "Возвращаюсь в главное меню.",
-                reply_markup=markup,
-                logger=logger,
-            )
+        clear_user_state(message.chat.id)
+        markup, text = get_main_menu_for_user(message.chat.id)
+        safe_send_message(bot, message.chat.id, text, reply_markup=markup, logger=logger)
     except Exception as e:
         # При возникновении исключения отправляем сообщение об ошибке
         logger.exception("Back command failed for chat_id=%s: %s", message.chat.id, e)
@@ -5608,7 +5751,7 @@ def send_channel_post_with_retries(post, caption, markup, source):
             )
         except Exception as exc:
             retry_after = telegram_retry_after_seconds(exc)
-            if not is_transient_telegram_error(exc) or attempt == CHANNEL_POST_SEND_ATTEMPTS:
+            if not is_safe_to_resend_error(exc) or attempt == CHANNEL_POST_SEND_ATTEMPTS:
                 raise
 
             wait_seconds = retry_after + 1 if retry_after is not None else CHANNEL_POST_SEND_RETRY_SECONDS * attempt
@@ -5622,6 +5765,18 @@ def send_channel_post_with_retries(post, caption, markup, source):
                 exc,
             )
             time.sleep(wait_seconds)
+
+
+def resolve_archive_creator_user_id(session, post_id, fallback_chat_id):
+    revision = (
+        session.query(RevisionLog.auditor_user_id)
+        .filter(RevisionLog.post_id == int(post_id))
+        .order_by(RevisionLog.created_at.desc(), RevisionLog.id.desc())
+        .first()
+    )
+    if revision and revision.auditor_user_id:
+        return revision.auditor_user_id
+    return fallback_chat_id
 
 
 def send_archive_post_copy_best_effort(post_id, photo, group_caption):
@@ -5666,7 +5821,7 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
                     or int(live.quantity or 0) <= 0
                     or live.is_sent
                     or live.message_id is not None
-                    or post_has_active_links(session, post_id)
+                    or live.audit_status == AUDIT_STATUS_NOT_FOUND
                 ):
                     logger.info(
                         "Channel post publish skipped unavailable post_id=%s source=%s",
@@ -5675,10 +5830,11 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
                     )
                     continue
                 photo = live.photo
-                creator_user_id = live.chat_id
+                creator_user_id = resolve_archive_creator_user_id(session, post_id, live.chat_id)
                 caption = build_channel_post_caption(live)
                 markup = build_channel_post_markup(live)
                 publish_post = SimpleNamespace(id=live.id, photo=live.photo)
+                shelf_label = resolve_post_shelf(live)
 
             creator_name = Clients.get_name_by_user_id(creator_user_id) or "Неизвестный автор"
 
@@ -5693,13 +5849,14 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
             Posts.mark_as_sent(post_id=post_id, message_id=sent_message.message_id)
             sent_count += 1
 
-            group_caption = f"Id товара: {post_id}\nПост был создан пользователем: {creator_name}\n\n{caption}"
+            archive_lines = [f"Id товара: {post_id}"]
+            if shelf_label:
+                archive_lines.append(f"Полка: {shelf_label}")
+            archive_lines.append(f"Пост был создан пользователем: {creator_name}")
+            group_caption = "\n".join(archive_lines) + f"\n\n{caption}"
             send_archive_post_copy_best_effort(post_id, photo, group_caption)
 
             time.sleep(4)
-
-        if source == "auto" and sent_count and not failed_post_ids:
-            send_phoenix_channel_footer()
 
         if failed_post_ids:
             failed_preview = ", ".join(str(post_id) for post_id in failed_post_ids[:20])
@@ -5728,22 +5885,6 @@ def publish_unsent_posts_to_channel(notify_chat_id=None, source="manual"):
         return sent_count
     finally:
         channel_post_publish_lock.release()
-
-
-def send_phoenix_channel_footer():
-    try:
-        with open(PHOENIX_CHANNEL_FOOTER_IMAGE_PATH, "rb") as photo:
-            send_photo_or_text(
-                bot,
-                CHANNEL_ID,
-                photo,
-                PHOENIX_CHANNEL_FOOTER_TEXT,
-            )
-        logger.info("Phoenix footer sent to channel after post publish")
-        return True
-    except Exception as exc:
-        logger.warning("Phoenix footer send failed after post publish: %s", exc)
-        return False
 
 
 def should_auto_publish_channel_posts(value):
@@ -5797,9 +5938,36 @@ def send_new_posts_to_channel(message):
 
     publish_unsent_posts_to_channel(notify_chat_id=user_id, source="manual")
 
+def load_payroll_post_rows(session, start_at, end_at):
+    """Посты для выработки: живые плюс удалённые автоочисткой после доставки."""
+    rows = session.query(Posts.id, Posts.chat_id, Posts.created_at).filter(
+        Posts.created_at >= start_at,
+        Posts.created_at < end_at,
+    ).all()
+    live_ids = {row[0] for row in rows}
+    deleted_rows = session.query(
+        DeletedPostSnapshot.post_id,
+        DeletedPostSnapshot.chat_id,
+        DeletedPostSnapshot.created_at,
+    ).filter(
+        DeletedPostSnapshot.created_at >= start_at,
+        DeletedPostSnapshot.created_at < end_at,
+        DeletedPostSnapshot.reason.like("delivery_cleanup%"),
+    ).all()
+    result = [SimpleNamespace(id=row[0], chat_id=row[1], created_at=row[2]) for row in rows]
+    result.extend(
+        SimpleNamespace(id=row[0], chat_id=row[1], created_at=row[2])
+        for row in deleted_rows
+        if row[0] not in live_ids
+    )
+    return result
+
+
 # Статистика
 @bot.message_handler(commands=['statistic'])
 def handle_statistic(message):
+    if not require_role(message, POST_EDITOR_ROLES):
+        return
     today = now_local()
     monday = today - timedelta(days=today.weekday())
     last_monday = monday - timedelta(days=7)
@@ -5828,10 +5996,7 @@ def handle_statistic(message):
     # Получение данных из базы данных
     all_clients = Clients.get_row_all()  # Получаем всех клиентов
     with Session(bind=engine) as session:
-        all_posts = session.query(Posts).filter(
-            Posts.created_at >= query_start,
-            Posts.created_at < query_end,
-        ).all()
+        all_posts = load_payroll_post_rows(session, query_start, query_end)
         revision_logs = session.query(RevisionLog).filter(
             RevisionLog.created_at >= query_start,
             RevisionLog.created_at < query_end,
@@ -6087,11 +6252,8 @@ def calculate_payroll_week_counts(current=None):
         }
 
         post_counts = {}
-        posts = session.query(Posts.id, Posts.chat_id, Posts.created_at).filter(
-            Posts.created_at >= week_start,
-            Posts.created_at < week_end,
-        ).all()
-        for post_id, chat_id, created_at in posts:
+        posts = load_payroll_post_rows(session, week_start, week_end)
+        for post_id, chat_id, created_at in ((post.id, post.chat_id, post.created_at) for post in posts):
             if not created_at:
                 continue
             if post_id in revision_post_ids:
@@ -6178,6 +6340,168 @@ def start_payroll_sheet_sync_worker():
         daemon=True,
     )
     thread.start()
+
+def get_db_backup_chat_id():
+    return env_int("DB_BACKUP_CHAT_ID", int(CREATOR_USER_ID))
+
+
+def get_db_backup_state():
+    state = user_data.get(DB_BACKUP_STATE_KEY, {})
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def save_db_backup_state(state):
+    user_data[DB_BACKUP_STATE_KEY] = state
+
+
+def format_backup_size(size_bytes):
+    return f"{size_bytes / (1024 * 1024):.1f} МБ"
+
+
+def run_database_backup(chat_id=None, source="scheduled"):
+    """Делает дамп базы бота и отправляет его создателю. Возвращает (успех, текст)."""
+    chat_id = chat_id or get_db_backup_chat_id()
+    if not db_backup_lock.acquire(blocking=False):
+        return False, "Бэкап уже выполняется."
+
+    started = now_local()
+    temp_dir = tempfile.mkdtemp(prefix="final_bot_backup_")
+    try:
+        try:
+            backup_path = create_database_backup(
+                engine.url,
+                temp_dir,
+                current=started,
+                timeout=DB_BACKUP_TIMEOUT_SECONDS,
+            )
+        except DatabaseBackupError as exc:
+            logger.error("Database backup failed source=%s: %s", source, exc)
+            return False, f"Не удалось создать бэкап базы: {exc}"
+
+        size_bytes = os.path.getsize(backup_path)
+        if size_bytes > TELEGRAM_BOT_DOCUMENT_LIMIT_BYTES:
+            logger.error("Database backup too large for Telegram: %s bytes", size_bytes)
+            return False, (
+                f"Бэкап создан, но весит {format_backup_size(size_bytes)} — больше лимита Telegram (50 МБ). "
+                "Файл не отправлен, нужно настроить другой способ хранения."
+            )
+
+        caption = (
+            f"🗄 Бэкап базы бота\n"
+            f"Дата: {started.strftime('%d.%m.%Y %H:%M')} (Самара)\n"
+            f"Размер: {format_backup_size(size_bytes)}\n"
+            "Восстановление: pg_restore --no-owner --no-acl -d <база> <файл>\n"
+            "⚠️ В файле данные всех клиентов, не пересылайте его."
+        )
+        try:
+            send_document_file(bot, chat_id, str(backup_path), caption=caption, logger=logger)
+        except Exception as exc:
+            logger.warning("Database backup send failed: %s", sanitize_telegram_error_text(exc))
+            return False, f"Бэкап создан, но не отправился в Telegram: {sanitize_telegram_error_text(exc)}"
+
+        logger.info("Database backup sent to chat_id=%s size=%s source=%s", chat_id, size_bytes, source)
+        return True, f"Бэкап отправлен ({format_backup_size(size_bytes)})."
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        db_backup_lock.release()
+
+
+def should_run_database_backup(current, state):
+    current = current.astimezone(SAMARA_TZ) if current.tzinfo else current.replace(tzinfo=SAMARA_TZ)
+    backup_at = current.replace(hour=DB_BACKUP_HOUR, minute=DB_BACKUP_MINUTE, second=0, microsecond=0)
+    if current < backup_at:
+        return False
+
+    today_key = current.date().isoformat()
+    if state.get("last_success_date") == today_key:
+        return False
+    if state.get("attempt_date") != today_key:
+        return True
+    if int(state.get("attempts") or 0) >= DB_BACKUP_MAX_ATTEMPTS_PER_DAY:
+        return False
+    last_attempt_at = parse_datetime(state.get("last_attempt_at"))
+    if last_attempt_at and current.replace(tzinfo=None) - last_attempt_at < timedelta(minutes=DB_BACKUP_RETRY_MINUTES):
+        return False
+    return True
+
+
+def run_scheduled_database_backup(current=None):
+    current = current or now_samara()
+    state = get_db_backup_state()
+    if not should_run_database_backup(current, state):
+        return False
+
+    today_key = current.date().isoformat()
+    attempts = int(state.get("attempts") or 0) if state.get("attempt_date") == today_key else 0
+    attempts += 1
+    current_local = current.astimezone(SAMARA_TZ).replace(tzinfo=None) if current.tzinfo else current
+    state.update({
+        "attempt_date": today_key,
+        "attempts": attempts,
+        "last_attempt_at": serialize_datetime(current_local),
+    })
+    save_db_backup_state(state)
+
+    success, result_text = run_database_backup(source="scheduled")
+    if success:
+        state["last_success_date"] = today_key
+        state["last_success_at"] = serialize_datetime(now_local())
+        state.pop("last_error", None)
+    else:
+        state["last_error"] = result_text
+        retry_note = (
+            f"Повторю через {DB_BACKUP_RETRY_MINUTES} мин."
+            if attempts < DB_BACKUP_MAX_ATTEMPTS_PER_DAY
+            else "Попытки на сегодня закончились."
+        )
+        safe_send_message(
+            bot,
+            get_db_backup_chat_id(),
+            f"⚠️ {result_text}\nПопытка {attempts}/{DB_BACKUP_MAX_ATTEMPTS_PER_DAY}. {retry_note}",
+            logger=logger,
+        )
+    save_db_backup_state(state)
+    return success
+
+
+def database_backup_loop():
+    while True:
+        try:
+            run_scheduled_database_backup()
+        except Exception:
+            logger.exception("Database backup loop failed")
+
+        if db_backup_stop_event.wait(DB_BACKUP_CHECK_SECONDS):
+            return
+
+
+def start_database_backup_worker():
+    global db_backup_started
+    if db_backup_started:
+        return
+
+    db_backup_started = True
+    thread = threading.Thread(
+        target=database_backup_loop,
+        name="database-backup",
+        daemon=True,
+    )
+    thread.start()
+
+
+@bot.message_handler(commands=["backup_now"])
+def handle_backup_now(message):
+    if not require_creator(message):
+        return
+    safe_send_message(bot, message.chat.id, "Делаю бэкап базы, это может занять минуту...", logger=logger)
+
+    def worker():
+        success, result_text = run_database_backup(chat_id=message.chat.id, source="manual")
+        if not success:
+            safe_send_message(bot, message.chat.id, f"⚠️ {result_text}", logger=logger)
+
+    threading.Thread(target=worker, name="database-backup-manual", daemon=True).start()
+
 
 def close_expired_delivery_broadcast_campaigns(session, current=None):
     current = current or now_local()
@@ -6597,6 +6921,31 @@ def delete_delivery_offer_buttons(chat_id, message_id):
     safe_delete_message(bot, chat_id, message_id, logger=logger)
 
 
+def get_delivery_collectable_sum_for_user(session, user_id, cutoff_at=None):
+    cutoff_at = cutoff_at or delivery_campaign_cutoff_at()
+    client = session.query(Clients).filter(Clients.user_id == user_id).first()
+    phone = normalize_phone(client.phone if client else None)
+    return calculate_delivery_total_for_phone(session, phone, user_id, cutoff_at)
+
+
+def reject_delivery_below_threshold(user_id, collectable_sum, message_id=None):
+    if message_id:
+        delete_delivery_offer_buttons(user_id, message_id)
+    temp_user_data.pop(user_id, None)
+    clear_user_state(user_id)
+    current_sum = max(int(collectable_sum or 0), 0)
+    safe_send_message(
+        bot,
+        user_id,
+        (
+            f"Доставка доступна при сумме обработанных заказов от {DELIVERY_THRESHOLD} ₽.\n"
+            f"Сейчас у вас: {current_sum} ₽."
+        ),
+        logger=logger,
+    )
+    return current_sum
+
+
 # Обрабатывает ответ пользователя на предложение доставки с инлайн-клавиатуры.
 @bot.callback_query_handler(
     func=lambda call: call.data in ["delivery_yes", "delivery_no"] or is_legacy_delivery_callback(call)
@@ -6637,11 +6986,16 @@ def handle_delivery_response_callback(call):
         existing_cutoff = parse_datetime(existing_temp.get("delivery_cutoff_at"))
         with Session(bind=engine) as session:
             campaign_cutoff = get_delivery_cutoff_for_user(session, user_id)
+            threshold_cutoff = campaign_cutoff or delivery_campaign_cutoff_at()
+            collectable_sum = get_delivery_collectable_sum_for_user(session, user_id, threshold_cutoff)
             already_in_delivery = has_current_delivery_entry_for_user(
                 session,
                 user_id,
                 campaign_cutoff or current,
             )
+        if collectable_sum < DELIVERY_THRESHOLD:
+            reject_delivery_below_threshold(user_id, collectable_sum, message_id=message_id)
+            return
         if already_in_delivery:
             campaign_id = mark_delivery_broadcast_response(user_id, DELIVERY_RECIPIENT_RESPONSE_ACCEPTED)
             refresh_delivery_candidates_summary(campaign_id)
@@ -6682,11 +7036,41 @@ def handle_delivery_response_callback(call):
         safe_delete_message(bot, user_id, message_id, logger=logger)
         safe_send_message(bot, user_id, "Вы отказались от доставки. Оповестим вас при следующей доставке.", logger=logger)
 
+def delivery_checkout_expired(flow_data=None, current=None):
+    current = current or now_local()
+    if not is_delivery_campaign_before_cutoff(current):
+        return True
+    stored_cutoff = parse_datetime((flow_data or {}).get("delivery_cutoff_at"))
+    return bool(stored_cutoff and stored_cutoff.date() < current.date())
+
+
+def reject_expired_delivery_checkout(user_id, message_id=None):
+    if message_id:
+        safe_delete_message(bot, user_id, message_id, logger=logger)
+    temp_user_data.pop(user_id, None)
+    clear_user_state(user_id)
+    safe_send_message(
+        bot,
+        user_id,
+        f"Извините, приём заявок на доставку закрыт в {delivery_response_deadline_label()}. "
+        "Лист на доставку уже сформирован, ожидайте следующую рассылку.",
+        logger=logger,
+    )
+
+
+def delivery_flow_data(user_id):
+    data = temp_user_data.get(user_id, {})
+    return data if isinstance(data, dict) else {}
+
+
 # Обрабатывает ввод адреса пользователя.
 @bot.message_handler(func=lambda message: user_state_in(message.chat.id, DELIVERY_ADDRESS_INPUT_STATES))
 def handle_address_input(message):
     user_id = message.chat.id
     if ignore_silent_blocked_message(message):
+        return
+    if delivery_checkout_expired(delivery_flow_data(user_id)):
+        reject_expired_delivery_checkout(user_id)
         return
 
     address = require_text_message(message, "Введите адрес доставки текстом.")
@@ -6710,7 +7094,6 @@ def handle_address_input(message):
     user_orders_sum = calculate_collectable_sum_for_user(user_id, cutoff_at=delivery_cutoff_at)
     logger.debug("Delivery fulfilled order sum loaded for user_id=%s", user_id)
     # Поиск всех пользователей с таким же телефоном
-    from db import Session, engine
     phone_filter = phone_variants(phone)
     same_phone_users = []
     if phone_filter:
@@ -6843,12 +7226,46 @@ def get_delivery_broadcast_response_maps(session, campaign_id):
     return by_phone, by_user_id
 
 
-def get_delivery_broadcast_response_label(user, responses_by_phone, responses_by_user_id):
+def split_telegram_text(text, limit=TELEGRAM_TEXT_SAFE_LIMIT):
+    chunks = []
+    current = []
+    size = 0
+    for line in (text or "").split("\n"):
+        addition = len(line) + (1 if current else 0)
+        if current and size + addition > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+            addition = len(line)
+        if len(line) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                size = 0
+            for start in range(0, len(line), limit):
+                chunks.append(line[start:start + limit])
+            continue
+        current.append(line)
+        size += addition
+    if current:
+        chunks.append("\n".join(current))
+    if len(chunks) <= 1:
+        return chunks or [""]
+    total = len(chunks)
+    return [f"{chunk}\n\nЧасть {index}/{total}" for index, chunk in enumerate(chunks, start=1)]
+
+
+def get_delivery_broadcast_response_status(user, responses_by_phone, responses_by_user_id):
     response_status = responses_by_user_id.get(int(user.get("user_id") or 0))
     if not response_status:
         response_status = responses_by_phone.get(normalize_phone(user.get("phone")))
-    label = DELIVERY_RECIPIENT_RESPONSE_LABELS.get(response_status)
-    return f" ({label})" if label else ""
+    return response_status
+
+
+def get_delivery_broadcast_response_label(user, responses_by_phone, responses_by_user_id):
+    response_status = get_delivery_broadcast_response_status(user, responses_by_phone, responses_by_user_id)
+    label = DELIVERY_RECIPIENT_RESPONSE_LABELS.get(response_status, DELIVERY_RECIPIENT_RESPONSE_WAITING_LABEL)
+    return f" ({label})"
 
 
 def build_delivery_candidates_summary_text(eligible_users, scan_result=None, campaign_id=None):
@@ -6862,56 +7279,107 @@ def build_delivery_candidates_summary_text(eligible_users, scan_result=None, cam
         + status_counts.get(DELIVERY_RECIPIENT_STATUS_UNKNOWN, 0)
         + status_counts.get(DELIVERY_RECIPIENT_STATUS_FAILED, 0)
     )
-    lines = [
-        "📤 Клиенты для рассылки доставки",
-        f"Всего клиентов: {len(eligible_users)}",
-        f"Новых отправлено сейчас: {scan_result.get('sent_count', 0)}",
-        f"Уже были в кампании: {scan_result.get('skipped_count', 0)}",
-        f"Требуют проверки: {needs_check}",
-        "",
-    ]
-
     responses_by_phone = {}
     responses_by_user_id = {}
     if campaign_id:
         with Session(bind=engine) as session:
             responses_by_phone, responses_by_user_id = get_delivery_broadcast_response_maps(session, campaign_id)
 
+    agreed_count = 0
+    declined_count = 0
+    waiting_count = 0
+    client_lines = []
     for index, user in enumerate(eligible_users, start=1):
+        response_status = get_delivery_broadcast_response_status(user, responses_by_phone, responses_by_user_id)
+        if response_status == DELIVERY_RECIPIENT_RESPONSE_ACCEPTED:
+            agreed_count += 1
+        elif response_status == DELIVERY_RECIPIENT_RESPONSE_DECLINED:
+            declined_count += 1
+        else:
+            waiting_count += 1
         response_label = get_delivery_broadcast_response_label(user, responses_by_phone, responses_by_user_id)
-        lines.append(
+        client_lines.append(
             f"{index}. {user.get('name') or 'Имя не указано'} | "
             f"{user.get('phone') or 'Телефон не указан'} | "
             f"{user.get('total_amount', 0)} ₽{response_label}"
         )
+
+    lines = [
+        "📤 Клиенты для рассылки доставки",
+        f"Всего клиентов: {len(eligible_users)}",
+        f"Согласились: {agreed_count}",
+        f"Отказались: {declined_count}",
+        f"Не ответили: {waiting_count}",
+        f"Новых отправлено сейчас: {scan_result.get('sent_count', 0)}",
+        f"Уже были в кампании: {scan_result.get('skipped_count', 0)}",
+        f"Требуют проверки: {needs_check}",
+        "",
+        *client_lines,
+    ]
     return "\n".join(lines)
 
 
-def save_delivery_campaign_summary_message(campaign_id, sent_message):
-    if not campaign_id or not sent_message:
+def parse_summary_message_ids(raw_ids, fallback_message_id=None):
+    message_ids = []
+    for part in str(raw_ids or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            message_ids.append(int(part))
+    if not message_ids and fallback_message_id:
+        message_ids.append(int(fallback_message_id))
+    return message_ids
+
+
+def save_delivery_campaign_summary_messages(campaign_id, chat_id, message_ids):
+    if not campaign_id:
         return
 
+    stored_ids = [int(message_id) for message_id in message_ids if message_id]
     with Session(bind=engine) as session:
         campaign = session.query(DeliveryBroadcastCampaign).filter(
             DeliveryBroadcastCampaign.id == campaign_id
         ).first()
         if not campaign:
             return
-        campaign.summary_chat_id = getattr(getattr(sent_message, "chat", None), "id", None) or delivery_channel
-        campaign.summary_message_id = getattr(sent_message, "message_id", None)
+        campaign.summary_chat_id = chat_id or delivery_channel
+        campaign.summary_message_id = stored_ids[0] if stored_ids else None
+        campaign.summary_message_ids = ",".join(str(message_id) for message_id in stored_ids)
         session.commit()
+
+
+def save_delivery_campaign_summary_message(campaign_id, sent_message):
+    if not campaign_id or not sent_message:
+        return
+    save_delivery_campaign_summary_messages(
+        campaign_id,
+        getattr(getattr(sent_message, "chat", None), "id", None) or delivery_channel,
+        [getattr(sent_message, "message_id", None)],
+    )
 
 
 def send_delivery_candidates_summary(campaign_id, eligible_users, scan_result=None):
     text = build_delivery_candidates_summary_text(eligible_users, scan_result, campaign_id=campaign_id)
+    chunks = split_telegram_text(text)
+    sent_ids = []
+    chat_id = delivery_channel
 
-    try:
-        sent_message = safe_send_message(bot, delivery_channel, text, logger=logger)
-        save_delivery_campaign_summary_message(campaign_id, sent_message)
-        return sent_message
-    except Exception as e:
-        logger.warning("Delivery candidates summary send failed: %s", e)
-        return None
+    for chunk in chunks:
+        sent_message = safe_send_message(bot, delivery_channel, chunk, logger=logger)
+        if not sent_message:
+            logger.warning(
+                "Delivery candidates summary chunk failed campaign_id=%s sent_parts=%s/%s",
+                campaign_id,
+                len(sent_ids),
+                len(chunks),
+            )
+            break
+        sent_ids.append(sent_message.message_id)
+        chat_id = getattr(getattr(sent_message, "chat", None), "id", None) or chat_id
+        time.sleep(0.4)
+
+    if sent_ids:
+        save_delivery_campaign_summary_messages(campaign_id, chat_id, sent_ids)
+    return sent_ids
 
 
 def refresh_delivery_candidates_summary(campaign_id, eligible_users=None, scan_result=None):
@@ -6922,24 +7390,52 @@ def refresh_delivery_candidates_summary(campaign_id, eligible_users=None, scan_r
         campaign = session.query(DeliveryBroadcastCampaign).filter(
             DeliveryBroadcastCampaign.id == campaign_id
         ).first()
-        if not campaign or not campaign.summary_chat_id or not campaign.summary_message_id:
+        if not campaign:
             return False
-        summary_chat_id = campaign.summary_chat_id
-        summary_message_id = campaign.summary_message_id
+        summary_chat_id = campaign.summary_chat_id or delivery_channel
+        summary_message_ids = parse_summary_message_ids(
+            campaign.summary_message_ids,
+            campaign.summary_message_id,
+        )
         cutoff_at = campaign.cutoff_at
 
     if eligible_users is None:
         eligible_users = calculate_for_delivery(cutoff_at=cutoff_at)
 
     text = build_delivery_candidates_summary_text(eligible_users, scan_result, campaign_id=campaign_id)
-    result = safe_edit_message_text(
-        bot,
-        logger=logger,
-        chat_id=summary_chat_id,
-        message_id=summary_message_id,
-        text=text,
-    )
-    return result is not None
+    chunks = split_telegram_text(text)
+    if not summary_message_ids:
+        return bool(send_delivery_candidates_summary(campaign_id, eligible_users, scan_result))
+
+    updated_ids = []
+    for index, chunk in enumerate(chunks):
+        if index < len(summary_message_ids):
+            safe_edit_message_text(
+                bot,
+                logger=logger,
+                chat_id=summary_chat_id,
+                message_id=summary_message_ids[index],
+                text=chunk,
+            )
+            updated_ids.append(summary_message_ids[index])
+            continue
+        sent_message = safe_send_message(bot, summary_chat_id, chunk, logger=logger)
+        if not sent_message:
+            logger.warning(
+                "Delivery candidates summary extra chunk failed campaign_id=%s part=%s",
+                campaign_id,
+                index + 1,
+            )
+            break
+        updated_ids.append(sent_message.message_id)
+        time.sleep(0.4)
+
+    for message_id in summary_message_ids[len(chunks):]:
+        safe_delete_message(bot, summary_chat_id, message_id, logger=logger)
+
+    if updated_ids:
+        save_delivery_campaign_summary_messages(campaign_id, summary_chat_id, updated_ids)
+    return bool(updated_ids)
 
 
 def mark_delivery_broadcast_response(user_id, response_status):
@@ -7510,6 +8006,9 @@ def cleanup_in_delivery_records(source="scheduled"):
             post = session.query(Posts).filter(Posts.id == post_id).first()
             if not post:
                 continue
+            if int(post.quantity or 0) > 0:
+                # Остаток ещё продаётся — пост остаётся в канале и в базе.
+                continue
             if post_has_active_links(session, post_id):
                 continue
             ensure_deleted_post_snapshot(session, post, f"delivery_cleanup:{source}")
@@ -7616,54 +8115,6 @@ def start_delivery_cleanup_worker():
     thread.start()
 
 
-def count_linked_midnight_posts(session, model, post_ids):
-    if not post_ids:
-        return 0
-    return session.query(func.count(func.distinct(model.post_id))).filter(
-        model.post_id.in_(post_ids),
-    ).scalar() or 0
-
-
-def cleanup_midnight_posts_after_snapshot(reason="legacy_midnight_created_at_cleanup"):
-    stats = {
-        "snapshotted": 0,
-        "deleted": 0,
-        "with_reservations": 0,
-        "with_in_delivery": 0,
-        "with_temp_fulfilled": 0,
-        "with_wait_queue": 0,
-        "with_collection_items": 0,
-        "with_missing_delivery": 0,
-        "skipped_active": 0,
-    }
-
-    with Session(bind=engine) as session:
-        midnight_posts = [
-            post for post in session.query(Posts).filter(Posts.created_at != None).all()
-            if post.created_at.time() == datetime.min.time()
-        ]
-        post_ids = [post.id for post in midnight_posts]
-        stats["with_reservations"] = count_linked_midnight_posts(session, Reservations, post_ids)
-        stats["with_in_delivery"] = count_linked_midnight_posts(session, InDelivery, post_ids)
-        stats["with_temp_fulfilled"] = count_linked_midnight_posts(session, Temp_Fulfilled, post_ids)
-        stats["with_wait_queue"] = count_linked_midnight_posts(session, TempReservations, post_ids)
-        stats["with_collection_items"] = count_linked_midnight_posts(session, DeliveryCollectionItem, post_ids)
-        stats["with_missing_delivery"] = count_linked_midnight_posts(session, MissingDeliveryItem, post_ids)
-
-        for post in midnight_posts:
-            if post_has_active_links(session, post.id):
-                stats["skipped_active"] += 1
-                continue
-            if ensure_deleted_post_snapshot(session, post, reason):
-                stats["snapshotted"] += 1
-            session.delete(post)
-            stats["deleted"] += 1
-
-        session.commit()
-
-    return stats
-
-
 def keyboard_for_editing():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("Изменить адрес", callback_data="edit_address"))
@@ -7752,6 +8203,9 @@ def handle_new_address(message):
     if ignore_silent_blocked_message(message):
         return
 
+    if delivery_checkout_expired(delivery_flow_data(user_id)):
+        reject_expired_delivery_checkout(user_id)
+        return
     new_address = require_text_message(message, "Введите новый адрес текстом.")
     if new_address is None:
         return
@@ -7774,7 +8228,6 @@ def handle_new_address(message):
     delivery_cutoff_at = parse_datetime(flow_data.get("delivery_cutoff_at")) or now_local()
 
     # Получаем всех клиентов с таким же номером телефона
-    from db import Session, engine
     with Session(bind=engine) as session:
         same_phone_users = session.query(Clients).filter(
             Clients.phone.in_(phone_variants(phone))
@@ -7813,8 +8266,7 @@ def handle_new_address(message):
 @bot.message_handler(func=lambda message: message_user_state_is(message, "WAITING_FOR_NEW_PHONE"))
 def handle_new_phone(message):
     """
-    Обработка нового номера телефона пользователя.
-    Должен учитывать информацию по старому номеру телефона и временно сохранять новый номер.
+    Новый номер — только контакт для курьера. Корзина и заявка остаются на номере клиента.
     """
     user_id = message_from_user_id(message)
     if user_id is None:
@@ -7822,11 +8274,14 @@ def handle_new_phone(message):
         return
     if ignore_silent_blocked_message(message):
         return
+    if delivery_checkout_expired(delivery_flow_data(user_id)):
+        reject_expired_delivery_checkout(user_id)
+        return
 
     text = require_text_message(message, "Введите новый номер телефона текстом.")
     if text is None:
         return
-    new_phone = normalize_phone(text)  # Убираем лишние пробелы
+    new_phone = normalize_phone(text)
     if not is_phone_valid(new_phone):
         safe_send_message(bot, user_id, "Введите корректный номер телефона.", logger=logger)
         return
@@ -7840,66 +8295,34 @@ def handle_new_phone(message):
     if not flow_data:
         return
 
-    # Временные данные текущего пользователя
-    name = flow_data.get("name", "Не указано")
-    current_phone = flow_data.get("phone", "Не указан")  # Это старый номер телефона
-    address = flow_data.get("address", "Не указан")
-    final_sum = flow_data.get("final_sum", 0)
-    delivery_cutoff_at = parse_datetime(flow_data.get("delivery_cutoff_at")) or now_local()
-
-
-    # Подключаемся к базе данных, чтобы найти тех, у кого такой же старый номер телефона (current_phone)
-    from db import Session, engine, Clients
-    with Session(bind=engine) as session:
-        try:
-            # Найти всех клиентов с текущим (старым) номером телефона
-            same_phone_users = session.query(Clients).filter(
-                Clients.phone.in_(phone_variants(current_phone))
-            ).all()
-
-
-        except Exception as e:
-            logger.warning("Delivery phone lookup failed for user_id=%s: %s", user_id, e)
-            same_phone_users = []
-
-    # Подсчитываем общую сумму всех заказов и собираем имена
-    total_sum_by_phone = final_sum  # Начинаем с суммы текущего пользователя
-    all_names = [name]  # Добавляем название текущего клиента
-    seen_delivery_user_ids = {user_id}
-    for client in same_phone_users:
-        if client.user_id in seen_delivery_user_ids:
-            continue
-        seen_delivery_user_ids.add(client.user_id)
-        all_names.append(client.name)
-        order_sum = calculate_collectable_sum_for_user(client.user_id, cutoff_at=delivery_cutoff_at)
-        total_sum_by_phone += order_sum
-
-    # Формируем строку с именами всех клиентов
-    all_names_str = ", ".join(all_names)
-
-    # Сохраняем новый номер временно
-    flow_data["phone"] = new_phone
+    flow_data["contact_phone"] = new_phone
     temp_user_data[user_id] = flow_data
 
-    # Отправляем итоговое сообщение
     safe_send_message(
         bot,
         user_id,
         (
             f"Обновление данных:\n"
-            f"Текущий номер (старый): {current_phone}\n"
-            f"Новый номер: {new_phone}\n"
-            f"Имя: {name}\nАдрес: {address}\n"
-            f"Имена заказчиков с текущим номером: {all_names_str}\n"
-            f"Общая сумма заказов: {total_sum_by_phone}.\n\n"
+            f"Имя: {flow_data.get('name', 'Не указано')}\n"
+            f"Номер корзины: {flow_data.get('phone', 'Не указан')}\n"
+            f"Телефон для курьера: {new_phone}\n"
+            f"Адрес: {flow_data.get('address', 'Не указан')}\n"
+            f"Общая сумма заказов: {flow_data.get('total_sum_by_phone', flow_data.get('final_sum', 0))}.\n\n"
             f"Подтверждаете изменения?"
         ),
         reply_markup=keyboard_for_confirmation(),
         logger=logger,
     )
-
-    # Переводим пользователя в состояние ожидания подтверждения
     set_user_state(user_id, "WAITING_FOR_CONFIRMATION")
+
+
+def build_delivery_address_with_contact(address, contact_phone, cart_phone):
+    address = str(address or "").strip()
+    contact = normalize_phone(contact_phone)
+    if not contact or contact == normalize_phone(cart_phone):
+        return address
+    return f"{address}\nТелефон для курьера: {contact}"
+
 
 def keyboard_for_confirmation():
     keyboard = types.InlineKeyboardMarkup()
@@ -7935,16 +8358,30 @@ def handle_confirmation(call):
         )
         if not user_temp_data:
             return
+        if delivery_checkout_expired(user_temp_data):
+            reject_expired_delivery_checkout(user_id, message_id=call.message.message_id)
+            return
 
-        # Извлекаем новые данные из временного хранилища
+        # Извлекаем данные из временного хранилища. Номер корзины не меняется,
+        # отдельный номер для курьера дописывается к адресу.
         name = user_temp_data.get("name", "Не указано")
-        phone = user_temp_data.get("phone", "Не указан")  # Новый телефон
-        address = user_temp_data.get("address", "Не указан")
+        phone = user_temp_data.get("phone", "Не указан")
+        address = build_delivery_address_with_contact(
+            user_temp_data.get("address", "Не указан"),
+            user_temp_data.get("contact_phone"),
+            phone,
+        )
         final_sum = user_temp_data.get("final_sum", 0)  # Сумма текущего заказа
         delivery_cutoff_at = parse_datetime(user_temp_data.get("delivery_cutoff_at")) or now_local()
-
-
-        from db import Session, engine, Clients, ForDelivery
+        with Session(bind=engine) as session:
+            collectable_sum = get_delivery_collectable_sum_for_user(
+                session,
+                user_id,
+                delivery_campaign_cutoff_at(),
+            )
+        if collectable_sum < DELIVERY_THRESHOLD:
+            reject_delivery_below_threshold(user_id, collectable_sum, message_id=call.message.message_id)
+            return
 
         # Подключаемся к базе для извлечения старого телефона из Clients
         with Session(bind=engine) as session:
@@ -8284,17 +8721,10 @@ def send_delivery_offer_message(user_id, user_name, bot_instance=None):
         logger=logger,
         attempts=3,
         description="Telegram delivery offer send_message",
+        idempotent=False,
     )
     logger.debug("Delivery offer sent to user_id=%s", user_id)
     return sent_message
-
-
-def send_delivery_offer(bot_instance, user_id, user_name):
-    try:
-        return send_delivery_offer_message(user_id, user_name, bot_instance=bot_instance)
-    except Exception as e:
-        logger.warning("Delivery offer send failed for user_id=%s: %s", user_id, sanitize_telegram_error_text(e))
-        raise
 
 
 def add_user_id_to_set(user_ids, value):
@@ -8442,6 +8872,8 @@ def get_delivery_root_entry(session, delivery_entry, lock=False):
             current.merge_order = 0
             session.flush()
             return current
+        if find_delivery_cart_merge_by_extra_phone(session, current.phone) and not delivery_main_cart_has_collectable_items(session, parent.phone):
+            return current
         current = parent
 
     return current
@@ -8560,6 +8992,102 @@ def find_delivery_cart_merge_by_extra_phone(session, phone):
     ).order_by(DeliveryCartMerge.id.asc()).first()
 
 
+def extra_delivery_collection_phones(session):
+    phones = set()
+    for merge_row in session.query(DeliveryCartMerge).all():
+        if not delivery_main_cart_has_collectable_items(session, merge_row.main_phone):
+            continue
+        for variant in phone_variants(merge_row.extra_phone) or [merge_row.extra_phone]:
+            if variant:
+                phones.add(variant)
+    return phones
+
+
+def delivery_entry_own_collectable_sum(session, delivery_entry):
+    if not delivery_entry:
+        return 0
+    return calculate_delivery_total_for_user_ids(
+        session,
+        get_related_delivery_user_ids(session, delivery_entry),
+        get_delivery_cutoff_at(delivery_entry),
+    )
+
+
+def delivery_entry_has_own_collectable_items(session, delivery_entry):
+    return delivery_entry_own_collectable_sum(session, delivery_entry) > 0
+
+
+def delivery_main_cart_has_collectable_items(session, main_phone):
+    main_entry = find_for_delivery_entry_by_phone(session, main_phone)
+    if not main_entry or main_entry.merged_into_delivery_id:
+        return False
+    if main_entry.collector_user_id or delivery_entry_has_collection_items(session, main_entry):
+        return True
+    return delivery_entry_has_own_collectable_items(session, main_entry)
+
+
+def visible_delivery_collection_query(session):
+    query = session.query(ForDelivery).filter(ForDelivery.merged_into_delivery_id == None)
+    extra_phones = extra_delivery_collection_phones(session)
+    if extra_phones:
+        query = query.filter(~ForDelivery.phone.in_(list(extra_phones)))
+    return query
+
+
+def list_visible_delivery_collection_entries(session):
+    entries = session.query(ForDelivery).order_by(
+        ForDelivery.name,
+        ForDelivery.phone,
+        ForDelivery.id,
+    ).all()
+
+    # Объединения корзин читаем один раз, а не по запросу на каждого клиента.
+    merge_by_extra_phone = {}
+    mains_with_extras = set()
+    for merge_row in session.query(DeliveryCartMerge).order_by(DeliveryCartMerge.id.asc()).all():
+        extra_phone = normalize_phone(merge_row.extra_phone)
+        if extra_phone and extra_phone not in merge_by_extra_phone:
+            merge_by_extra_phone[extra_phone] = merge_row
+        main_phone = normalize_phone(merge_row.main_phone)
+        if main_phone:
+            mains_with_extras.add(main_phone)
+
+    main_cart_cache = {}
+
+    def main_cart_has_items(phone):
+        key = normalize_phone(phone)
+        if key not in main_cart_cache:
+            main_cart_cache[key] = delivery_main_cart_has_collectable_items(session, phone)
+        return main_cart_cache[key]
+
+    visible = []
+    for entry in entries:
+        entry_phone = normalize_phone(entry.phone)
+        owner_merge = merge_by_extra_phone.get(entry_phone)
+        if owner_merge:
+            if main_cart_has_items(owner_merge.main_phone):
+                continue
+            visible.append(entry)
+            continue
+        if entry.merged_into_delivery_id:
+            continue
+        if entry_phone in mains_with_extras and not main_cart_has_items(entry.phone):
+            continue
+        visible.append(entry)
+    return visible
+
+
+def resolve_delivery_collection_root_entry(session, delivery_entry, lock=False):
+    if not delivery_entry:
+        return None
+    owner_merge = find_delivery_cart_merge_by_extra_phone(session, delivery_entry.phone)
+    if owner_merge and delivery_main_cart_has_collectable_items(session, owner_merge.main_phone):
+        main_entry = find_for_delivery_entry_by_phone(session, owner_merge.main_phone, lock=lock)
+        if main_entry:
+            delivery_entry = main_entry
+    return get_delivery_root_entry(session, delivery_entry, lock=lock) or delivery_entry
+
+
 def list_delivery_cart_merges_for_main(session, main_phone):
     normalized_phone = normalize_phone(main_phone)
     if not normalized_phone:
@@ -8616,15 +9144,19 @@ def unlink_for_delivery_extra_entry(session, extra_entry):
     extra_entry.collection_started_at = None
 
 
-def apply_persistent_cart_merges_for_phone(session, phone):
+def apply_persistent_cart_merges_for_phone(session, phone, lock=False):
     normalized_phone = normalize_phone(phone)
     if not normalized_phone:
         return None
 
     owner_merge = find_delivery_cart_merge_by_extra_phone(session, normalized_phone)
     if owner_merge:
-        main_entry = find_for_delivery_entry_by_phone(session, owner_merge.main_phone, lock=True)
-        extra_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=True)
+        main_entry = find_for_delivery_entry_by_phone(session, owner_merge.main_phone, lock=lock)
+        extra_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=lock)
+        if extra_entry and not delivery_main_cart_has_collectable_items(session, owner_merge.main_phone):
+            unlink_for_delivery_extra_entry(session, extra_entry)
+            session.flush()
+            return extra_entry
         if (
             main_entry
             and extra_entry
@@ -8632,7 +9164,7 @@ def apply_persistent_cart_merges_for_phone(session, phone):
             and not main_entry.collector_user_id
             and not delivery_entry_has_collection_items(session, main_entry)
         ):
-            extra_group = get_delivery_collection_entries(session, extra_entry, lock=True)
+            extra_group = get_delivery_collection_entries(session, extra_entry, lock=lock)
             for child in extra_group:
                 if child.id == main_entry.id:
                     continue
@@ -8644,7 +9176,7 @@ def apply_persistent_cart_merges_for_phone(session, phone):
             main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
         return extra_entry or main_entry
 
-    main_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=True)
+    main_entry = find_for_delivery_entry_by_phone(session, normalized_phone, lock=lock)
     if not main_entry:
         return None
     if main_entry.collector_user_id or delivery_entry_has_collection_items(session, main_entry):
@@ -8653,11 +9185,18 @@ def apply_persistent_cart_merges_for_phone(session, phone):
     main_entry.merged_into_delivery_id = None
     main_entry.merge_order = 0
     extra_rows = list_delivery_cart_merges_for_main(session, normalized_phone)
+    if extra_rows and not delivery_entry_has_own_collectable_items(session, main_entry):
+        for extra_row in extra_rows:
+            extra_entry = find_for_delivery_entry_by_phone(session, extra_row.extra_phone, lock=lock)
+            unlink_for_delivery_extra_entry(session, extra_entry)
+        session.flush()
+        main_entry.total_sum = calculate_delivery_entry_actual_total(session, main_entry)
+        return main_entry
     for extra_row in extra_rows:
         extra_client = find_client_by_normalized_phone(session, extra_row.extra_phone)
         if not extra_client:
             continue
-        extra_entry = find_for_delivery_entry_by_phone(session, extra_row.extra_phone, lock=True)
+        extra_entry = find_for_delivery_entry_by_phone(session, extra_row.extra_phone, lock=lock)
         if extra_entry and (
             extra_entry.collector_user_id
             or delivery_entry_has_collection_items(session, extra_entry)
@@ -8675,7 +9214,7 @@ def apply_persistent_cart_merges_for_phone(session, phone):
                 apply_merges=False,
             )
             session.flush()
-        extra_group = get_delivery_collection_entries(session, extra_entry, lock=True)
+        extra_group = get_delivery_collection_entries(session, extra_entry, lock=lock)
         for child in extra_group:
             if child.id == main_entry.id:
                 continue
@@ -8758,7 +9297,7 @@ def merge_or_unmerge_delivery_carts(session, main_phone, extra_phone_text):
         nested.main_phone = main_phone
         nested.merge_order = merge_order + offset
     session.flush()
-    apply_persistent_cart_merges_for_phone(session, main_phone)
+    apply_persistent_cart_merges_for_phone(session, main_phone, lock=True)
 
     main_client = find_client_by_normalized_phone(session, main_phone)
     extra_labels = [
@@ -8786,46 +9325,6 @@ def merge_or_unmerge_delivery_carts(session, main_phone, extra_phone_text):
         f"Дополнительные: {', '.join(extra_labels)}\n"
         f"{status_line}"
     )
-
-
-def merge_delivery_cart_entries(session, main_delivery_id, extra_phone_text):
-    main_entry = session.query(ForDelivery).filter(
-        ForDelivery.id == main_delivery_id,
-    ).first()
-    if not main_entry:
-        return False, "Основная корзина уже обработана или удалена из списка доставки."
-    return merge_or_unmerge_delivery_carts(session, main_entry.phone, extra_phone_text)
-
-
-def find_delivery_entry_by_phone_input(session, raw_phone):
-    normalized_phone = normalize_phone(raw_phone)
-    if not normalized_phone:
-        return None, "Введите номер телефона корзины."
-
-    query = session.query(ForDelivery)
-    if len(normalized_phone) >= 10:
-        query = query.filter(ForDelivery.phone.in_(phone_variants(normalized_phone)))
-    elif len(normalized_phone) >= 4:
-        query = query.filter(ForDelivery.phone.like(f"%{normalized_phone}"))
-    else:
-        return None, "Введите полный номер телефона или минимум последние 4 цифры."
-
-    rows = query.order_by(
-        ForDelivery.name.asc(),
-        ForDelivery.phone.asc(),
-        ForDelivery.id.asc(),
-    ).all()
-    if not rows:
-        return None, f"Корзина доставки по телефону {normalized_phone} не найдена."
-    if len(rows) > 1:
-        matches = "\n".join(
-            f"- {format_delivery_entry_label(row)}"
-            for row in rows[:10]
-        )
-        if len(rows) > 10:
-            matches += f"\n...и еще {len(rows) - 10}"
-        return None, f"Найдено несколько корзин. Введите телефон точнее:\n{matches}"
-    return rows[0], None
 
 
 def delivery_entries_have_placed_items(session, delivery_entries):
@@ -9008,8 +9507,6 @@ def send_delivery_reserved_group_snapshot():
 
 def start_delivery_reserved_group_pause_and_snapshot():
     with Session(bind=engine) as session:
-        deduplicate_for_delivery_entries(session)
-        session.commit()
         delivery_count = session.query(func.count(ForDelivery.id)).scalar() or 0
 
     if delivery_count == 0:
@@ -9206,6 +9703,7 @@ def build_delivery_collection_report_items_from_collection_items(collection_item
             "reservation_id": item.reservation_id,
             "unit_index": item.unit_index,
             "author": None,
+            "shelf": resolve_shelf_label(item.post_id, item.item_description),
             "placed_count": max(int(item.quantity or 0), 1) if item.placed_at else 0,
             "unplaced_item_ids": [] if item.placed_at else ([item.id] if item.id else []),
         }
@@ -9225,6 +9723,7 @@ def group_delivery_collection_report_items(items):
             item.get("description"),
             item.get("created_at"),
             item.get("author"),
+            item.get("shelf"),
         )
         if item_key not in grouped_by_key:
             grouped_item = {
@@ -9238,6 +9737,7 @@ def group_delivery_collection_report_items(items):
                 "total_price": 0,
                 "created_at": item.get("created_at"),
                 "author": item.get("author"),
+                "shelf": item.get("shelf"),
                 "placed_count": 0,
                 "unplaced_item_ids": [],
             }
@@ -9291,16 +9791,21 @@ def build_delivery_collection_report_item_keyboard(item, collection_finished=Fal
 
 
 def build_delivery_collection_report_item_caption(context, item, collection_finished=False):
-    return "\n".join([
+    lines = [
         f"Id товара: {item['post_id']}",
         f"Номер телефона клиента: {item.get('phone') or context['phone'] or 'не указан'}",
         f"Клиент: {item.get('client_name') or context['name'] or 'имя не указано'}",
         f"Кто собирает: {context['collector_name'] or 'неизвестно'}",
         f"Описание товара: {item['description']}",
+    ]
+    if item.get("shelf"):
+        lines.append(f"Полка: {item['shelf']}")
+    lines.extend([
         f"Сумма товара: {item['total_price']} ₽",
         f"Количество: {item['quantity']}",
         f"Статус: {format_delivery_collection_report_item_status(item, collection_finished=collection_finished)}",
     ])
+    return "\n".join(lines)
 
 
 def build_delivery_collection_report_footer(context, grouped_items):
@@ -9348,7 +9853,7 @@ def send_delivery_collection_report_message(text):
             if attempt == 1 and update_delivery_collection_report_group_id(migrate_to_chat_id):
                 continue
             retry_after = telegram_retry_after_seconds(exc)
-            if is_transient_telegram_error(exc) and attempt < attempts:
+            if is_safe_to_resend_error(exc) and attempt < attempts:
                 wait_seconds = (
                     max(retry_after + 1, DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
                     if retry_after is not None
@@ -9382,7 +9887,7 @@ def send_delivery_collection_report_photo_or_text(photo, text, reply_markup=None
             if attempt == 1 and update_delivery_collection_report_group_id(migrate_to_chat_id):
                 continue
             retry_after = telegram_retry_after_seconds(exc)
-            if is_transient_telegram_error(exc) and attempt < attempts:
+            if is_safe_to_resend_error(exc) and attempt < attempts:
                 wait_seconds = (
                     max(retry_after + 1, DELIVERY_COLLECTION_REPORT_SEND_INTERVAL_SECONDS)
                     if retry_after is not None
@@ -9508,22 +10013,10 @@ def edit_delivery_collection_report_item_message(item):
         grouped_item,
         collection_finished=collection_finished,
     )
-    if message_has_photo:
-        edited_caption = safe_edit_message_caption(
-            bot,
-            logger=logger,
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=caption,
-            reply_markup=reply_markup,
-        )
-        if edited_caption is not None:
-            return True
-        logger.debug("Delivery collection report caption edit fallback for item_id=%s", item.id)
-
-    return safe_edit_message_text(
+    return safe_edit_message_text_or_caption(
         bot,
         logger=logger,
+        prefer_caption=message_has_photo,
         chat_id=chat_id,
         message_id=message_id,
         text=caption,
@@ -9754,8 +10247,11 @@ def build_delivery_collection_item_caption(item):
     lines = [
         f"Id товара: {item.post_id}",
         f"Описание: {item.item_description}",
-        f"Цена: {item.amount} ₽",
     ]
+    shelf = resolve_shelf_label(item.post_id, item.item_description)
+    if shelf:
+        lines.append(f"Полка: {shelf}")
+    lines.append(f"Цена: {item.amount} ₽")
     if item.quantity and int(item.quantity) != 1:
         lines.append(f"Количество: {item.quantity}")
     lines.append(f"Клиент: {item.user_name or 'Имя не указано'}")
@@ -9786,22 +10282,10 @@ def edit_delivery_collection_item_message(item):
 
     caption = build_delivery_collection_item_caption(item)
     markup = build_delivery_collection_item_keyboard(item)
-    if item.message_has_photo:
-        edited_caption = safe_edit_message_caption(
-            bot,
-            logger=logger,
-            chat_id=item.message_chat_id,
-            message_id=item.message_id,
-            caption=caption,
-            reply_markup=markup,
-        )
-        if edited_caption is not None:
-            return True
-        logger.debug("Delivery collection caption edit fallback for item_id=%s", item.id)
-
-    return safe_edit_message_text(
+    return safe_edit_message_text_or_caption(
         bot,
         logger=logger,
+        prefer_caption=bool(item.message_has_photo),
         chat_id=item.message_chat_id,
         message_id=item.message_id,
         text=caption,
@@ -10015,6 +10499,7 @@ def get_pending_delivery_collector_sheet_delivery_ids(limit=DELIVERY_SHEET_RETRY
             ForDelivery.collector_name != None,
             ForDelivery.collector_sheet_added_at == None,
         ).order_by(
+            (ForDelivery.collector_sheet_error != None).asc(),
             ForDelivery.collection_started_at.asc(),
             ForDelivery.id.asc(),
         ).limit(limit).all()
@@ -10051,6 +10536,12 @@ def add_collection_item_amount_to_sheet(item_id):
             return True, item
         if not item.placed_at:
             return False, item
+        if int(item.amount or 0) <= 0:
+            # Нулевая сумма: в таблицу добавлять нечего, иначе запись бесконечно уходила бы в повтор.
+            item.sheet_added_at = now_local()
+            item.sheet_error = None
+            session.commit()
+            return True, item
         phone = get_delivery_sheet_phone(session, item=item)
         amount = item.amount
 
@@ -10104,6 +10595,9 @@ def get_pending_delivery_sheet_item_ids(limit=DELIVERY_SHEET_RETRY_BATCH_SIZE):
             DeliveryCollectionItem.placed_at != None,
             DeliveryCollectionItem.sheet_added_at == None,
         ).order_by(
+            # Сначала новые записи, записи с ошибкой (например, телефона нет в таблице) — в конце,
+            # чтобы они не блокировали очередь.
+            (DeliveryCollectionItem.sheet_error != None).asc(),
             DeliveryCollectionItem.placed_at.asc(),
             DeliveryCollectionItem.id.asc(),
         ).limit(limit).all()
@@ -10281,6 +10775,19 @@ def calculate_delivery_entry_actual_total(session, delivery_entry):
     return sum(max(int(item.get("total_price") or 0), 0) for item in get_delivery_entry_cart_items(session, delivery_entry))
 
 
+def calculate_delivery_entry_list_total(session, entry):
+    if delivery_entry_has_collection_items(session, entry):
+        return calculate_delivery_entry_actual_total(session, entry)
+
+    campaign_cutoff = delivery_campaign_cutoff_at()
+    stored_cutoff = get_delivery_cutoff_at(entry)
+    cutoff_at = campaign_cutoff if should_replace_delivery_cutoff(stored_cutoff, campaign_cutoff) else stored_cutoff
+    user_ids = set(get_related_delivery_user_ids(session, entry))
+    for merge_row in list_delivery_cart_merges_for_main(session, entry.phone):
+        user_ids.update(get_related_delivery_user_ids_by_phone(session, merge_row.extra_phone))
+    return calculate_delivery_total_for_user_ids(session, sorted(user_ids), cutoff_at)
+
+
 def sync_delivery_entry_total_sum(session, delivery_entry):
     actual_total = calculate_delivery_entry_actual_total(session, delivery_entry)
     if delivery_entry.total_sum != actual_total:
@@ -10296,8 +10803,9 @@ def sync_delivery_entry_total_sum(session, delivery_entry):
     return actual_total
 
 
-def build_delivery_collection_button_text(row):
-    base_text = f"{row.name} | {row.phone} | {row.total_sum} ₽"
+def build_delivery_collection_button_text(row, total_sum=None):
+    amount = row.total_sum if total_sum is None else total_sum
+    base_text = f"{row.name} | {row.phone} | {amount} ₽"
     if not row.collector_name:
         return base_text[:64]
 
@@ -10307,29 +10815,16 @@ def build_delivery_collection_button_text(row):
 
 
 def build_delivery_collection_keyboard(session, page=0):
-    deduplicate_for_delivery_entries(session)
-    session.flush()
-    for root_entry in session.query(ForDelivery).filter(
-        ForDelivery.merged_into_delivery_id == None,
-    ).order_by(ForDelivery.id.asc()).all():
-        apply_persistent_cart_merges_for_phone(session, root_entry.phone)
-    session.flush()
-    visible_query = session.query(ForDelivery).filter(
-        ForDelivery.merged_into_delivery_id == None,
-    )
-    total_count = visible_query.count()
-    rows = visible_query.order_by(
-        ForDelivery.name,
-        ForDelivery.phone,
-        ForDelivery.id,
-    ).offset(page * DELIVERY_COLLECTION_PAGE_SIZE).limit(DELIVERY_COLLECTION_PAGE_SIZE).all()
-    for row in rows:
-        sync_delivery_entry_total_sum(session, row)
-    session.flush()
+    rows = list_visible_delivery_collection_entries(session)
+    total_count = len(rows)
+    rows = rows[page * DELIVERY_COLLECTION_PAGE_SIZE:(page + 1) * DELIVERY_COLLECTION_PAGE_SIZE]
 
     keyboard = InlineKeyboardMarkup()
     for row in rows:
-        button_text = build_delivery_collection_button_text(row)
+        button_text = build_delivery_collection_button_text(
+            row,
+            total_sum=calculate_delivery_entry_list_total(session, row),
+        )
         keyboard.add(InlineKeyboardButton(button_text, callback_data=f"collect_delivery_{row.id}_{page}"))
 
     nav_buttons = []
@@ -10344,14 +10839,32 @@ def build_delivery_collection_keyboard(session, page=0):
 
 
 def show_delivery_collection_list(chat_id, message_id=None, page=0):
-    with Session(bind=engine) as session:
-        keyboard, total_count = build_delivery_collection_keyboard(session, page)
-        session.commit()
+    try:
+        with Session(bind=engine) as session:
+            with session.no_autoflush:
+                keyboard, total_count = build_delivery_collection_keyboard(session, page)
+    except Exception as exc:
+        if not is_transient_database_error(exc):
+            raise
+        logger.warning("Delivery collection list locked: %s", exc)
+        safe_send_message(
+            bot,
+            chat_id,
+            "Список сборки сейчас занят. Нажмите «Собрать доставку» ещё раз.",
+            logger=logger,
+        )
+        return
 
     if total_count == 0:
         text = "Список доставки пуст. Пока никто не согласился на доставку и не добавлен вручную."
         if message_id:
-            edited_message = safe_edit_message_text(bot, logger=logger, chat_id=chat_id, message_id=message_id, text=text)
+            edited_message = safe_edit_message_text_or_caption(
+                bot,
+                logger=logger,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
             if edited_message is not None:
                 return
         safe_send_message(bot, chat_id, text, logger=logger)
@@ -10359,7 +10872,7 @@ def show_delivery_collection_list(chat_id, message_id=None, page=0):
 
     text = f"Клиенты для сборки доставки: {total_count}\nВыберите клиента, чтобы посмотреть корзину."
     if message_id:
-        edited_message = safe_edit_message_text(
+        edited_message = safe_edit_message_text_or_caption(
             bot,
             logger=logger,
             chat_id=chat_id,
@@ -10376,8 +10889,13 @@ def show_delivery_collection_list(chat_id, message_id=None, page=0):
 def collect_delivery(message):
     if not require_role(message, DELIVERY_COLLECTION_ROLES):
         return
-    auto_fulfill_expired_reservations()
-    started_snapshot, snapshot_count = start_delivery_reserved_group_pause_and_snapshot()
+    try:
+        started_snapshot, snapshot_count = start_delivery_reserved_group_pause_and_snapshot()
+    except Exception as exc:
+        if not is_transient_database_error(exc):
+            raise
+        logger.warning("Delivery collection pause start locked: %s", exc)
+        started_snapshot, snapshot_count = False, 0
     if started_snapshot:
         safe_send_message(
             bot,
@@ -10394,6 +10912,7 @@ def collect_delivery(message):
             logger=logger,
         )
     show_delivery_collection_list(message.chat.id)
+    auto_fulfill_expired_reservations()
 
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "collect_delivery_page_"))
@@ -10466,58 +10985,147 @@ def show_delivery_collection_client(call):
         safe_answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
         return
 
-    with Session(bind=engine, expire_on_commit=False) as session:
+    open_delivery_collection_client(call, delivery_id, page)
+
+
+def send_delivery_collection_takeover_offer(chat_id, delivery_id, page, collector_name):
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton(
+        "🔓 Забрать корзину себе",
+        callback_data=f"collect_takeover_{delivery_id}_{page}",
+    ))
+    safe_send_message(
+        bot,
+        chat_id,
+        f"Эту корзину сейчас собирает {collector_name}. "
+        "Если сборщик ушёл, вы можете забрать корзину себе. Отметки «Положил» сохранятся.",
+        reply_markup=keyboard,
+        logger=logger,
+    )
+
+
+def force_release_delivery_collection_entry(session, delivery_entry):
+    delivery_entry = get_delivery_root_entry(session, delivery_entry, lock=True) or delivery_entry
+    previous_collectors = set()
+    for entry in get_delivery_collection_entries(session, delivery_entry, lock=True):
+        if entry.collector_user_id:
+            previous_collectors.add(int(entry.collector_user_id))
+        entry.collector_user_id = None
+        entry.collector_name = None
+        entry.collection_started_at = None
+        entry.collector_sheet_added_at = None
+        entry.collector_sheet_row = None
+        entry.collector_sheet_error = None
+    update_delivery_collection_items_collector(session, delivery_entry, reset_sheet=True)
+    session.flush()
+    return previous_collectors
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "collect_takeover_"))
+def take_over_delivery_collection_client(call):
+    if not has_role(call.from_user.id, ADMIN_ROLES):
+        safe_answer_callback_query(call.id, "Забрать корзину может только администратор.", show_alert=True)
+        return
+    try:
+        delivery_id, page = parse_delivery_collection_callback(call.data, "collect_takeover_")
+    except ValueError:
+        safe_answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
+        return
+
+    with Session(bind=engine) as session:
         delivery_entry = session.query(ForDelivery).filter(
             ForDelivery.id == delivery_id,
         ).with_for_update().first()
         if not delivery_entry:
             safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
             return
-
-        delivery_entry = get_delivery_root_entry(session, delivery_entry, lock=True) or delivery_entry
-        delivery_id = delivery_entry.id
-        claimed, collector_name = claim_delivery_collection_entry(session, delivery_entry, call.from_user)
-        if not claimed:
-            session.commit()
-            safe_answer_callback_query(
-                call.id,
-                f"Эту корзину сейчас собирает {collector_name}.",
-                show_alert=True,
-            )
-            show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
-            return
-
-        items = get_or_create_delivery_collection_items(session, delivery_entry)
-        if not items:
-            release_delivery_collection_entry(session, delivery_entry, call.from_user)
-            session.commit()
-            safe_answer_callback_query(call.id)
-            show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
-            safe_send_message(bot, call.message.chat.id, "У клиента нет обработанных товаров в корзине.", logger=logger)
-            return
-
-        actual_total_sum = sum(max(int(item.amount or 0), 0) for item in items)
-        if delivery_entry.total_sum != actual_total_sum:
-            logger.warning(
-                "Delivery opened with stale total_sum delivery_id=%s phone=%s old_total=%s actual_total=%s",
-                delivery_entry.id,
-                delivery_entry.phone,
-                delivery_entry.total_sum,
-                actual_total_sum,
-            )
-            delivery_entry.total_sum = actual_total_sum
-        header = (
-            f"🧺 Сборка доставки\n"
-            f"Клиент: {delivery_entry.name}\n"
-            f"Телефон: {delivery_entry.phone}\n"
-            f"Сумма: {actual_total_sum} ₽\n"
-            f"Адрес: {delivery_entry.address or 'адрес не указан'}\n"
-            f"Собирает: {collector_name}\n"
-            f"Срез доставки: {format_datetime(get_delivery_cutoff_at(delivery_entry))}"
-        )
-        report_context = build_delivery_collection_report_context(session, delivery_entry)
-        report_items = build_delivery_collection_report_items_from_collection_items(items)
+        client_label = format_delivery_entry_label(delivery_entry)
+        previous_collectors = force_release_delivery_collection_entry(session, delivery_entry)
         session.commit()
+
+    new_collector_name = Clients.get_name_by_user_id(call.from_user.id) or f"ID {call.from_user.id}"
+    for collector_id in previous_collectors:
+        if collector_id == int(call.from_user.id):
+            continue
+        safe_send_message(
+            bot,
+            collector_id,
+            f"Корзину {client_label} забрал на сборку {new_collector_name}.",
+            logger=logger,
+        )
+    open_delivery_collection_client(call, delivery_id, page)
+
+
+def open_delivery_collection_client(call, delivery_id, page):
+    try:
+        with Session(bind=engine, expire_on_commit=False) as session:
+            delivery_entry = session.query(ForDelivery).filter(
+                ForDelivery.id == delivery_id,
+            ).with_for_update().first()
+            if not delivery_entry:
+                safe_answer_callback_query(call.id, "Клиент уже обработан или удалён из списка.", show_alert=True)
+                return
+
+            delivery_entry = resolve_delivery_collection_root_entry(session, delivery_entry, lock=True)
+            delivery_id = delivery_entry.id
+            apply_persistent_cart_merges_for_phone(session, delivery_entry.phone, lock=False)
+            refresh_stale_uncollected_delivery_entry(session, delivery_entry)
+            claimed, collector_name = claim_delivery_collection_entry(session, delivery_entry, call.from_user)
+            if not claimed:
+                session.commit()
+                if has_role(call.from_user.id, ADMIN_ROLES):
+                    safe_answer_callback_query(call.id)
+                    send_delivery_collection_takeover_offer(call.message.chat.id, delivery_id, page, collector_name)
+                    return
+                safe_answer_callback_query(
+                    call.id,
+                    f"Эту корзину сейчас собирает {collector_name}.",
+                    show_alert=True,
+                )
+                show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
+                return
+
+            items = get_or_create_delivery_collection_items(session, delivery_entry)
+            if not items:
+                release_delivery_collection_entry(session, delivery_entry, call.from_user)
+                session.commit()
+                safe_answer_callback_query(call.id)
+                show_delivery_collection_list(call.message.chat.id, call.message.message_id, page)
+                safe_send_message(bot, call.message.chat.id, "У клиента нет обработанных товаров в корзине.", logger=logger)
+                return
+
+            actual_total_sum = sum(max(int(item.amount or 0), 0) for item in items)
+            if delivery_entry.total_sum != actual_total_sum:
+                logger.warning(
+                    "Delivery opened with stale total_sum delivery_id=%s phone=%s old_total=%s actual_total=%s",
+                    delivery_entry.id,
+                    delivery_entry.phone,
+                    delivery_entry.total_sum,
+                    actual_total_sum,
+                )
+                delivery_entry.total_sum = actual_total_sum
+            header = (
+                f"🧺 Сборка доставки\n"
+                f"Клиент: {delivery_entry.name}\n"
+                f"Телефон: {delivery_entry.phone}\n"
+                f"Сумма: {actual_total_sum} ₽\n"
+                f"Адрес: {delivery_entry.address or 'адрес не указан'}\n"
+                f"Собирает: {collector_name}\n"
+                f"Срез доставки: {format_datetime(get_delivery_cutoff_at(delivery_entry))}"
+            )
+            report_context = build_delivery_collection_report_context(session, delivery_entry)
+            report_items = build_delivery_collection_report_items_from_collection_items(items)
+            session.commit()
+    except Exception as exc:
+        if not is_transient_database_error(exc):
+            raise
+        logger.warning("Delivery collection open locked delivery_id=%s: %s", delivery_id, exc)
+        safe_answer_callback_query(
+            call.id,
+            "Корзина сейчас занята. Нажмите на клиента ещё раз.",
+            show_alert=True,
+        )
+        return
 
     safe_answer_callback_query(call.id)
     collector_sheet_ok, _delivery_entry = add_delivery_collector_name_to_sheet(delivery_id)
@@ -10894,17 +11502,103 @@ def serialize_delivery_collection_item_notice(item):
     }
 
 
-def build_delivery_collection_client_notice(delivery_entry, placed_items, unplaced_items):
+def build_merged_delivery_carts_for_notice(session, delivery_entry, placed_items):
+    main_phone = normalize_phone(delivery_entry.phone)
+    owner_merge = find_delivery_cart_merge_by_extra_phone(session, main_phone)
+    if owner_merge:
+        main_phone = normalize_phone(owner_merge.main_phone) or main_phone
+
+    carts = []
+    seen_phones = set()
+
+    def add_cart(phone, name=None):
+        normalized = normalize_phone(phone)
+        if not normalized or normalized in seen_phones:
+            return
+        seen_phones.add(normalized)
+        client = find_client_by_normalized_phone(session, normalized)
+        carts.append({
+            "phone": normalized,
+            "name": name or (client.name if client else None) or "Имя не указано",
+            "user_ids": get_related_delivery_user_ids_by_phone(session, normalized),
+        })
+
+    main_client = find_client_by_normalized_phone(session, main_phone)
+    add_cart(
+        main_phone,
+        delivery_entry.name if normalize_phone(delivery_entry.phone) == main_phone else (
+            main_client.name if main_client else None
+        ),
+    )
+    for merge_row in list_delivery_cart_merges_for_main(session, main_phone):
+        add_cart(merge_row.extra_phone)
+    for extra_entry in get_delivery_collection_entries(session, delivery_entry):
+        add_cart(extra_entry.phone, extra_entry.name)
+
+    if len(carts) < 2:
+        return []
+
+    variant_to_phone = {}
+    for cart in carts:
+        for variant in phone_variants(cart["phone"]) or [cart["phone"]]:
+            if variant:
+                variant_to_phone[variant] = cart["phone"]
+        variant_to_phone[cart["phone"]] = cart["phone"]
+
+    amounts = {cart["phone"]: 0 for cart in carts}
+    fallback_phone = carts[0]["phone"]
+    for item in placed_items or []:
+        item_phone = normalize_phone(getattr(item, "phone", None))
+        cart_phone = variant_to_phone.get(item_phone) or variant_to_phone.get(getattr(item, "phone", None)) or fallback_phone
+        amounts[cart_phone] = amounts.get(cart_phone, 0) + max(int(getattr(item, "amount", 0) or 0), 0)
+
+    for cart in carts:
+        cart["amount"] = amounts.get(cart["phone"], 0)
+    return carts
+
+
+def build_merged_carts_client_text(merged_carts, recipient_user_id=None):
+    if not merged_carts or len(merged_carts) < 2:
+        return None
+
+    carts = list(merged_carts)
+    if recipient_user_id is not None:
+        recipient_id = int(recipient_user_id)
+        others = [
+            cart for cart in carts
+            if recipient_id not in {int(user_id) for user_id in (cart.get("user_ids") or []) if user_id}
+        ]
+        if others and len(others) < len(carts):
+            carts = others
+
+    lines = ["С вашей корзиной совмещены такие корзины:", ""]
+    for cart in carts:
+        lines.append(
+            f"• {cart.get('name') or 'Имя не указано'} | {cart.get('phone') or 'телефон не указан'} | "
+            f"{max(int(cart.get('amount') or 0), 0)} ₽"
+        )
+    return "\n".join(lines)
+
+
+def build_delivery_collection_client_notice(session, delivery_entry, placed_items, unplaced_items):
+    merged_carts = build_merged_delivery_carts_for_notice(session, delivery_entry, placed_items)
+    user_ids = {
+        int(item.user_id)
+        for item in [*placed_items, *unplaced_items]
+        if item and item.user_id
+    }
+    if delivery_entry.user_id:
+        user_ids.add(int(delivery_entry.user_id))
+    for cart in merged_carts:
+        for user_id in cart.get("user_ids") or []:
+            add_user_id_to_set(user_ids, user_id)
     return {
         "main_user_id": delivery_entry.user_id,
         "phone": delivery_entry.phone,
         "name": delivery_entry.name,
         "placed_sum": delivery_collection_items_amount(placed_items),
-        "user_ids": sorted({
-            int(item.user_id)
-            for item in [*placed_items, *unplaced_items]
-            if item and item.user_id
-        } | ({int(delivery_entry.user_id)} if delivery_entry.user_id else set())),
+        "user_ids": sorted(user_ids),
+        "merged_carts": merged_carts,
         "missing_items": [serialize_delivery_collection_item_notice(item) for item in unplaced_items],
         "report_item_ids": [
             item.id
@@ -10919,9 +11613,12 @@ def send_delivery_client_notice(user_id, text, photo=None):
         return False
     try:
         if photo:
-            send_photo_or_text(bot, user_id, photo, text)
+            sent = send_photo_or_text(bot, user_id, photo, text)
         else:
-            safe_send_message(bot, user_id, text, logger=logger)
+            sent = safe_send_message(bot, user_id, text, logger=logger)
+        if not sent:
+            logger.warning("Delivery client notice returned empty user_id=%s", user_id)
+            return False
         return True
     except Exception as exc:
         logger.warning("Delivery client notice failed user_id=%s: %s", user_id, exc)
@@ -10950,11 +11647,30 @@ def build_found_delivery_item_client_text(item, final_sum):
 
 def notify_client_after_delivery_collection(notice):
     if not notice:
+        logger.warning("Delivery client notice skipped: empty notice")
+        return
+    user_ids = notice.get("user_ids") or []
+    if not user_ids:
+        logger.warning(
+            "Delivery client notice skipped: no user_ids phone=%s",
+            notice.get("phone"),
+        )
         return
     final_sum = max(int(notice.get("placed_sum") or 0), 0)
+    missing_count = len(notice.get("missing_items") or [])
+    logger.info(
+        "Delivery client notices start user_ids=%s placed_sum=%s missing=%s",
+        user_ids,
+        final_sum,
+        missing_count,
+    )
     final_text = f"Сборка вашей доставки завершена.\nОкончательная сумма корзины: {final_sum} ₽"
-    for user_id in notice.get("user_ids") or []:
+    merged_carts = notice.get("merged_carts") or []
+    for user_id in user_ids:
         send_delivery_client_notice(user_id, final_text)
+        merged_text = build_merged_carts_client_text(merged_carts, recipient_user_id=user_id)
+        if merged_text:
+            send_delivery_client_notice(user_id, merged_text)
         time.sleep(0.2)
 
     main_user_id = notice.get("main_user_id")
@@ -11022,17 +11738,112 @@ def mark_temp_fulfilled_in_delivery_for_items(session, reservation, placed_items
     return True
 
 
+def find_live_delivery_entry_for_finish(session, delivery_id, collector_user_id=None):
+    delivery_entry = session.query(ForDelivery).filter(
+        ForDelivery.id == delivery_id,
+    ).with_for_update().first()
+    if delivery_entry:
+        return resolve_delivery_collection_root_entry(session, delivery_entry, lock=True)
+
+    item = session.query(DeliveryCollectionItem).filter(
+        DeliveryCollectionItem.delivery_id == delivery_id,
+    ).order_by(DeliveryCollectionItem.id.asc()).first()
+
+    live_entries = []
+    if collector_user_id:
+        live_entries = session.query(ForDelivery).filter(
+            ForDelivery.collector_user_id == collector_user_id,
+        ).with_for_update().all()
+
+    if item and item.phone:
+        phone_set = set(phone_variants(item.phone) or [])
+        phone_matches = [
+            entry for entry in live_entries
+            if normalize_phone(entry.phone) in phone_set or entry.phone in phone_set
+        ]
+        if phone_matches:
+            live_entries = phone_matches
+        elif not live_entries:
+            by_phone = find_for_delivery_entry_by_phone(session, item.phone, lock=True)
+            if by_phone:
+                live_entries = [by_phone]
+
+    if not live_entries:
+        return None
+    return resolve_delivery_collection_root_entry(session, live_entries[0], lock=True)
+
+
+def delivery_collection_already_finished(session, delivery_id):
+    items = session.query(DeliveryCollectionItem).filter(
+        DeliveryCollectionItem.delivery_id == delivery_id,
+    ).all()
+    if not items:
+        return False
+    if session.query(ForDelivery.id).filter(ForDelivery.id == delivery_id).first():
+        return False
+
+    placed_reservation_ids = [item.reservation_id for item in items if item.placed_at]
+    if placed_reservation_ids:
+        in_delivery_exists = session.query(InDelivery.id).filter(
+            InDelivery.reservation_id.in_(placed_reservation_ids),
+        ).first() is not None
+        if in_delivery_exists:
+            return True
+
+    missing_exists = session.query(MissingDeliveryItem.id).filter(
+        MissingDeliveryItem.delivery_id == delivery_id,
+    ).first() is not None
+    return missing_exists
+
+
+def build_client_notice_from_finished_collection(session, delivery_id):
+    items = session.query(DeliveryCollectionItem).filter(
+        DeliveryCollectionItem.delivery_id == delivery_id,
+    ).order_by(DeliveryCollectionItem.id.asc()).all()
+    if not items:
+        return None
+    first = items[0]
+    delivery_entry = SimpleNamespace(
+        id=delivery_id,
+        user_id=first.user_id,
+        phone=first.phone,
+        name=first.user_name,
+        merged_into_delivery_id=None,
+    )
+    return build_delivery_collection_client_notice(
+        session,
+        delivery_entry,
+        [item for item in items if item.placed_at],
+        [item for item in items if not item.placed_at],
+    )
+
+
+def notify_after_delivery_collection_finish(client_notice):
+    if not client_notice:
+        logger.info("Delivery client notices skipped: empty notice payload")
+        return
+    try:
+        notify_client_after_delivery_collection(client_notice)
+    except Exception:
+        logger.exception("Delivery client notices failed after collection")
+    try:
+        refresh_delivery_collection_report_after_finish(client_notice.get("report_item_ids"))
+    except Exception:
+        logger.exception("Delivery collection report refresh failed after collection")
+
+
 def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplaced_to_missing=False):
     affected_missing_post_ids = set()
     client_notice = None
     with Session(bind=engine, expire_on_commit=False) as session:
-        delivery_entry = session.query(ForDelivery).filter(
-            ForDelivery.id == delivery_id,
-        ).with_for_update().first()
+        delivery_entry = find_live_delivery_entry_for_finish(session, delivery_id, collector_user_id)
         if not delivery_entry:
-            return False, "Клиент уже обработан или удалён из списка.", 0, 0
+            already_finished = delivery_collection_already_finished(session, delivery_id)
+            if already_finished:
+                notice = build_client_notice_from_finished_collection(session, delivery_id)
+                return True, "Сборка уже завершена.", 0, 0, notice
+            return False, "Клиент уже обработан или удалён из списка.", 0, 0, None
 
-        delivery_entry = get_delivery_root_entry(session, delivery_entry, lock=True) or delivery_entry
         delivery_id = delivery_entry.id
         if (
             collector_user_id
@@ -11040,16 +11851,16 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
             and int(delivery_entry.collector_user_id) != int(collector_user_id)
         ):
             collector_name = delivery_entry.collector_name or f"ID {delivery_entry.collector_user_id}"
-            return False, f"Эту корзину сейчас собирает {collector_name}.", 0, 0
+            return False, f"Эту корзину сейчас собирает {collector_name}.", 0, 0, None
 
         items = get_or_create_delivery_collection_items(session, delivery_entry)
         placed_items = [item for item in items if item.placed_at]
         unplaced_items = [item for item in items if not item.placed_at]
         if unplaced_items and not move_unplaced_to_missing:
-            return False, build_unplaced_delivery_items_text(unplaced_items), len(placed_items), len(unplaced_items)
+            return False, build_unplaced_delivery_items_text(unplaced_items), len(placed_items), len(unplaced_items), None
 
         if not placed_items and not unplaced_items:
-            return False, "У клиента нет товаров для завершения сборки.", 0, 0
+            return False, "У клиента нет товаров для завершения сборки.", 0, 0, None
 
         reservation_ids = {item.reservation_id for item in items}
         reservations_by_id = {
@@ -11127,7 +11938,12 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
                 sheet_error=delivery_entry.collector_sheet_error or "Ожидает повторной записи Google Sheets",
             )
 
-        client_notice = build_delivery_collection_client_notice(delivery_entry, placed_items, unplaced_items)
+        client_notice = build_delivery_collection_client_notice(
+            session,
+            delivery_entry,
+            placed_items,
+            unplaced_items,
+        )
 
         for extra_entry in get_delivery_collection_entries(session, delivery_entry, lock=True):
             if extra_entry.id == delivery_entry.id:
@@ -11143,10 +11959,6 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
         session.delete(delivery_entry)
         session.commit()
 
-    if client_notice:
-        refresh_delivery_collection_report_after_finish(client_notice.get("report_item_ids"))
-        notify_client_after_delivery_collection(client_notice)
-
     for post_id in affected_missing_post_ids:
         post = Posts.get_row_by_id(post_id)
         if post and int(post.quantity or 0) <= 0:
@@ -11155,7 +11967,7 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
     message_parts = [f"В доставку перенесено товарных строк: {moved_count}."]
     if missing_count:
         message_parts.append(f"В список пропажи отправлено: {missing_count}.")
-    return True, " ".join(message_parts), moved_count, missing_count
+    return True, " ".join(message_parts), moved_count, missing_count, client_notice
 
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_collected_"))
@@ -11168,7 +11980,7 @@ def mark_delivery_collected(call):
     if delivery_id is None:
         return
     safe_answer_callback_query(call.id)
-    success, message_text, moved_count, missing_count = finish_delivery_collection(
+    success, message_text, moved_count, missing_count, client_notice = finish_delivery_collection(
         delivery_id,
         collector_user_id=call.from_user.id,
         move_unplaced_to_missing=False,
@@ -11188,6 +12000,8 @@ def mark_delivery_collected(call):
         return
 
     safe_send_message(bot, call.message.chat.id, f"{'✅' if success else '❌'} {message_text}", logger=logger)
+    if success:
+        notify_after_delivery_collection_finish(client_notice)
     if success and start_reserved_group_resume_flush_if_delivery_done(call.message.chat.id):
         safe_send_message(
             bot,
@@ -11208,12 +12022,14 @@ def confirm_finish_delivery_with_missing(call):
     if delivery_id is None:
         return
     safe_answer_callback_query(call.id)
-    success, message_text, moved_count, missing_count = finish_delivery_collection(
+    success, message_text, moved_count, missing_count, client_notice = finish_delivery_collection(
         delivery_id,
         collector_user_id=call.from_user.id,
         move_unplaced_to_missing=True,
     )
     safe_send_message(bot, call.message.chat.id, f"{'✅' if success else '❌'} {message_text}", logger=logger)
+    if success:
+        notify_after_delivery_collection_finish(client_notice)
     if success and start_reserved_group_resume_flush_if_delivery_done(call.message.chat.id):
         safe_send_message(
             bot,
@@ -11595,12 +12411,14 @@ def handle_edit_choice(call):
 # Для ревизии
 @bot.message_handler(func=lambda message: message.text == "Ревизия")
 def audit_menu(message):
+    if not require_role(message, REVISION_ROLES):
+        return
     # Создаем клавиатуру
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
 
     # Добавляем кнопки
     btn_do_audit = types.KeyboardButton("Сделать ревизию")
-    btn_send_audit = types.KeyboardButton("В будущих обновлениях...")
+    btn_send_audit = types.KeyboardButton("Ручная Ревизия")
     btn_back = types.KeyboardButton("⬅️ Назад")
 
     # Добавляем кнопки на клавиатуру
@@ -11611,15 +12429,14 @@ def audit_menu(message):
 
 @bot.message_handler(func=lambda message: message.text == "Сделать ревизию")
 def manage_audit_posts(message):
+    if not require_role(message, REVISION_ROLES):
+        return
     with Session(bind=engine) as session:
-        blocked_post_ids = get_revision_blocked_post_ids(session)
-        query = session.query(Posts).filter(
+        # Ревизии подлежит свободный остаток, даже если часть товара уже в корзинах.
+        posts = session.query(Posts).filter(
             Posts.quantity > 0,
             Posts.created_at != None,
-        )
-        if blocked_post_ids:
-            query = query.filter(~Posts.id.in_(blocked_post_ids))
-        posts = query.all()
+        ).all()
 
     if not posts:
         safe_send_message(bot, message.chat.id, "Нет свободных постов для ревизии.", logger=logger)
@@ -11693,19 +12510,12 @@ def apply_auto_audit_for_date(selected_date, audit_user_id):
             *date_filter,
             Posts.quantity <= 0,
         ).count()
-        if blocked_post_ids:
-            summary["blocked_count"] = session.query(Posts.id).filter(
-                *date_filter,
-                Posts.id.in_(blocked_post_ids),
-            ).count()
-
-        selected_query = session.query(Posts).filter(
+        selected_posts = session.query(Posts).filter(
             *date_filter,
             Posts.quantity > 0,
-        )
+        ).order_by(Posts.id).all()
         if blocked_post_ids:
-            selected_query = selected_query.filter(~Posts.id.in_(blocked_post_ids))
-        selected_posts = selected_query.order_by(Posts.id).all()
+            summary["blocked_count"] = sum(1 for post in selected_posts if post.id in blocked_post_ids)
         channel_cleanup = []
 
         for post in selected_posts:
@@ -11733,14 +12543,15 @@ def apply_auto_audit_for_date(selected_date, audit_user_id):
             post.is_sent = False
             post.message_id = None
             post.created_at = now
-            post.chat_id = audit_user_id
             summary["processed_count"] += 1
             summary["old_total"] += old_price
             summary["new_total"] += new_price
 
         session.commit()
 
-    for snapshot in channel_cleanup:
+    for index, snapshot in enumerate(channel_cleanup):
+        if index:
+            time.sleep(REVISION_CHANNEL_DELETE_DELAY_SECONDS)
         delete_delivered_channel_post_message(
             snapshot,
             source="revision",
@@ -11759,9 +12570,459 @@ def answer_manual_audit_disabled(target):
         clear_user_state(target.chat.id)
 
 
+def format_manual_audit_datetime(value):
+    if not value:
+        return "не указано"
+    try:
+        return value.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(value)
+
+
+def collect_manual_audit_purchases(session, post_id):
+    purchases = []
+    seen_reservation_ids = set()
+    seen_user_keys = set()
+
+    for reservation in session.query(Reservations).filter(
+        Reservations.post_id == post_id,
+    ).order_by(Reservations.created_at.asc(), Reservations.id.asc()).all():
+        client = session.query(Clients).filter(Clients.user_id == reservation.user_id).first()
+        purchases.append({
+            "name": (client.name if client else None) or "Имя не указано",
+            "phone": (client.phone if client else None) or "телефон не указан",
+            "quantity": max(int(reservation.quantity or 0), 1),
+            "bought_at": reservation.fulfilled_at or reservation.created_at,
+            "status": "обработан" if reservation.is_fulfilled else "в корзине",
+        })
+        seen_reservation_ids.add(reservation.id)
+        seen_user_keys.add(("reservation", reservation.id))
+
+    for item in session.query(Temp_Fulfilled).filter(Temp_Fulfilled.post_id == post_id).all():
+        if item.reservation_id and item.reservation_id in seen_reservation_ids:
+            continue
+        key = ("temp", item.id)
+        if key in seen_user_keys:
+            continue
+        seen_user_keys.add(key)
+        client = session.query(Clients).filter(Clients.user_id == item.user_id).first()
+        purchases.append({
+            "name": item.user_name or (client.name if client else None) or "Имя не указано",
+            "phone": (client.phone if client else None) or "телефон не указан",
+            "quantity": max(int(item.quantity or 0), 1),
+            "bought_at": item.created_at,
+            "status": "в доставке" if item.in_delivery else "обработан",
+        })
+
+    for item in session.query(InDelivery).filter(InDelivery.post_id == post_id).all():
+        if item.reservation_id and item.reservation_id in seen_reservation_ids:
+            continue
+        key = ("indelivery", item.id)
+        if key in seen_user_keys:
+            continue
+        seen_user_keys.add(key)
+        client = session.query(Clients).filter(Clients.user_id == item.user_id).first()
+        purchases.append({
+            "name": item.user_name or (client.name if client else None) or "Имя не указано",
+            "phone": (client.phone if client else None) or "телефон не указан",
+            "quantity": max(int(item.quantity or 0), 1),
+            "bought_at": item.data,
+            "status": "в доставке",
+        })
+    return purchases
+
+
+def post_has_manual_audit_purchases(session, post_id):
+    return bool(
+        session.query(Reservations.id).filter(Reservations.post_id == post_id).first()
+        or session.query(Temp_Fulfilled.id).filter(Temp_Fulfilled.post_id == post_id).first()
+        or session.query(InDelivery.id).filter(InDelivery.post_id == post_id).first()
+    )
+
+
+def build_manual_audit_card(session, post_id):
+    post = session.query(Posts).filter(Posts.id == post_id).first()
+    snapshot = session.query(DeletedPostSnapshot).filter(
+        DeletedPostSnapshot.post_id == post_id,
+    ).first()
+    purchases = collect_manual_audit_purchases(session, post_id)
+    in_database = post is not None
+    purchased = bool(purchases) or post_has_manual_audit_purchases(session, post_id)
+    quantity = int(post.quantity or 0) if post else 0
+    description = (post.description if post else None) or (snapshot.description if snapshot else None) or "описание отсутствует"
+    photo = (post.photo if post else None) or (snapshot.photo if snapshot else None)
+    price = post.price if post else (snapshot.price if snapshot else None)
+    shelf = resolve_post_shelf(post) if post else parse_shelf_from_description(snapshot.description if snapshot else None)
+    status = post.audit_status if post else None
+    status_label = {
+        AUDIT_STATUS_FOUND: "найден",
+        AUDIT_STATUS_NOT_FOUND: "не найден",
+    }.get(status) or "нет отметки"
+    lines = [
+        f"Id товара: {post_id}",
+        f"В базе данных: {'да' if in_database else 'нет'}",
+        f"Купили этот товар: {'да' if purchased else 'нет'}",
+        f"Полка: {shelf or 'не указана'}",
+        f"Ревизия: {status_label}",
+        f"Остаток: {quantity}",
+        f"Цена: {price} ₽" if price is not None else "Цена: не указана",
+        f"Описание: {description}",
+    ]
+    if purchased:
+        lines.append("Покупки:")
+        for purchase in purchases[:8]:
+            lines.append(
+                f"• {purchase['name']} | {purchase['phone']} | {purchase['quantity']} шт | "
+                f"{format_manual_audit_datetime(purchase['bought_at'])} | {purchase['status']}"
+            )
+        extra_count = len(purchases) - 8
+        if extra_count > 0:
+            lines.append(f"...и ещё {extra_count}")
+    elif not in_database and not snapshot:
+        lines.append("Карточка товара не найдена.")
+    return {
+        "post": post,
+        "photo": photo,
+        "purchased": purchased,
+        "in_database": in_database,
+        "shelf": shelf,
+        "text": "\n".join(lines),
+    }
+
+
+def build_manual_audit_keyboard(post_id, purchased, in_database):
+    keyboard = InlineKeyboardMarkup()
+    if purchased:
+        keyboard.add(InlineKeyboardButton(
+            "Оставить в корзину клиента",
+            callback_data=f"manual_audit_keep_cart_{post_id}",
+        ))
+    elif in_database:
+        keyboard.add(InlineKeyboardButton(
+            "Оставить на канале",
+            callback_data=f"manual_audit_keep_ch_{post_id}",
+        ))
+    keyboard.add(InlineKeyboardButton(
+        "Удалить",
+        callback_data=f"manual_audit_delete_{post_id}",
+    ))
+    keyboard.add(InlineKeyboardButton("Назад", callback_data="manual_audit_back_id"))
+    return keyboard
+
+
+def show_manual_audit_post(chat_id, post_id):
+    shelf_notice = None
+    missing_shelf = False
+    with Session(bind=engine) as session:
+        post = session.query(Posts).filter(Posts.id == post_id).first()
+        if post:
+            shelf = resolve_post_shelf(post)
+            if shelf:
+                if not post.shelf:
+                    post.shelf = shelf
+                _, marked_posts = mark_shelf_not_found(session, shelf)
+                stopped_count = sum(
+                    1 for item in marked_posts if item.audit_status == AUDIT_STATUS_NOT_FOUND
+                )
+                shelf_notice = (shelf, stopped_count)
+            else:
+                missing_shelf = True
+        session.commit()
+        card = build_manual_audit_card(session, post_id)
+    keyboard = build_manual_audit_keyboard(post_id, card["purchased"], card["in_database"])
+    text = card["text"]
+    if shelf_notice:
+        text = (
+            f"Полка {shelf_notice[0]}: остановил {shelf_notice[1]} товар(ов), они не уйдут в канал.\n\n"
+            + text
+        )
+    elif missing_shelf:
+        text = "Полка в описании не найдена. Массово полку не отмечал.\n\n" + text
+    if card["photo"]:
+        sent = send_photo_or_text(bot, chat_id, card["photo"], text, reply_markup=keyboard)
+        if sent:
+            return True
+    safe_send_message(bot, chat_id, text, logger=logger, reply_markup=keyboard)
+    return True
+
+
+def keep_post_on_channel_for_manual_audit(post):
+    now = Posts.next_created_at()
+    snapshot = None
+    if post.message_id:
+        snapshot = SimpleNamespace(
+            id=post.id,
+            message_id=post.message_id,
+            photo=post.photo,
+            price=post.price,
+            description=post.description,
+            quantity=post.quantity,
+        )
+    post.is_sent = False
+    post.message_id = None
+    post.created_at = now
+    return snapshot
+
+
+def purge_post_id_for_reuse(session, post_id):
+    post_id = int(post_id)
+    post = session.query(Posts).filter(Posts.id == post_id).first()
+    photo_path = post.photo if post else None
+    channel_snapshot = None
+    if post and post.message_id:
+        channel_snapshot = SimpleNamespace(
+            id=post.id,
+            message_id=post.message_id,
+            photo=post.photo,
+            price=post.price,
+            description=post.description,
+            quantity=post.quantity,
+        )
+    session.query(DeliveryCollectionItem).filter(DeliveryCollectionItem.post_id == post_id).delete(synchronize_session=False)
+    session.query(MissingDeliveryItem).filter(MissingDeliveryItem.post_id == post_id).delete(synchronize_session=False)
+    session.query(InDelivery).filter(InDelivery.post_id == post_id).delete(synchronize_session=False)
+    session.query(Temp_Fulfilled).filter(Temp_Fulfilled.post_id == post_id).delete(synchronize_session=False)
+    session.query(TempReservations).filter(TempReservations.post_id == post_id).delete(synchronize_session=False)
+    session.query(Reservations).filter(Reservations.post_id == post_id).delete(synchronize_session=False)
+    session.query(RevisionLog).filter(RevisionLog.post_id == post_id).delete(synchronize_session=False)
+    session.query(DeletedPostSnapshot).filter(DeletedPostSnapshot.post_id == post_id).delete(synchronize_session=False)
+    session.query(PostIdReservation).filter(PostIdReservation.post_id == post_id).delete(synchronize_session=False)
+    session.query(ReservationStatEvent).filter(ReservationStatEvent.post_id == post_id).delete(synchronize_session=False)
+    if post:
+        session.delete(post)
+    return photo_path, channel_snapshot
+
+
+def manual_audit_id_prompt_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("Назад", callback_data="manual_audit_back_menu"))
+    return keyboard
+
+
+def ask_manual_audit_post_id(chat_id):
+    set_user_state(chat_id, "WAITING_FOR_MANUAL_AUDIT_ID")
+    safe_send_message(
+        bot,
+        chat_id,
+        "Введите Id товара.",
+        logger=logger,
+        reply_markup=manual_audit_id_prompt_keyboard(),
+    )
+
+
+def send_manual_audit_home(user_id):
+    clear_user_state(user_id)
+    markup, text = get_main_menu_for_user(user_id)
+    safe_send_message(bot, user_id, text, reply_markup=markup, logger=logger)
+
+
+@bot.message_handler(func=lambda message: message.text == "Ручная Ревизия")
+def start_manual_audit(message):
+    if not require_role(message, REVISION_ROLES):
+        return
+    ask_manual_audit_post_id(message.chat.id)
+
+
+@bot.message_handler(func=lambda message: user_state_in(message.chat.id, {"WAITING_FOR_MANUAL_AUDIT_ID"}))
+def handle_manual_audit_id(message):
+    if not require_role(message, REVISION_ROLES):
+        clear_user_state(message.chat.id)
+        return
+    text = require_text_message(message, "Введите Id товара числом.")
+    if text is None:
+        return
+    post_id_text = str(text or "").strip()
+    if post_id_text in {"Назад", "⬅️ Назад"}:
+        send_manual_audit_home(message.chat.id)
+        return
+    if not post_id_text.isdigit():
+        safe_send_message(
+            bot,
+            message.chat.id,
+            "Введите Id товара числом.",
+            logger=logger,
+            reply_markup=manual_audit_id_prompt_keyboard(),
+        )
+        return
+    show_manual_audit_post(message.chat.id, int(post_id_text))
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "manual_audit_keep_ch_"))
+def keep_manual_audit_on_channel(call):
+    if not has_role(call.from_user.id, REVISION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    post_id = parse_callback_int_suffix(call, "manual_audit_keep_ch_", "Некорректный Id товара.")
+    if post_id is None:
+        return
+    safe_answer_callback_query(call.id)
+    channel_snapshot = None
+    with Session(bind=engine) as session:
+        post = session.query(Posts).filter(Posts.id == post_id).first()
+        if not post:
+            safe_send_message(bot, call.from_user.id, f"Товар #{post_id} не найден в базе.", logger=logger)
+            return
+        if post_has_manual_audit_purchases(session, post_id):
+            safe_send_message(bot, call.from_user.id, "Этот товар уже купили. Его нельзя отправить в канал этой кнопкой.", logger=logger)
+            return
+        post.audit_status = AUDIT_STATUS_FOUND
+        channel_snapshot = keep_post_on_channel_for_manual_audit(post)
+        session.commit()
+    if channel_snapshot:
+        delete_delivered_channel_post_message(
+            channel_snapshot,
+            source="manual_audit",
+            disable_reason="Товар на ревизии",
+        )
+    safe_send_message(
+        bot,
+        call.from_user.id,
+        f"Товар #{post_id} снят с канала, отмечен как найден и поставлен в очередь на оптовую отправку сегодняшней датой.",
+        logger=logger,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "manual_audit_keep_cart_"))
+def keep_manual_audit_in_cart(call):
+    if not has_role(call.from_user.id, REVISION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    post_id = parse_callback_int_suffix(call, "manual_audit_keep_cart_", "Некорректный Id товара.")
+    if post_id is None:
+        return
+    safe_answer_callback_query(call.id)
+    with Session(bind=engine) as session:
+        post = session.query(Posts).filter(Posts.id == post_id).first()
+        if post:
+            post.audit_status = AUDIT_STATUS_FOUND
+            session.commit()
+    safe_send_message(
+        bot,
+        call.from_user.id,
+        f"Товар #{post_id} оставлен в корзине клиента и отмечен как найден.",
+        logger=logger,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "manual_audit_delete_"))
+def delete_manual_audit_post(call):
+    if not has_role(call.from_user.id, REVISION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    post_id = parse_callback_int_suffix(call, "manual_audit_delete_", "Некорректный Id товара.")
+    if post_id is None:
+        return
+    safe_answer_callback_query(call.id)
+    photo_path = None
+    channel_snapshot = None
+    with Session(bind=engine) as session:
+        photo_path, channel_snapshot = purge_post_id_for_reuse(session, post_id)
+        session.commit()
+    if channel_snapshot:
+        delete_delivered_channel_post_message(
+            channel_snapshot,
+            source="manual_audit_delete",
+            disable_reason="Товар удалён на ревизии",
+        )
+    if photo_path:
+        try:
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+        except Exception as exc:
+            logger.warning("Manual audit photo delete failed post_id=%s: %s", post_id, exc)
+    safe_send_message(
+        bot,
+        call.from_user.id,
+        f"Товар #{post_id} полностью удалён. Этот Id свободен для новых постов.",
+        logger=logger,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("manual_audit_back_id", "manual_audit_back_menu"))
+def handle_manual_audit_back(call):
+    if not has_role(call.from_user.id, REVISION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    safe_answer_callback_query(call.id)
+    chat_id = callback_message_chat_id(call) or call.from_user.id
+    if call.data == "manual_audit_back_id":
+        ask_manual_audit_post_id(chat_id)
+        return
+    send_manual_audit_home(chat_id)
+
+
+def run_doom_purge():
+    photo_paths = []
+    channel_snapshots = []
+    with Session(bind=engine) as session:
+        post_ids = [
+            row[0]
+            for row in session.query(Posts.id).filter(Posts.audit_status == AUDIT_STATUS_NOT_FOUND).all()
+        ]
+        for post_id in post_ids:
+            photo_path, snapshot = purge_post_id_for_reuse(session, post_id)
+            if photo_path:
+                photo_paths.append(photo_path)
+            if snapshot:
+                channel_snapshots.append(snapshot)
+        session.commit()
+    for index, snapshot in enumerate(channel_snapshots):
+        if index:
+            time.sleep(REVISION_CHANNEL_DELETE_DELAY_SECONDS)
+        delete_delivered_channel_post_message(
+            snapshot,
+            source="doom",
+            disable_reason="DOOM: не найден",
+        )
+    for photo_path in photo_paths:
+        try:
+            if os.path.exists(photo_path):
+                os.remove(photo_path)
+        except Exception as exc:
+            logger.warning("DOOM photo delete failed: %s", exc)
+    return len(post_ids)
+
+
+@bot.message_handler(func=lambda message: message.text == "DOOM")
+def start_doom(message):
+    if not is_creator(message.from_user.id):
+        safe_send_message(bot, message.chat.id, "У вас нет прав для этой функции.", logger=logger)
+        return
+    set_user_state(message.chat.id, "WAITING_FOR_DOOM_PASSWORD")
+    safe_send_message(bot, message.chat.id, "Введите пароль.", logger=logger)
+
+
+@bot.message_handler(func=lambda message: user_state_in(message.chat.id, {"WAITING_FOR_DOOM_PASSWORD"}))
+def handle_doom_password(message):
+    if not is_creator(message.from_user.id):
+        clear_user_state(message.chat.id)
+        safe_send_message(bot, message.chat.id, "У вас нет прав для этой функции.", logger=logger)
+        return
+    text = require_text_message(message, "Введите пароль текстом.")
+    if text is None:
+        return
+    if str(text).strip() in {"Назад", "⬅️ Назад"}:
+        send_manual_audit_home(message.chat.id)
+        return
+    if not doom_password_matches(text):
+        safe_send_message(bot, message.chat.id, "Неверный пароль.", logger=logger)
+        return
+    clear_user_state(message.chat.id)
+    deleted_count = run_doom_purge()
+    markup = supreme_leader_main_menu(message.from_user.id)
+    if deleted_count:
+        result_text = f"DOOM: удалил {deleted_count} ненайденных товаров. Их Id свободны."
+    else:
+        result_text = "DOOM: ненайденных товаров нет."
+    safe_send_message(bot, message.chat.id, result_text, reply_markup=markup, logger=logger)
+
+
 @bot.message_handler(
     func=lambda message: message.text in temp_user_data.get(message.chat.id, {}).get("unique_dates", []))
 def show_posts_by_date(message):
+    if not require_role(message, REVISION_ROLES):
+        temp_user_data.pop(message.chat.id, None)
+        return
     selected_date_text = message.text
     audit_data = temp_user_data.get(message.chat.id, {})
     selected_date_iso = audit_data.get("audit_date_map", {}).get(selected_date_text)
@@ -11771,6 +13032,12 @@ def show_posts_by_date(message):
         return
 
     selected_date = datetime.fromisoformat(selected_date_iso).date()
+    safe_send_message(
+        bot,
+        message.chat.id,
+        "Запускаю ревизию. Снимаю товары с канала, это может занять несколько минут. Не открывайте «📄 Посты» до завершения.",
+        logger=logger,
+    )
     summary = apply_auto_audit_for_date(selected_date, message.chat.id)
 
     if (
@@ -11792,7 +13059,7 @@ def show_posts_by_date(message):
             "✅ Автоматическая ревизия завершена.\n"
             f"Дата: {selected_date.strftime('%d.%m.%Y')}\n"
             f"Обработано постов: {summary['processed_count']}\n"
-            f"Исключено из-за корзины/доставки/очереди: {summary['blocked_count']}\n"
+            f"Из них с бронями (уценён только свободный остаток): {summary['blocked_count']}\n"
             f"Пропущено без остатка: {summary['no_stock_count']}\n"
             f"Старая сумма: {summary['old_total']} ₽\n"
             f"Новая сумма: {summary['new_total']} ₽\n\n"
@@ -11805,6 +13072,8 @@ def show_posts_by_date(message):
 @bot.message_handler(func=lambda message: message.text == "Отменить ревизию")
 def cancel_audit(message):
     global active_audit
+    if not require_role(message, REVISION_ROLES):
+        return
 
     # Проверяем, активна ли ревизия
     if not active_audit.get(message.chat.id):
@@ -11842,6 +13111,15 @@ def disabled_manual_audit_message(message):
 def defect(message):
     user_id = message.chat.id
     if ignore_silent_blocked_message(message):
+        return
+    if get_client_role(user_id) not in POST_EDITOR_ROLES:
+        safe_send_message(
+            bot,
+            user_id,
+            "По вопросам брака напишите в чат поддержки.",
+            reply_markup=client_main_menu(),
+            logger=logger,
+        )
         return
 
     show_user_defect_items(user_id, page=0)
@@ -12245,11 +13523,15 @@ def handle_discount_amount(message):
             clear_user_state(admin_id)
             return
 
-        # Уведомляем клиента о скидке
+        # Предложенная сумма хранится в записи товара (skidka_price при skidka=False),
+        # чтобы не перезаписывать текущее состояние клиента (например, ввод адреса доставки).
+        item.skidka_price = discount_amount
+        session.commit()
+
         markup = InlineKeyboardMarkup()
         markup.add(
-            InlineKeyboardButton("Да", callback_data=f"confirm_discount_{item_id}"),
-            InlineKeyboardButton("Отказаться", callback_data=f"return_discount_{item_id}")
+            InlineKeyboardButton("Да", callback_data=f"confirm_discount_{item_id}_{admin_id}"),
+            InlineKeyboardButton("Отказаться", callback_data=f"return_discount_{item_id}_{admin_id}")
         )
 
         discount_message = safe_send_message(
@@ -12263,6 +13545,8 @@ def handle_discount_amount(message):
             logger=logger,
         )
         if not discount_message:
+            item.skidka_price = 0
+            session.commit()
             safe_send_message(
                 bot,
                 admin_id,
@@ -12270,14 +13554,7 @@ def handle_discount_amount(message):
                 logger=logger,
             )
             clear_user_state(admin_id)
-            clear_user_state(client.user_id)
             return
-
-        # Сохраняем состояние для клиента только после успешной отправки сообщения с кнопками.
-        set_user_state(
-            client.user_id,
-            {"action": "confirm_discount", "item_id": item_id, "discount_amount": discount_amount, "admin_id": admin_id}
-        )
 
     # Подтверждаем администратору
     safe_send_message(
@@ -12293,37 +13570,31 @@ def handle_discount_amount(message):
 )
 def handle_discount_confirmation(call):
     user_id = call.from_user.id
-    if call.data.startswith("confirm_discount_"):
-        action = "confirm_discount"
-        item_id = parse_callback_int_suffix(call, "confirm_discount_", "Ошибка: некорректные данные.")
-    else:
-        action = "return_discount"
-        item_id = parse_callback_int_suffix(call, "return_discount_", "Ошибка: некорректные данные.")
-    if item_id is None:
+    match = re.match(r"^(confirm_discount|return_discount)_(\d+)(?:_(\d+))?$", str(call.data or ""))
+    if not match:
+        safe_answer_callback_query(call.id, "Ошибка: некорректные данные.", show_alert=True)
         return
-
-    state = get_user_state(user_id)
-    if (
-        not isinstance(state, dict)
-        or state.get("action") != "confirm_discount"
-        or state.get("item_id") != item_id
-    ):
-        safe_answer_callback_query(call.id, "Ошибка! Товар не найден.", show_alert=True)
-        return
-
-    discount_amount = state.get("discount_amount")
-    admin_id = state.get("admin_id")  # Получаем ID администратора
+    action = match.group(1)
+    item_id = int(match.group(2))
+    admin_id = int(match.group(3)) if match.group(3) else None
+    if admin_id and not has_role(admin_id, ADMIN_ROLES):
+        admin_id = None
 
     with Session(bind=engine) as session:
         # Получаем информацию о товаре
         item = session.query(Temp_Fulfilled).filter_by(id=item_id).with_for_update().first()
         if not item:
             safe_answer_callback_query(call.id, "Ошибка! Запись о товаре не найдена.", show_alert=True)
-            clear_user_state(user_id)
             return
         if item.defect or item.skidka:
             safe_answer_callback_query(call.id, "Этот товар уже обработан.", show_alert=True)
-            clear_user_state(user_id)
+            return
+        if item.user_id not in get_related_user_ids_by_full_phone(user_id):
+            safe_answer_callback_query(call.id, "Этот товар не найден в ваших заказах.", show_alert=True)
+            return
+        discount_amount = int(item.skidka_price or 0)
+        if discount_amount <= 0:
+            safe_answer_callback_query(call.id, "Предложение скидки уже недействительно.", show_alert=True)
             return
 
         if action == "confirm_discount":
@@ -12372,8 +13643,6 @@ def handle_discount_confirmation(call):
                     f"💰 Предлагавшаяся скидка: {discount_amount}₽"
                 )
                 safe_send_message(bot, admin_id, admin_message, logger=logger)
-
-    clear_user_state(user_id)
 
 def contact_client(call, user_id):
     with Session(bind=engine) as session:
@@ -12426,6 +13695,7 @@ def run_bot():
     start_reservation_stats_daily_report_worker()
     start_delivery_broadcast_monitor_worker()
     start_payroll_sheet_sync_worker()
+    start_database_backup_worker()
     start_delivery_sheet_retry_worker()
     start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)
     retry_delay = 5

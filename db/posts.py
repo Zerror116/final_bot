@@ -1,10 +1,11 @@
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, text
+from sqlalchemy import String, BIGINT, Boolean, DateTime, Integer, Index, or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import mapped_column, Session
 
@@ -51,12 +52,72 @@ def default_post_created_at():
     return normalize_post_created_at()
 
 
+AUDIT_STATUS_FOUND = "found"
+AUDIT_STATUS_NOT_FOUND = "not_found"
+
+
+def normalize_shelf(value):
+    compact = "".join(str(value or "").split())
+    if not compact or len(compact) > 32:
+        return None
+    if not any(ch.isalpha() for ch in compact):
+        return None
+    if not all(ch.isalpha() or ch in "0123456789" for ch in compact):
+        return None
+    return compact.upper()
+
+
+def parse_shelf_from_description(description):
+    lines = [line.strip() for line in str(description or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    match = re.search(r"(?<![^\W\d_])([^\W\d_])\s*(\d{1,2})\s*$", lines[-1])
+    if not match:
+        return None
+    return normalize_shelf(match.group(1) + match.group(2))
+
+
+def resolve_post_shelf(post):
+    return normalize_shelf(getattr(post, "shelf", None)) or parse_shelf_from_description(
+        getattr(post, "description", None)
+    )
+
+
+def list_posts_on_shelf(session, shelf):
+    shelf = normalize_shelf(shelf)
+    if not shelf:
+        return []
+    matched = session.query(Posts).filter(Posts.shelf == shelf).all()
+    seen = {post.id for post in matched}
+    unshelved = session.query(Posts).filter(or_(Posts.shelf.is_(None), Posts.shelf == "")).all()
+    for post in unshelved:
+        if post.id in seen:
+            continue
+        parsed = parse_shelf_from_description(post.description)
+        if parsed != shelf:
+            continue
+        post.shelf = shelf
+        matched.append(post)
+        seen.add(post.id)
+    return matched
+
+
+def mark_shelf_not_found(session, shelf):
+    posts = list_posts_on_shelf(session, shelf)
+    for post in posts:
+        if post.audit_status != AUDIT_STATUS_FOUND:
+            post.audit_status = AUDIT_STATUS_NOT_FOUND
+    return shelf, posts
+
+
 class Posts(AbstractModel):
     __tablename__ = "posts"
     __table_args__ = (
         Index("ix_posts_chat_id", "chat_id"),
         Index("ix_posts_is_sent", "is_sent"),
         Index("ix_posts_message_id", "message_id"),
+        Index("ix_posts_shelf", "shelf"),
+        Index("ix_posts_audit_status", "audit_status"),
     )
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -66,6 +127,8 @@ class Posts(AbstractModel):
     description = mapped_column(String, nullable=False)
     message_id = mapped_column(BIGINT, nullable=True)
     quantity = mapped_column(Integer, nullable=False)
+    shelf = mapped_column(String(32), nullable=True)
+    audit_status = mapped_column(String(16), nullable=True)
     is_sent = mapped_column(Boolean, nullable=False, default=0)
     created_at = mapped_column(DateTime, nullable=False, default=default_post_created_at)
 
@@ -181,7 +244,7 @@ class Posts(AbstractModel):
 
     @staticmethod
     def insert(chat_id: int, photo: str, price: str, description: str, quantity: int,
-               created_at: datetime = None, post_id: int = None):
+               created_at: datetime = None, post_id: int = None, shelf: str = None):
         if post_id is None:
             post_id = Posts.reserve_next_id(chat_id=chat_id)
         else:
@@ -198,6 +261,7 @@ class Posts(AbstractModel):
             if Posts.post_id_has_any_links(session, post_id):
                 raise ValueError(f"ID {post_id} уже используется в истории товара.")
 
+            normalized_shelf = normalize_shelf(shelf)
             posts = Posts(
                 id=post_id,
                 chat_id=chat_id,
@@ -205,6 +269,8 @@ class Posts(AbstractModel):
                 price=price,
                 description=description,
                 quantity=quantity,
+                shelf=normalized_shelf,
+                audit_status=AUDIT_STATUS_FOUND if normalized_shelf else None,
                 created_at=normalize_post_created_at(created_at),
             )
             session.add(posts)
@@ -278,6 +344,7 @@ class Posts(AbstractModel):
                 Posts.is_sent == False,
                 Posts.message_id == None,
                 Posts.quantity > 0,
+                or_(Posts.audit_status.is_(None), Posts.audit_status != AUDIT_STATUS_NOT_FOUND),
             ).order_by(Posts.id).all()
 
     @staticmethod
@@ -339,6 +406,7 @@ class Posts(AbstractModel):
                     Posts.is_sent == False,
                     Posts.message_id == None,
                     Posts.quantity > 0,
+                    or_(Posts.audit_status.is_(None), Posts.audit_status != AUDIT_STATUS_NOT_FOUND),
                 ).all()
 
     @staticmethod
@@ -358,7 +426,8 @@ class Posts(AbstractModel):
                 photo=kwargs.get("photo", original_post.photo),
                 price=kwargs.get("price", original_post.price),
                 description=kwargs.get("description", original_post.description),
-                quantity=kwargs.get("quantity", original_post.quantity)
+                quantity=kwargs.get("quantity", original_post.quantity),
+                shelf=kwargs.get("shelf", original_post.shelf),
             )
 
             if not new_post_id:

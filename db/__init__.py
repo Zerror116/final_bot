@@ -67,6 +67,10 @@ def run_schema_migrations():
         ensure_delivery_collection_report_message_tracking,
     )
     run_migration("027_delivery_cart_merges", ensure_delivery_cart_merges)
+    run_migration("028_posts_shelf", ensure_posts_shelf)
+    run_migration("029_posts_audit_status", ensure_posts_audit_status)
+    run_migration("030_posts_shelf_width", ensure_posts_shelf_width)
+    run_migration("031_delivery_broadcast_summary_parts", ensure_delivery_broadcast_summary_parts)
 
 
 def ensure_schema_migrations():
@@ -391,6 +395,11 @@ def ensure_delivery_broadcast_campaigns():
         ))
 
 
+def ensure_delivery_broadcast_summary_parts():
+    AbstractModel.metadata.create_all(engine)
+    add_column_if_missing("delivery_broadcast_campaigns", "summary_message_ids", "TEXT")
+
+
 def ensure_delivery_broadcast_summary_tracking():
     timestamp_type = (
         "TIMESTAMP WITHOUT TIME ZONE"
@@ -588,6 +597,52 @@ def backfill_completed_delivery_collection_item_collector_sheet_tracking():
             "AND fd.collector_sheet_added_at IS NOT NULL"
             ")"
         ))
+
+
+def ensure_posts_shelf():
+    AbstractModel.metadata.create_all(engine)
+    add_column_if_missing("posts", "shelf", "VARCHAR(8)")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_posts_shelf ON posts (shelf)"
+        ))
+
+
+def ensure_posts_audit_status():
+    from sqlalchemy import or_
+    from .posts import parse_shelf_from_description
+
+    AbstractModel.metadata.create_all(engine)
+    add_column_if_missing("posts", "audit_status", "VARCHAR(16)")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_posts_audit_status ON posts (audit_status)"
+        ))
+    with Session(bind=engine) as session:
+        unshelved = session.query(Posts).filter(or_(Posts.shelf.is_(None), Posts.shelf == "")).all()
+        changed = False
+        for post in unshelved:
+            shelf = parse_shelf_from_description(post.description)
+            if not shelf:
+                continue
+            post.shelf = shelf
+            changed = True
+        if changed:
+            session.commit()
+
+
+def ensure_posts_shelf_width():
+    AbstractModel.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "posts" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("posts")}
+    if "shelf" not in columns:
+        add_column_if_missing("posts", "shelf", "VARCHAR(32)")
+        return
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE posts ALTER COLUMN shelf TYPE VARCHAR(32)"))
 
 
 def ensure_delivery_cart_merges():
