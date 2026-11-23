@@ -11,6 +11,7 @@
 #   4. Кладёт новый код поверх /opt/final_bot (ключи, venv и настройки не трогает).
 #   5. Обновляет зависимости Python и перезапускает бота.
 #   6. Если бот не поднялся — сам откатывает код и перезапускает старую версию.
+#   7. Хранит только 5 последних бэкапов кода и базы перед обновлением.
 set -euo pipefail
 
 REPO="${REPO:-Zerror116/final_bot}"
@@ -21,6 +22,8 @@ ENVF="${ENVF:-/etc/final_bot.env}"
 PGC="${PGC:-final_bot_db}"
 BK="${BK:-/opt/final_bot_backups}"
 WAIT_SECONDS="${WAIT_SECONDS:-25}"
+KEEP_BACKUPS="${KEEP_BACKUPS:-5}"          # сколько последних бэкапов каждого вида хранить
+MIN_FREE_MB="${MIN_FREE_MB:-500}"          # меньше — обновление не начинаем
 TS="$(date +%Y%m%d_%H%M%S)"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -32,6 +35,11 @@ die()  { printf '\n\033[1;31mОШИБКА: %s\033[0m\n' "$*" >&2; exit 1; }
 PY="$APP/venv/bin/python"
 [ -x "$PY" ] || die "не найден $PY"
 mkdir -p "$BK"
+
+free_mb() { df -Pm "$1" | awk 'NR==2 {print $4}'; }
+FREE_MB="$(free_mb "$BK")"
+echo "   свободно на диске: ${FREE_MB} МБ, бэкапы обновлений занимают: $(du -sh "$BK" 2>/dev/null | cut -f1)"
+[ "${FREE_MB:-0}" -ge "$MIN_FREE_MB" ] || die "на диске меньше ${MIN_FREE_MB} МБ свободного места, освободи место в $BK"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -89,9 +97,13 @@ fi
 
 say "Бэкап текущего кода"
 CODE_BK="$BK/code_before_update_$TS.tgz"
+# Только сам бот: без venv, git, старых бэкапов и дампов (иначе ~80 МБ на каждое обновление).
+APP_NAME="$(basename "$APP")"
 tar -czf "$CODE_BK" -C "$(dirname "$APP")" \
-  --exclude="$(basename "$APP")/venv" --exclude='__pycache__' --exclude='*.pyc' \
-  "$(basename "$APP")"
+  --exclude="$APP_NAME/venv" --exclude="$APP_NAME/.git" \
+  --exclude="$APP_NAME/backups" --exclude="$APP_NAME/deploy_backups" --exclude="$APP_NAME/.deploy_backups" \
+  --exclude='__pycache__' --exclude='*.pyc' --exclude='*.bak_*' --exclude='*.dump' --exclude='*.tgz' \
+  "$APP_NAME"
 echo "   $CODE_BK ($(du -h "$CODE_BK" | cut -f1))"
 
 rollback() {
@@ -142,10 +154,15 @@ for extra in final_bot_statistic_api final_bot_button_control; do
   fi
 done
 
-# старые бэкапы обновлений храним 30 дней
-find "$BK" -maxdepth 1 \( -name 'before_update_*.dump' -o -name 'code_before_update_*.tgz' \) -mtime +30 -delete 2>/dev/null || true
+# храним только KEEP_BACKUPS последних бэкапов каждого вида (ежедневные дампы cron не трогаем)
+for pattern in 'before_update_*.dump' 'code_before_update_*.tgz'; do
+  ls -1t "$BK"/$pattern 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | while read -r old_backup; do
+    rm -f -- "$old_backup"
+  done || true
+done
 
 say "Готово: бот обновлён (коммит ${COMMIT:-неизвестен}) и работает"
 echo "   бэкап базы: ${DB_DUMP:-не делался}"
 echo "   бэкап кода: $CODE_BK"
+echo "   бэкапы обновлений: последние $KEEP_BACKUPS, занимают $(du -sh "$BK" 2>/dev/null | cut -f1), свободно $(free_mb "$BK") МБ"
 echo "   проверить бэкап в Telegram: отправь боту /backup_now"
