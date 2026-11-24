@@ -682,7 +682,7 @@ MENU_BUTTON_TEXTS = {
     "Регистрация", "🗑 Удалить клиента 📞", "🧺 Просмотреть корзину", "❌ Брак", "⬅️ Назад",
     "📤 Отправить рассылку", "👨‍🦯 Засунуть в доставку", "📦 Список пропажи", "Список Клиентов",
     "Объединить корзины", "🗄 Архив доставки", "Сделать ревизию", "Ручная Ревизия",
-    "Отменить ревизию", "📦 Заказы клиентов", "✅ Подтвердить доставку",
+    "Отменить ревизию", "📦 Заказы клиентов", "✅ Подтвердить доставку", "🖨 Распечатать стикер",
 }
 
 
@@ -13331,6 +13331,65 @@ def run_doom_purge():
         except Exception as exc:
             logger.warning("DOOM photo delete failed: %s", exc)
     return len(post_ids)
+
+
+CUSTOM_STICKER_STATE = "WAITING_FOR_CUSTOM_STICKER_TEXT"
+# Агент печати подставляет текст через «Найти и заменить» Word: там не больше 255 символов,
+# «^» — служебный знак (экранируем как «^^»), а «^l» — перенос строки.
+CUSTOM_STICKER_MAX_LEN = 200
+
+
+def word_replace_text(text):
+    lines = [line.strip() for line in str(text).replace("\r", "").split("\n")]
+    return "^l".join(line.replace("^", "^^") for line in lines if line)
+
+
+@bot.message_handler(func=lambda message: message.text == "🖨 Распечатать стикер")
+def start_custom_sticker(message):
+    if not is_creator(message.from_user.id):
+        safe_send_message(bot, message.chat.id, "У вас нет прав для этой функции.", logger=logger)
+        return
+    if not label_print_api_enabled():
+        safe_send_message(bot, message.chat.id, "Печать наклеек не настроена.", logger=logger)
+        return
+    set_user_state(message.chat.id, CUSTOM_STICKER_STATE)
+    safe_send_message(bot, message.chat.id, "Напишите текст для стикера — он распечатается на админском ПК.\n"
+                      "Для отмены нажмите «⬅️ Назад».", logger=logger)
+
+
+@bot.message_handler(func=lambda message: user_state_in(message.chat.id, {CUSTOM_STICKER_STATE}))
+def handle_custom_sticker_text(message):
+    if not is_creator(message.from_user.id):
+        clear_user_state(message.chat.id)
+        safe_send_message(bot, message.chat.id, "У вас нет прав для этой функции.", logger=logger)
+        return
+    text = require_text_message(message, "Отправьте текст для стикера.")
+    if text is None:
+        return
+    printable = word_replace_text(text)
+    if not printable:
+        safe_send_message(bot, message.chat.id, "Текст пустой, напишите что-нибудь.", logger=logger)
+        return
+    if len(printable) > CUSTOM_STICKER_MAX_LEN:
+        safe_send_message(bot, message.chat.id,
+                          f"Слишком длинно для стикера: максимум {CUSTOM_STICKER_MAX_LEN} символов.", logger=logger)
+        return
+    clear_user_state(message.chat.id)
+    with Session(bind=engine) as session:
+        job = LabelPrintJob(
+            delivery_id=None,
+            phone=printable,
+            name="",
+            source="custom",
+            requested_by=message.from_user.id,
+            status=LABEL_PRINT_STATUS_PENDING,
+            created_at=now_local(),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    logger.info("Custom sticker print job queued id=%s", job_id)
+    safe_send_message(bot, message.chat.id, "🖨 Стикер отправлен на печать.", logger=logger)
 
 
 @bot.message_handler(func=lambda message: message.text == "DOOM")

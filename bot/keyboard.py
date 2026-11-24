@@ -25,7 +25,7 @@ def supreme_leader_main_menu(user_id=None):
                         phoenix_broadcast, reservation_stats)
     try:
         if user_id is not None and int(user_id) == int(CREATOR_USER_ID):
-            leader_keyboard.add(KeyboardButton("DOOM"))
+            leader_keyboard.add(KeyboardButton("DOOM"), KeyboardButton("🖨 Распечатать стикер"))
     except (TypeError, ValueError):
         pass
     return leader_keyboard
