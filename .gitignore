@@ -39,3 +39,7 @@ deploy_backups/
 config.
 sage.chat.id,
 ystemctl*
+
+# Агент печати наклеек: файл настроек с токеном и журналы
+tools/label_print_agent/label_print_agent.config.json
+tools/label_print_agent/*.log

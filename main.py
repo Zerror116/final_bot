@@ -1,5 +1,6 @@
 import hmac
 import io
+import json
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import telebot
 import locale
 from urllib.parse import quote
@@ -39,6 +41,7 @@ from db.delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from db.delivery_collection_items import DeliveryCollectionItem
 from db.missing_delivery_items import MissingDeliveryItem
 from db.delivery_cart_merges import DeliveryCartMerge
+from db.label_print_jobs import LabelPrintJob
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -218,6 +221,17 @@ DB_BACKUP_RETRY_MINUTES = 30
 DB_BACKUP_MAX_ATTEMPTS_PER_DAY = 3
 DB_BACKUP_TIMEOUT_SECONDS = env_int("DB_BACKUP_TIMEOUT_SECONDS", 600, minimum=60)
 TELEGRAM_BOT_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024
+# Наклейки на пакеты: бот ставит задание, агент на админском ПК печатает его через Word.
+LABEL_PRINT_API_HOST = (os.environ.get("LABEL_PRINT_API_HOST") or "0.0.0.0").strip()
+LABEL_PRINT_API_PORT = env_int("LABEL_PRINT_API_PORT", 8093, minimum=1)
+LABEL_PRINT_JOB_MAX_AGE_MINUTES = env_int("LABEL_PRINT_JOB_MAX_AGE_MINUTES", 120, minimum=1)
+LABEL_PRINT_TAKEN_TIMEOUT_MINUTES = 5
+LABEL_PRINT_MAX_ATTEMPTS = 3
+LABEL_PRINT_STATUS_PENDING = "pending"
+LABEL_PRINT_STATUS_PRINTING = "printing"
+LABEL_PRINT_STATUS_PRINTED = "printed"
+LABEL_PRINT_STATUS_FAILED = "failed"
+LABEL_PRINT_STATUS_EXPIRED = "expired"
 RESERVATION_DB_RETRY_ATTEMPTS = env_int("RESERVATION_DB_RETRY_ATTEMPTS", 5, minimum=1)
 RESERVATION_DB_RETRY_BASE_SECONDS = env_float("RESERVATION_DB_RETRY_BASE_SECONDS", 0.5, minimum=0)
 RESERVED_GROUP_FLOW_STATE_KEY = 0
@@ -11159,6 +11173,8 @@ def open_delivery_collection_client(call, delivery_id, page):
             )
             report_context = build_delivery_collection_report_context(session, delivery_entry)
             report_items = build_delivery_collection_report_items_from_collection_items(items)
+            label_phone = delivery_entry.phone
+            label_name = delivery_entry.name
             session.commit()
     except Exception as exc:
         if not is_transient_database_error(exc):
@@ -11172,6 +11188,8 @@ def open_delivery_collection_client(call, delivery_id, page):
         return
 
     safe_answer_callback_query(call.id)
+    if label_print_api_enabled():
+        enqueue_label_print_job(delivery_id, label_phone, label_name, call.from_user.id, source="auto")
     collector_sheet_ok, _delivery_entry = add_delivery_collector_name_to_sheet(delivery_id)
     if not collector_sheet_ok:
         logger.warning("Delivery collector name queued for Sheets retry delivery_id=%s", delivery_id)
@@ -11223,9 +11241,205 @@ def open_delivery_collection_client(call, delivery_id, page):
     start_delivery_collection_report_to_group(report_context, report_items)
 
 
+def label_print_api_token():
+    return (os.environ.get("LABEL_PRINT_API_TOKEN") or "").strip()
+
+
+def label_print_api_enabled():
+    return bool(label_print_api_token())
+
+
+def format_label_name(name):
+    """На наклейку идёт только первое слово имени."""
+    parts = str(name or "").split()
+    return parts[0] if parts else ""
+
+
+def enqueue_label_print_job(delivery_id, phone, name, requested_by=None, source="auto"):
+    """Ставит наклейку в очередь. Автоматически — один раз на клиента, вручную — всегда."""
+    phone = normalize_phone(phone) or str(phone or "").strip()
+    name = format_label_name(name)
+    if not phone:
+        logger.warning("Label print job skipped: no phone delivery_id=%s", delivery_id)
+        return None
+    with Session(bind=engine) as session:
+        if source == "auto" and delivery_id:
+            already_queued = session.query(LabelPrintJob.id).filter(
+                LabelPrintJob.delivery_id == delivery_id,
+            ).first()
+            if already_queued:
+                return None
+        job = LabelPrintJob(
+            delivery_id=delivery_id,
+            phone=phone,
+            name=name,
+            source=source,
+            requested_by=requested_by,
+            status=LABEL_PRINT_STATUS_PENDING,
+            created_at=now_local(),
+        )
+        session.add(job)
+        session.commit()
+        logger.info("Label print job queued id=%s delivery_id=%s source=%s", job.id, delivery_id, source)
+        return job.id
+
+
+def find_label_data_for_delivery(delivery_id):
+    with Session(bind=engine) as session:
+        entry = session.query(ForDelivery).filter(ForDelivery.id == delivery_id).first()
+        if entry:
+            root = get_delivery_root_entry(session, entry) or entry
+            return root.phone, root.name
+        item = session.query(DeliveryCollectionItem).filter(
+            DeliveryCollectionItem.delivery_id == delivery_id,
+        ).order_by(DeliveryCollectionItem.id.asc()).first()
+        if item:
+            return item.phone, item.user_name
+    return None, None
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "label_print_"))
+def print_delivery_label(call):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+    if not label_print_api_enabled():
+        safe_answer_callback_query(call.id, "Печать наклеек не настроена.", show_alert=True)
+        return
+    delivery_id = parse_callback_int_suffix(call, "label_print_")
+    if delivery_id is None:
+        return
+    phone, name = find_label_data_for_delivery(delivery_id)
+    if not phone:
+        safe_answer_callback_query(call.id, "Клиент не найден.", show_alert=True)
+        return
+    enqueue_label_print_job(delivery_id, phone, name, call.from_user.id, source="manual")
+    safe_answer_callback_query(call.id, f"🖨 Наклейка отправлена на печать: {normalize_phone(phone)} {format_label_name(name)}")
+
+
+def claim_next_label_print_job():
+    current = now_local()
+    with Session(bind=engine) as session:
+        # Агент взял задание и пропал (ПК выключили) — возвращаем в очередь.
+        session.query(LabelPrintJob).filter(
+            LabelPrintJob.status == LABEL_PRINT_STATUS_PRINTING,
+            LabelPrintJob.taken_at < current - timedelta(minutes=LABEL_PRINT_TAKEN_TIMEOUT_MINUTES),
+        ).update({LabelPrintJob.status: LABEL_PRINT_STATUS_PENDING}, synchronize_session=False)
+        # Старые задания не печатаем, чтобы после выключенного ПК не вылезла стопка вчерашних наклеек.
+        session.query(LabelPrintJob).filter(
+            LabelPrintJob.status == LABEL_PRINT_STATUS_PENDING,
+            LabelPrintJob.created_at < current - timedelta(minutes=LABEL_PRINT_JOB_MAX_AGE_MINUTES),
+        ).update({LabelPrintJob.status: LABEL_PRINT_STATUS_EXPIRED}, synchronize_session=False)
+        job = session.query(LabelPrintJob).filter(
+            LabelPrintJob.status == LABEL_PRINT_STATUS_PENDING,
+        ).order_by(LabelPrintJob.created_at.asc(), LabelPrintJob.id.asc()).with_for_update(skip_locked=True).first()
+        if not job:
+            session.commit()
+            return None
+        job.status = LABEL_PRINT_STATUS_PRINTING
+        job.taken_at = current
+        job.attempts = int(job.attempts or 0) + 1
+        payload = {"id": job.id, "phone": job.phone, "name": job.name}
+        session.commit()
+        return payload
+
+
+def finish_label_print_job(job_id, ok, error=None):
+    with Session(bind=engine) as session:
+        job = session.query(LabelPrintJob).filter(LabelPrintJob.id == job_id).with_for_update().first()
+        if not job:
+            return False
+        if ok:
+            job.status = LABEL_PRINT_STATUS_PRINTED
+            job.printed_at = now_local()
+            job.error = None
+        else:
+            job.error = str(error or "ошибка печати")[:1000]
+            job.status = (
+                LABEL_PRINT_STATUS_PENDING
+                if int(job.attempts or 0) < LABEL_PRINT_MAX_ATTEMPTS
+                else LABEL_PRINT_STATUS_FAILED
+            )
+            logger.warning("Label print job failed id=%s attempts=%s: %s", job.id, job.attempts, job.error)
+        session.commit()
+        return True
+
+
+class LabelPrintApiHandler(BaseHTTPRequestHandler):
+    server_version = "FinalBotLabels/1.0"
+
+    def is_authorized(self):
+        authorization = self.headers.get("Authorization", "")
+        if not authorization.startswith("Bearer "):
+            return False
+        return hmac.compare_digest(authorization[len("Bearer "):].strip(), label_print_api_token())
+
+    def write_json(self, status, payload):
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def read_json(self):
+        length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.write_json(200, {"ok": True})
+            return
+        self.write_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        if not self.is_authorized():
+            self.write_json(401, {"error": "unauthorized"})
+            return
+        try:
+            if self.path == "/api/labels/next":
+                self.write_json(200, {"job": claim_next_label_print_job()})
+                return
+            match = re.fullmatch(r"/api/labels/(\d+)/result", self.path)
+            if match:
+                body = self.read_json()
+                found = finish_label_print_job(int(match.group(1)), bool(body.get("ok")), body.get("error"))
+                self.write_json(200 if found else 404, {"ok": found})
+                return
+            self.write_json(404, {"error": "not_found"})
+        except Exception:
+            logger.exception("Label print API request failed path=%s", self.path)
+            self.write_json(500, {"error": "internal_error"})
+
+    def log_message(self, fmt, *args):
+        logger.debug("Label print API %s - %s", self.client_address[0], fmt % args)
+
+
+def start_label_print_api():
+    if not label_print_api_enabled():
+        logger.info("Label print API disabled: LABEL_PRINT_API_TOKEN is not set")
+        return None
+    try:
+        server = ThreadingHTTPServer((LABEL_PRINT_API_HOST, LABEL_PRINT_API_PORT), LabelPrintApiHandler)
+    except OSError as exc:
+        logger.error("Label print API failed to start on %s:%s: %s", LABEL_PRINT_API_HOST, LABEL_PRINT_API_PORT, exc)
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="label-print-api", daemon=True).start()
+    logger.info("Label print API listening on %s:%s", LABEL_PRINT_API_HOST, LABEL_PRINT_API_PORT)
+    return server
+
+
 def build_delivery_collection_finish_keyboard(delivery_id, page=0):
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("🏁 Закончить сборку", callback_data=f"delivery_collected_{delivery_id}"))
+    if label_print_api_enabled():
+        keyboard.add(InlineKeyboardButton("🖨 Наклейка", callback_data=f"label_print_{delivery_id}"))
     keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data=f"collect_release_{delivery_id}_{page}"))
     return keyboard
 
@@ -13827,6 +14041,7 @@ def run_bot():
     start_delivery_broadcast_monitor_worker()
     start_payroll_sheet_sync_worker()
     start_database_backup_worker()
+    start_label_print_api()
     start_delivery_sheet_retry_worker()
     start_reserved_group_resume_flush_if_delivery_done(recover_stale=True)
     retry_delay = 5

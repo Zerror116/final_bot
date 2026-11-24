@@ -17,6 +17,7 @@ from .delivery_broadcast_recipients import DeliveryBroadcastRecipient
 from .delivery_collection_items import DeliveryCollectionItem
 from .missing_delivery_items import MissingDeliveryItem
 from .delivery_cart_merges import DeliveryCartMerge
+from .label_print_jobs import LabelPrintJob
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -72,6 +73,7 @@ def run_schema_migrations():
     run_migration("030_posts_shelf_width", ensure_posts_shelf_width)
     run_migration("031_delivery_broadcast_summary_parts", ensure_delivery_broadcast_summary_parts)
     run_migration("032_posts_first_created_at", ensure_posts_first_created_at)
+    run_migration("033_label_print_jobs", ensure_label_print_jobs)
 
 
 def ensure_schema_migrations():
@@ -479,6 +481,19 @@ def ensure_posts_first_created_at():
                     text(f"UPDATE {table} SET first_created_at = :value WHERE {id_column} = :post_id"),
                     {"value": min(candidates), "post_id": post_id},
                 )
+
+
+def ensure_label_print_jobs():
+    AbstractModel.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_label_print_jobs_status_created "
+            "ON label_print_jobs (status, created_at)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_label_print_jobs_delivery_id "
+            "ON label_print_jobs (delivery_id)"
+        ))
 
 
 def ensure_delivery_broadcast_summary_tracking():
@@ -1091,5 +1106,6 @@ __all__ = {
     "DeliveryCollectionItem",
     "MissingDeliveryItem",
     "DeliveryCartMerge",
+    "LabelPrintJob",
     "init_db",
 }
