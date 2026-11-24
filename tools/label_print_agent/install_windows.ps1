@@ -40,7 +40,7 @@ try {
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType Interactive `
-        -RunLevel LeastPrivilege
+        -RunLevel Limited
 
     Register-ScheduledTask `
         -TaskName $taskName `
