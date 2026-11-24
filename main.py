@@ -11256,7 +11256,11 @@ def format_label_name(name):
 
 
 def enqueue_label_print_job(delivery_id, phone, name, requested_by=None, source="auto"):
-    """Ставит наклейку в очередь. Автоматически — один раз на клиента, вручную — всегда."""
+    """Ставит наклейку в очередь: при каждом открытии клиента и по кнопке «🖨 Наклейка».
+
+    Автоматическая наклейка не ставится, только если наклейка этого клиента ещё ждёт
+    печати или печатается — это защита от двойного нажатия.
+    """
     phone = normalize_phone(phone) or str(phone or "").strip()
     name = format_label_name(name)
     if not phone:
@@ -11266,6 +11270,7 @@ def enqueue_label_print_job(delivery_id, phone, name, requested_by=None, source=
         if source == "auto" and delivery_id:
             already_queued = session.query(LabelPrintJob.id).filter(
                 LabelPrintJob.delivery_id == delivery_id,
+                LabelPrintJob.status.in_([LABEL_PRINT_STATUS_PENDING, LABEL_PRINT_STATUS_PRINTING]),
             ).first()
             if already_queued:
                 return None
