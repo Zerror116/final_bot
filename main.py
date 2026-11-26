@@ -224,7 +224,8 @@ TELEGRAM_BOT_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024
 # Наклейки на пакеты: бот ставит задание, агент на админском ПК печатает его через Word.
 LABEL_PRINT_API_HOST = (os.environ.get("LABEL_PRINT_API_HOST") or "0.0.0.0").strip()
 LABEL_PRINT_API_PORT = env_int("LABEL_PRINT_API_PORT", 8093, minimum=1)
-LABEL_PRINT_JOB_MAX_AGE_MINUTES = env_int("LABEL_PRINT_JOB_MAX_AGE_MINUTES", 120, minimum=1)
+# Наклейку, которую не удалось напечатать за 5 минут (нет связи с ПК и т.п.), больше не печатаем.
+LABEL_PRINT_JOB_MAX_AGE_MINUTES = env_int("LABEL_PRINT_JOB_MAX_AGE_MINUTES", 5, minimum=1)
 LABEL_PRINT_TAKEN_TIMEOUT_MINUTES = 5
 LABEL_PRINT_MAX_ATTEMPTS = 3
 LABEL_PRINT_STATUS_PENDING = "pending"
