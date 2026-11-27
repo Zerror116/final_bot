@@ -18,6 +18,7 @@ from .delivery_collection_items import DeliveryCollectionItem
 from .missing_delivery_items import MissingDeliveryItem
 from .delivery_cart_merges import DeliveryCartMerge
 from .label_print_jobs import LabelPrintJob
+from .pc_wake_jobs import PcWakeJob
 from .db import AbstractModel, engine
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -1107,5 +1108,6 @@ __all__ = {
     "MissingDeliveryItem",
     "DeliveryCartMerge",
     "LabelPrintJob",
+    "PcWakeJob",
     "init_db",
 }

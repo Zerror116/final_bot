@@ -1,5 +1,6 @@
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from db.delivery_collection_items import DeliveryCollectionItem
 from db.missing_delivery_items import MissingDeliveryItem
 from db.delivery_cart_merges import DeliveryCartMerge
 from db.label_print_jobs import LabelPrintJob
+from db.pc_wake_jobs import PcWakeJob
 from db import init_db
 from handlers.black_list import *
 from handlers.clients_manage import *
@@ -233,6 +235,20 @@ LABEL_PRINT_STATUS_PRINTING = "printing"
 LABEL_PRINT_STATUS_PRINTED = "printed"
 LABEL_PRINT_STATUS_FAILED = "failed"
 LABEL_PRINT_STATUS_EXPIRED = "expired"
+# Включение админского ПК: бот ставит команду, телефон рядом с ПК забирает её через Tailscale
+# и шлёт Wake-on-LAN в местную сеть. Работает на том же HTTP-сервере, что и наклейки.
+PC_WAKE_BUTTON = "💻 Включить админ ПК"
+PC_WAKE_ROLES = {"supreme_leader"}
+PC_WAKE_JOB_MAX_AGE_SECONDS = 120
+PC_WAKE_STATUS_PENDING = "pending"
+PC_WAKE_STATUS_TAKEN = "taken"
+PC_WAKE_STATUS_SENT = "sent"
+PC_WAKE_STATUS_FAILED = "failed"
+PC_WAKE_STATUS_EXPIRED = "expired"
+# Без токена команды забирают только устройства из Tailscale (и localhost — прокси Tailscale).
+PC_WAKE_ALLOWED_NETWORKS = tuple(ipaddress.ip_network(network) for network in (
+    "100.64.0.0/10", "fd7a:115c:a1e0::/48", "127.0.0.0/8", "::1/128",
+))
 RESERVATION_DB_RETRY_ATTEMPTS = env_int("RESERVATION_DB_RETRY_ATTEMPTS", 5, minimum=1)
 RESERVATION_DB_RETRY_BASE_SECONDS = env_float("RESERVATION_DB_RETRY_BASE_SECONDS", 0.5, minimum=0)
 RESERVED_GROUP_FLOW_STATE_KEY = 0
@@ -684,6 +700,7 @@ MENU_BUTTON_TEXTS = {
     "📤 Отправить рассылку", "👨‍🦯 Засунуть в доставку", "📦 Список пропажи", "Список Клиентов",
     "Объединить корзины", "🗄 Архив доставки", "Сделать ревизию", "Ручная Ревизия",
     "Отменить ревизию", "📦 Заказы клиентов", "✅ Подтвердить доставку", "🖨 Распечатать стикер",
+    "💻 Включить админ ПК",
 }
 
 
@@ -11371,6 +11388,86 @@ def finish_label_print_job(job_id, ok, error=None):
         return True
 
 
+def pc_wake_api_token():
+    return (os.environ.get("PC_WAKE_API_TOKEN") or "").strip()
+
+
+def pc_wake_request_allowed(client_ip, authorization):
+    try:
+        address = ipaddress.ip_address(str(client_ip))
+    except ValueError:
+        return False
+    if getattr(address, "ipv4_mapped", None):
+        address = address.ipv4_mapped
+    if not any(address in network for network in PC_WAKE_ALLOWED_NETWORKS):
+        return False
+    token = pc_wake_api_token()
+    if not token:
+        return True
+    if not str(authorization).startswith("Bearer "):
+        return False
+    return hmac.compare_digest(str(authorization)[len("Bearer "):].strip(), token)
+
+
+def claim_next_pc_wake_job():
+    current = now_local()
+    with Session(bind=engine) as session:
+        # Старые команды не выполняем: телефон был не на связи, человек уже получил отказ.
+        job = session.query(PcWakeJob).filter(
+            PcWakeJob.status == PC_WAKE_STATUS_PENDING,
+            PcWakeJob.created_at >= current - timedelta(seconds=PC_WAKE_JOB_MAX_AGE_SECONDS),
+        ).order_by(PcWakeJob.created_at.asc(), PcWakeJob.id.asc()).with_for_update(skip_locked=True).first()
+        if not job:
+            return None
+        job.status = PC_WAKE_STATUS_TAKEN
+        job.taken_at = current
+        payload = {"id": job.id}
+        session.commit()
+        return payload
+
+
+def finish_pc_wake_job(job_id, ok, error=None):
+    with Session(bind=engine) as session:
+        job = session.query(PcWakeJob).filter(PcWakeJob.id == job_id).with_for_update().first()
+        if not job:
+            return False
+        job.status = PC_WAKE_STATUS_SENT if ok else PC_WAKE_STATUS_FAILED
+        job.done_at = now_local()
+        job.error = None if ok else str(error or "ошибка отправки")[:1000]
+        chat_id = job.chat_id
+        session.commit()
+    if ok:
+        logger.info("PC wake packet sent job_id=%s", job_id)
+        text = ("✅ Телефон отправил сигнал включения. ПК загрузится за 1–2 минуты, "
+                "потом можно подключаться через AnyDesk.")
+    else:
+        logger.warning("PC wake job failed job_id=%s", job_id)
+        text = "❌ Телефон не смог отправить сигнал включения ПК."
+    if chat_id:
+        safe_send_message(bot, chat_id, text, logger=logger)
+    return True
+
+
+def check_pc_wake_job_answered(job_id):
+    try:
+        with Session(bind=engine) as session:
+            job = session.query(PcWakeJob).filter(PcWakeJob.id == job_id).with_for_update().first()
+            if not job or job.status not in {PC_WAKE_STATUS_PENDING, PC_WAKE_STATUS_TAKEN}:
+                return
+            was_taken = job.status == PC_WAKE_STATUS_TAKEN
+            job.status = PC_WAKE_STATUS_EXPIRED
+            chat_id = job.chat_id
+            session.commit()
+        logger.warning("PC wake job not answered job_id=%s taken=%s", job_id, was_taken)
+        if chat_id:
+            text = ("⚠️ Телефон взял команду, но не подтвердил отправку сигнала." if was_taken else
+                    "📵 Телефон у админского ПК не ответил за 2 минуты. "
+                    "Проверьте, что он включён, в Wi-Fi и в Tailscale.")
+            safe_send_message(bot, chat_id, text, logger=logger)
+    except Exception:
+        logger.exception("PC wake answer check failed job_id=%s", job_id)
+
+
 class LabelPrintApiHandler(BaseHTTPRequestHandler):
     server_version = "FinalBotLabels/1.0"
 
@@ -11404,6 +11501,9 @@ class LabelPrintApiHandler(BaseHTTPRequestHandler):
         self.write_json(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.path.startswith("/api/wake/"):
+            self.handle_pc_wake_post()
+            return
         if not self.is_authorized():
             self.write_json(401, {"error": "unauthorized"})
             return
@@ -11420,6 +11520,26 @@ class LabelPrintApiHandler(BaseHTTPRequestHandler):
             self.write_json(404, {"error": "not_found"})
         except Exception:
             logger.exception("Label print API request failed path=%s", self.path)
+            self.write_json(500, {"error": "internal_error"})
+
+    def handle_pc_wake_post(self):
+        if not pc_wake_request_allowed(self.client_address[0], self.headers.get("Authorization", "")):
+            logger.warning("PC wake API rejected client=%s", self.client_address[0])
+            self.write_json(403, {"error": "forbidden"})
+            return
+        try:
+            if self.path == "/api/wake/next":
+                self.write_json(200, {"job": claim_next_pc_wake_job()})
+                return
+            match = re.fullmatch(r"/api/wake/(\d+)/result", self.path)
+            if match:
+                body = self.read_json()
+                found = finish_pc_wake_job(int(match.group(1)), bool(body.get("ok")), body.get("error"))
+                self.write_json(200 if found else 404, {"ok": found})
+                return
+            self.write_json(404, {"error": "not_found"})
+        except Exception:
+            logger.exception("PC wake API request failed path=%s", self.path)
             self.write_json(500, {"error": "internal_error"})
 
     def log_message(self, fmt, *args):
@@ -13391,6 +13511,41 @@ def handle_custom_sticker_text(message):
         job_id = job.id
     logger.info("Custom sticker print job queued id=%s", job_id)
     safe_send_message(bot, message.chat.id, "🖨 Стикер отправлен на печать.", logger=logger)
+
+
+@bot.message_handler(func=lambda message: message.text == PC_WAKE_BUTTON)
+def request_pc_wake(message):
+    if not has_role(message.from_user.id, PC_WAKE_ROLES):
+        safe_send_message(bot, message.chat.id, "У вас нет прав для этой функции.", logger=logger)
+        return
+    if not label_print_api_enabled():
+        safe_send_message(bot, message.chat.id, "Включение ПК не настроено.", logger=logger)
+        return
+    current = now_local()
+    with Session(bind=engine) as session:
+        active = session.query(PcWakeJob.id).filter(
+            PcWakeJob.status.in_([PC_WAKE_STATUS_PENDING, PC_WAKE_STATUS_TAKEN]),
+            PcWakeJob.created_at >= current - timedelta(seconds=PC_WAKE_JOB_MAX_AGE_SECONDS),
+        ).first()
+        if active:
+            safe_send_message(bot, message.chat.id, "⏳ Команда уже отправлена, подождите ответа телефона.",
+                              logger=logger)
+            return
+        job = PcWakeJob(
+            requested_by=message.from_user.id,
+            chat_id=message.chat.id,
+            status=PC_WAKE_STATUS_PENDING,
+            created_at=current,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    logger.info("PC wake job queued id=%s by user_id=%s", job_id, message.from_user.id)
+    safe_send_message(bot, message.chat.id, "⏳ Команда отправлена телефону у админского ПК. "
+                      "Сообщу, когда он отправит сигнал включения.", logger=logger)
+    timer = threading.Timer(PC_WAKE_JOB_MAX_AGE_SECONDS + 10, check_pc_wake_job_answered, args=(job_id,))
+    timer.daemon = True
+    timer.start()
 
 
 @bot.message_handler(func=lambda message: message.text == "DOOM")

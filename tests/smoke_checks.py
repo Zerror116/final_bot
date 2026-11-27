@@ -1477,6 +1477,70 @@ def test_client_update_for_work_handles_errors_safely():
         raise AssertionError("client update rollback must not run after a failed session setup")
 
 
+def test_pc_wake_markers():
+    main_text = MAIN.read_text(encoding="utf-8")
+    keyboard_text = (ROOT / "bot" / "keyboard.py").read_text(encoding="utf-8")
+    for marker in [
+        'PC_WAKE_BUTTON = "💻 Включить админ ПК"',
+        'PC_WAKE_ROLES = {"supreme_leader"}',
+        "@bot.message_handler(func=lambda message: message.text == PC_WAKE_BUTTON)",
+        "if not has_role(message.from_user.id, PC_WAKE_ROLES):",
+        "def claim_next_pc_wake_job",
+        "def finish_pc_wake_job",
+        "def check_pc_wake_job_answered",
+        'if self.path == "/api/wake/next":',
+        'r"/api/wake/(\\d+)/result"',
+    ]:
+        if marker not in main_text:
+            raise AssertionError(f"PC wake marker missing {marker}")
+    if "💻 Включить админ ПК" not in keyboard_text:
+        raise AssertionError("PC wake button missing from supreme_leader menu")
+    leader_menu = keyboard_text.split("def supreme_leader_main_menu", 1)[1].split("try:", 1)[0]
+    if "wake_admin_pc" not in leader_menu:
+        raise AssertionError("PC wake button must be shown to every supreme_leader, not only the creator")
+    do_post = main_text.split("    def do_POST(self):", 1)[1].split("    def handle_pc_wake_post", 1)[0]
+    assert_marker_order(do_post, 'self.path.startswith("/api/wake/")', "self.is_authorized()",
+                        "PC wake API must not require the label print token")
+
+    tree = ast.parse(main_text)
+    source = next(
+        ast.get_source_segment(main_text, node) for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"pc_wake_request_allowed"}
+    )
+    token_source = next(
+        ast.get_source_segment(main_text, node) for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "pc_wake_api_token"
+    )
+    import hmac as hmac_module
+    import ipaddress as ipaddress_module
+    namespace = {
+        "os": os,
+        "hmac": hmac_module,
+        "ipaddress": ipaddress_module,
+        "PC_WAKE_ALLOWED_NETWORKS": tuple(ipaddress_module.ip_network(n) for n in (
+            "100.64.0.0/10", "fd7a:115c:a1e0::/48", "127.0.0.0/8", "::1/128",
+        )),
+    }
+    exec(token_source + "\n" + source, namespace)
+    allowed = namespace["pc_wake_request_allowed"]
+    previous = os.environ.pop("PC_WAKE_API_TOKEN", None)
+    try:
+        assert_equal(allowed("100.117.213.11", ""), True, "tailnet phone allowed without token")
+        assert_equal(allowed("127.0.0.1", ""), True, "localhost (tailscale proxy) allowed")
+        assert_equal(allowed("::ffff:100.117.213.11", ""), True, "ipv4-mapped tailnet address allowed")
+        assert_equal(allowed("192.168.0.50", ""), False, "home LAN rejected")
+        assert_equal(allowed("8.8.8.8", ""), False, "internet rejected")
+        assert_equal(allowed("not-an-ip", ""), False, "garbage rejected")
+        os.environ["PC_WAKE_API_TOKEN"] = "secret-wake"
+        assert_equal(allowed("100.117.213.11", ""), False, "token required when configured")
+        assert_equal(allowed("100.117.213.11", "Bearer secret-wake"), True, "correct token accepted")
+        assert_equal(allowed("192.168.0.50", "Bearer secret-wake"), False, "token does not bypass network check")
+    finally:
+        os.environ.pop("PC_WAKE_API_TOKEN", None)
+        if previous is not None:
+            os.environ["PC_WAKE_API_TOKEN"] = previous
+
+
 def test_init_db_runs_on_clean_sqlite_database():
     with tempfile.TemporaryDirectory() as tmp_dir:
         sqlite_path = Path(tmp_dir) / "clean.sqlite"
@@ -4394,6 +4458,7 @@ def main():
     test_reservation_creation_retries_transient_database_errors()
     test_no_post_stats_api_tokens_are_hardcoded()
     test_inline_callback_data_stays_within_telegram_limit()
+    test_pc_wake_markers()
     print("smoke checks ok")
 
 

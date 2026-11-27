@@ -20,9 +20,10 @@ def supreme_leader_main_menu(user_id=None):
     i_have_a_defect = KeyboardButton("😞 У меня брак")
     phoenix_broadcast = KeyboardButton("Рассылка о Фениксе")
     reservation_stats = KeyboardButton("БроньСтатистик")
+    wake_admin_pc = KeyboardButton("💻 Включить админ ПК")
     leader_keyboard.add(create_new_post, manage_posts, send_new_posts_to_channel, my_orders, manage_clients,
                         delivery_management, orders_in_delivery, manage_workers, audit_manage, i_have_a_defect,
-                        phoenix_broadcast, reservation_stats)
+                        phoenix_broadcast, reservation_stats, wake_admin_pc)
     try:
         if user_id is not None and int(user_id) == int(CREATOR_USER_ID):
             leader_keyboard.add(KeyboardButton("DOOM"), KeyboardButton("🖨 Распечатать стикер"))
