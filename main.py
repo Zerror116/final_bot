@@ -86,6 +86,7 @@ from services.google_sheets_delivery import (
     write_delivery_collector_name,
 )
 from services.db_backup import DatabaseBackupError, create_database_backup
+from services.phone_match_watch import PHONE_MATCH_CHECK_SECONDS, run_phone_match_check
 
 
 def env_bool(name, default=False):
@@ -218,6 +219,7 @@ PAYROLL_SHEET_SYNC_HOUR = 23
 PAYROLL_SHEET_SYNC_MINUTE = 0
 PAYROLL_SHEET_SYNC_CHECK_SECONDS = 60
 DB_BACKUP_STATE_KEY = 4
+PHONE_MATCH_STATE_KEY = 5
 DB_BACKUP_HOUR = env_int("DB_BACKUP_HOUR", 18, minimum=0)
 DB_BACKUP_MINUTE = env_int("DB_BACKUP_MINUTE", 0, minimum=0)
 DB_BACKUP_CHECK_SECONDS = 60
@@ -692,6 +694,8 @@ payroll_sheet_sync_started = False
 payroll_sheet_sync_stop_event = threading.Event()
 payroll_sheet_sync_lock = threading.Lock()
 db_backup_started = False
+phone_match_started = False
+phone_match_stop_event = threading.Event()
 db_backup_stop_event = threading.Event()
 db_backup_lock = threading.Lock()
 delivery_sheet_retry_started = False
@@ -6442,6 +6446,40 @@ def payroll_sheet_sync_loop():
 
         if payroll_sheet_sync_stop_event.wait(PAYROLL_SHEET_SYNC_CHECK_SECONDS):
             return
+
+
+def get_phone_match_state():
+    state = user_data.get(PHONE_MATCH_STATE_KEY, {})
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def save_phone_match_state(state):
+    user_data[PHONE_MATCH_STATE_KEY] = state
+
+
+def phone_match_loop():
+    while True:
+        try:
+            run_phone_match_check(
+                lambda chat_id, text: safe_send_message(bot, chat_id, text, logger=logger),
+                get_phone_match_state,
+                save_phone_match_state,
+                now_samara().replace(tzinfo=None),
+            )
+        except Exception:
+            logger.exception("Phone match check failed")
+
+        if phone_match_stop_event.wait(PHONE_MATCH_CHECK_SECONDS):
+            return
+
+
+def start_phone_match_worker():
+    global phone_match_started
+    if phone_match_started:
+        return
+
+    phone_match_started = True
+    threading.Thread(target=phone_match_loop, name="phone-match", daemon=True).start()
 
 
 def start_payroll_sheet_sync_worker():
@@ -14424,6 +14462,7 @@ def run_bot():
     start_reservation_stats_daily_report_worker()
     start_delivery_broadcast_monitor_worker()
     start_payroll_sheet_sync_worker()
+    start_phone_match_worker()
     start_database_backup_worker()
     start_label_print_api()
     start_delivery_sheet_retry_worker()

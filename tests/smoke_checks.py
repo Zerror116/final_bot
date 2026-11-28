@@ -4424,6 +4424,56 @@ def test_delivery_finish_asks_confirmation():
     assert "build_delivery_collection_finish_keyboard(delivery_id" in no_block
 
 
+def test_phone_match_watch_logic():
+    from datetime import datetime, timedelta
+    from services import phone_match_watch as pm
+
+    assert pm.normalize_phone("8 (917) 123-45-67") == pm.normalize_phone("+7 917 1234567") == "79171234567"
+    base = pm.parse_base_rows([
+        ["Номер", "имя", "сумма"],
+        ["89171234567", "Аня", "1\xa0900 ₽"],
+        ["89270000555", "Боря", "0 ₽"],
+        ["7788", "Вика", "50 ₽"],
+        ["89375551199", "Гоша", "300 ₽"],
+    ])
+    assert pm.find_base_matches("79171234567", base)[0] == pm.MATCH_EXACT
+    assert pm.find_base_matches("79990007788", base)[0] == pm.MATCH_LAST4
+    kind, rows = pm.find_base_matches("79375552189", base)
+    assert kind == pm.MATCH_FUZZY and rows[0]["name"] == "Гоша", "2 differing digits must still match"
+    assert pm.find_base_matches("79001112233", base)[0] is None
+    assert pm.find_base_matches("79375551211", base)[0] is None, "3 differing digits are too many"
+
+    requests = pm.parse_request_rows([
+        ["89171234567", "x", "", "", "1"],
+        ["89270000555", "x", "", "", "1"],
+        ["89375551199", "x", "", "", "с"],
+    ])
+    current = pm.collect_matches(requests, base)
+    assert [m["name"] for m in current.values()] == ["Аня"], "zero sum and rows without E=1 are skipped"
+
+    morning = datetime(2026, 11, 28, 9, 0)
+    messages, state = pm.plan_phone_match_messages(current, {}, morning)
+    assert len(messages) == 1 and "Аня" in messages[0]
+    messages, state = pm.plan_phone_match_messages(current, state, morning + timedelta(minutes=10))
+    assert messages == [], "already sent person is not repeated"
+    messages, state = pm.plan_phone_match_messages({}, state, datetime(2026, 11, 28, 17, 5))
+    assert len(messages) == 1 and "Отказались" in messages[0] and "Аня" in messages[0]
+    messages, state = pm.plan_phone_match_messages({}, state, datetime(2026, 11, 28, 17, 15))
+    assert messages == [], "17:00 summary is sent once per day"
+    _, state = pm.plan_phone_match_messages(current, {}, morning)
+    messages, _ = pm.plan_phone_match_messages(current, state, morning + timedelta(hours=21))
+    assert len(messages) == 1, "person is sent again after 20 hours"
+
+    sent = []
+    pm.load_current_matches = lambda _file: current
+    saved = []
+    pm.run_phone_match_check(lambda chat_id, text: sent.append(chat_id) or True, lambda: {}, saved.append, morning, "x")
+    assert sent == [5411051275] and saved, "messages go only to the one recipient"
+
+    main_text = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "    start_phone_match_worker()\n" in main_text
+
+
 def main():
     test_audit_prices()
     test_delivery_callbacks_are_namespaced()
@@ -4513,6 +4563,7 @@ def main():
     test_delivery_label_counter_and_amount_age_limit()
     test_delivery_cart_merge_has_back_button()
     test_delivery_finish_asks_confirmation()
+    test_phone_match_watch_logic()
     print("smoke checks ok")
 
 
