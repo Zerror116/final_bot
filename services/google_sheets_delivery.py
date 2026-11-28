@@ -120,6 +120,7 @@ def get_delivery_sheet_config():
         "phone_column": os.environ.get("GOOGLE_SHEETS_PHONE_COLUMN", "A").strip().upper() or "A",
         "amount_column": os.environ.get("GOOGLE_SHEETS_AMOUNT_COLUMN", "C").strip().upper() or "C",
         "collector_column": os.environ.get("GOOGLE_SHEETS_COLLECTOR_COLUMN", "I").strip().upper() or "I",
+        "label_count_column": os.environ.get("GOOGLE_SHEETS_LABEL_COUNT_COLUMN", "J").strip().upper() or "J",
         "first_data_row": get_int_env("GOOGLE_SHEETS_FIRST_DATA_ROW", 2, minimum=1),
         "service_account_file": os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip(),
     }
@@ -698,3 +699,49 @@ def write_delivery_collector_name(phone, collector_name):
         "row": row_number,
         "collector_name": collector_name,
     }
+
+
+def next_label_counter_value(current_value, add_labels=0, finished=None):
+    """Счётчик наклеек в ячейке: «1», «2» во время сборки, «2м» после её завершения.
+
+    finished=False — наклейка текущей сборки: число растёт; если прошлая сборка уже
+    завершена («2м»), счёт начинается заново. finished=True — сборка завершена, ставим «м».
+    finished=None — наклейка допечаталась после завершения: число растёт, «м» остаётся.
+    Возвращает None, если писать нечего.
+    """
+    current = str(current_value or "").strip()
+    match = re.match(r"^(\d+)\s*([мМmM])?", current)
+    count = int(match.group(1)) if match else 0
+    was_finished = bool(match and match.group(2))
+    if was_finished and finished is False:
+        count = 0
+    count += int(add_labels or 0)
+    if count <= 0:
+        return None
+    is_finished = was_finished if finished is None else bool(finished)
+    return f"{count}м" if is_finished else str(count)
+
+
+def update_delivery_label_counter(phone, add_labels=0, finished=None):
+    config = get_delivery_sheet_config()
+    service = get_delivery_sheets_service(config)
+    row_number = find_delivery_sheet_row(service, config, phone)
+
+    sheet_name = quote_sheet_name(config["worksheet"])
+    counter_range = f"{sheet_name}!{config['label_count_column']}{row_number}"
+    response = service.spreadsheets().values().get(
+        spreadsheetId=config["spreadsheet_id"],
+        range=counter_range,
+        valueRenderOption="FORMATTED_VALUE",
+    ).execute()
+    values = response.get("values", [])
+    current_value = values[0][0] if values and values[0] else ""
+    new_value = next_label_counter_value(current_value, add_labels, finished)
+    if new_value is not None and new_value != str(current_value).strip():
+        service.spreadsheets().values().update(
+            spreadsheetId=config["spreadsheet_id"],
+            range=counter_range,
+            valueInputOption="RAW",
+            body={"values": [[new_value]]},
+        ).execute()
+    return {"row": row_number, "value": new_value if new_value is not None else current_value}

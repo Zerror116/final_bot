@@ -4373,6 +4373,57 @@ def test_inline_callback_data_stays_within_telegram_limit():
             )
 
 
+def test_delivery_label_counter_and_amount_age_limit():
+    sheets_path = ROOT / "services" / "google_sheets_delivery.py"
+    sheets_tree = ast.parse(sheets_path.read_text(encoding="utf-8"))
+    function_nodes = [
+        node for node in sheets_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "next_label_counter_value"
+    ]
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=function_nodes, type_ignores=[]), str(sheets_path), "exec"), namespace)
+    next_value = namespace["next_label_counter_value"]
+    assert next_value("", 1, False) == "1"
+    assert next_value("1", 1, False) == "2"
+    assert next_value("2", 0, True) == "2м"
+    assert next_value("2м", 1, False) == "1", "new collection must restart the counter"
+    assert next_value("2м", 1, None) == "3м", "late print after finish keeps the mark"
+    assert next_value("", 0, True) is None
+    assert next_value("Тоня", 1, False) == "1"
+
+    main_text = (ROOT / "main.py").read_text(encoding="utf-8")
+    for marker in (
+        "DELIVERY_SHEET_AMOUNT_MAX_AGE_HOURS",
+        "if delivery_sheet_amount_expired(item.placed_at):",
+        "DeliveryCollectionItem.placed_at >= cutoff,",
+        "count_printed_label_in_sheet(session, job)",
+        "queue_delivery_label_counter(label_counter_phone, add_labels=0, finished=True)",
+    ):
+        assert marker in main_text, marker
+
+
+def test_delivery_cart_merge_has_back_button():
+    main_text = (ROOT / "main.py").read_text(encoding="utf-8")
+    for handler in ("def handle_delivery_cart_merge_main_input(", "def handle_delivery_cart_merge_extra_input("):
+        block = main_text.split(handler, 1)[1].split("\n\n\n", 1)[0]
+        assert "if is_delivery_cart_merge_back(text):" in block, handler
+        assert "exit_delivery_cart_merge(message.chat.id)" in block, handler
+    start_block = main_text.split("def request_delivery_cart_merge_main(", 1)[1].split("\n\n\n", 1)[0]
+    assert "reply_markup=delivery_cart_merge_keyboard()" in start_block
+
+
+def test_delivery_finish_asks_confirmation():
+    main_text = (ROOT / "main.py").read_text(encoding="utf-8")
+    keyboard_block = main_text.split("def build_delivery_collection_finish_keyboard(", 1)[1].split("\n\n\n", 1)[0]
+    assert 'callback_data=f"delivery_finish_ask_{delivery_id}"' in keyboard_block
+    ask_block = main_text.split("def ask_finish_delivery_collection(", 1)[1].split("\n\n\n", 1)[0]
+    assert "Вы уверены что хотите закончить сборку?" in ask_block
+    assert 'callback_data=f"delivery_collected_{delivery_id}"' in ask_block
+    assert 'callback_data=f"delivery_finish_no_{delivery_id}"' in ask_block
+    no_block = main_text.split("def decline_finish_delivery_collection(", 1)[1].split("\n\n\n", 1)[0]
+    assert "build_delivery_collection_finish_keyboard(delivery_id" in no_block
+
+
 def main():
     test_audit_prices()
     test_delivery_callbacks_are_namespaced()
@@ -4459,6 +4510,9 @@ def main():
     test_no_post_stats_api_tokens_are_hardcoded()
     test_inline_callback_data_stays_within_telegram_limit()
     test_pc_wake_markers()
+    test_delivery_label_counter_and_amount_age_limit()
+    test_delivery_cart_merge_has_back_button()
+    test_delivery_finish_asks_confirmation()
     print("smoke checks ok")
 
 

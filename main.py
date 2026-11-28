@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -81,6 +82,7 @@ from services.google_sheets_delivery import (
     DeliverySheetError,
     add_delivery_amount,
     sync_payroll_sheet_week,
+    update_delivery_label_counter,
     write_delivery_collector_name,
 )
 from services.db_backup import DatabaseBackupError, create_database_backup
@@ -263,6 +265,11 @@ DELIVERY_COLLECTION_REPORT_LOCK_KEY = env_int("DELIVERY_COLLECTION_REPORT_LOCK_K
 DELIVERY_SHEET_LOCK_KEY = env_int("DELIVERY_SHEET_LOCK_KEY", 4453060579)
 DELIVERY_SHEET_RETRY_SECONDS = env_float("DELIVERY_SHEET_RETRY_SECONDS", 60, minimum=1)
 DELIVERY_SHEET_RETRY_BATCH_SIZE = env_int("DELIVERY_SHEET_RETRY_BATCH_SIZE", 25, minimum=1)
+# Сумму товара дописываем в таблицу только в течение 5 часов после того, как его положили.
+# Иначе через неделю (когда телефон клиента появится в таблице) бот вписал бы старые суммы.
+DELIVERY_SHEET_AMOUNT_MAX_AGE_HOURS = env_float("DELIVERY_SHEET_AMOUNT_MAX_AGE_HOURS", 5, minimum=0.1)
+LABEL_COUNTER_SHEET_ATTEMPTS = 3
+LABEL_COUNTER_SHEET_RETRY_SECONDS = 20
 MERGE_DELIVERY_CARTS_BUTTON = "Объединить корзины"
 MERGE_DELIVERY_MAIN_STATE = "MERGE_DELIVERY_MAIN"
 MERGE_DELIVERY_EXTRA_STATE = "MERGE_DELIVERY_EXTRA"
@@ -4041,6 +4048,24 @@ def show_delivery_clients_summary(message):
         time.sleep(0.2)
 
 
+def delivery_cart_merge_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("⬅️ Назад")
+    return markup
+
+
+def is_delivery_cart_merge_back(text):
+    return str(text or "").strip() in {"⬅️ Назад", "Назад"}
+
+
+def exit_delivery_cart_merge(chat_id):
+    """Выход из объединения на любом шаге: ничего не сохраняется, возвращаемся в главное меню."""
+    clear_user_state(chat_id)
+    temp_user_data.pop(chat_id, None)
+    markup, text = get_main_menu_for_user(chat_id)
+    safe_send_message(bot, chat_id, text, reply_markup=markup, logger=logger)
+
+
 @bot.message_handler(func=lambda message: message.text == MERGE_DELIVERY_CARTS_BUTTON)
 def request_delivery_cart_merge_main(message):
     if not require_role(message, DELIVERY_ROLES):
@@ -4054,6 +4079,7 @@ def request_delivery_cart_merge_main(message):
         "Введите телефон основной корзины.\n"
         "Корзины можно объединять даже если их ещё нет в списке сборки. "
         "Когда основная корзина попадёт в сборку, дополнительные тоже добавятся.",
+        reply_markup=delivery_cart_merge_keyboard(),
         logger=logger,
     )
 
@@ -4067,6 +4093,9 @@ def handle_delivery_cart_merge_main_input(message):
 
     text = require_text_message(message, "Введите телефон основной корзины текстом.")
     if text is None:
+        return
+    if is_delivery_cart_merge_back(text):
+        exit_delivery_cart_merge(message.chat.id)
         return
 
     with Session(bind=engine) as session:
@@ -4119,7 +4148,13 @@ def handle_delivery_cart_merge_main_input(message):
             "Введите телефон дополнительной корзины. "
             "Её товары будут идти после основной корзины."
         )
-    safe_send_message(bot, message.chat.id, "\n".join(prompt_lines), logger=logger)
+    safe_send_message(
+        bot,
+        message.chat.id,
+        "\n".join(prompt_lines),
+        reply_markup=delivery_cart_merge_keyboard(),
+        logger=logger,
+    )
 
 
 @bot.message_handler(func=lambda message: message_user_state_is(message, MERGE_DELIVERY_EXTRA_STATE))
@@ -4131,6 +4166,9 @@ def handle_delivery_cart_merge_extra_input(message):
 
     text = require_text_message(message, "Введите телефон дополнительной корзины текстом.")
     if text is None:
+        return
+    if is_delivery_cart_merge_back(text):
+        exit_delivery_cart_merge(message.chat.id)
         return
 
     flow_data = get_temp_user_data_or_reset(
@@ -4152,6 +4190,9 @@ def handle_delivery_cart_merge_extra_input(message):
     if success:
         clear_user_state(message.chat.id)
         temp_user_data.pop(message.chat.id, None)
+        markup, _menu_text = get_main_menu_for_user(message.chat.id)
+        safe_send_message(bot, message.chat.id, result_text, reply_markup=markup, logger=logger)
+        return
 
     safe_send_message(bot, message.chat.id, result_text, logger=logger)
 
@@ -10603,6 +10644,14 @@ def build_delivery_sheet_operation_id(item_id):
     return f"delivery_item_{int(item_id)}"
 
 
+def delivery_sheet_amount_cutoff():
+    return now_local() - timedelta(hours=DELIVERY_SHEET_AMOUNT_MAX_AGE_HOURS)
+
+
+def delivery_sheet_amount_expired(placed_at):
+    return placed_at is not None and placed_at < delivery_sheet_amount_cutoff()
+
+
 def add_collection_item_amount_to_sheet(item_id):
     with Session(bind=engine, expire_on_commit=False) as session:
         item = session.query(DeliveryCollectionItem).filter(
@@ -10611,6 +10660,8 @@ def add_collection_item_amount_to_sheet(item_id):
         if not item or item.sheet_added_at:
             return True, item
         if not item.placed_at:
+            return False, item
+        if delivery_sheet_amount_expired(item.placed_at):
             return False, item
         if int(item.amount or 0) <= 0:
             # Нулевая сумма: в таблицу добавлять нечего, иначе запись бесконечно уходила бы в повтор.
@@ -10667,8 +10718,11 @@ def add_collection_item_amount_to_sheet(item_id):
 
 def get_pending_delivery_sheet_item_ids(limit=DELIVERY_SHEET_RETRY_BATCH_SIZE):
     with Session(bind=engine) as session:
+        # Товар положили больше 5 часов назад — сумму больше не дописываем.
+        cutoff = delivery_sheet_amount_cutoff()
         rows = session.query(DeliveryCollectionItem.id).filter(
             DeliveryCollectionItem.placed_at != None,
+            DeliveryCollectionItem.placed_at >= cutoff,
             DeliveryCollectionItem.sheet_added_at == None,
         ).order_by(
             # Сначала новые записи, записи с ошибкой (например, телефона нет в таблице) — в конце,
@@ -11367,12 +11421,66 @@ def claim_next_label_print_job():
         return payload
 
 
+label_counter_queue = queue.Queue()
+label_counter_worker_lock = threading.Lock()
+label_counter_worker_started = False
+
+
+def queue_delivery_label_counter(phone, add_labels=0, finished=None):
+    """Столбец J онлайн-таблицы: сколько наклеек напечатано («1», «2»), после сборки — «2м»."""
+    global label_counter_worker_started
+    if not phone:
+        return
+    label_counter_queue.put((phone, int(add_labels or 0), finished))
+    with label_counter_worker_lock:
+        if label_counter_worker_started:
+            return
+        label_counter_worker_started = True
+    threading.Thread(target=label_counter_worker_loop, name="label-counter-sheet", daemon=True).start()
+
+
+def label_counter_worker_loop():
+    while True:
+        phone, add_labels, finished = label_counter_queue.get()
+        for attempt in range(1, LABEL_COUNTER_SHEET_ATTEMPTS + 1):
+            db_lock_connection = None
+            failed = False
+            try:
+                with delivery_sheet_sync_lock:
+                    db_lock_connection = acquire_delivery_sheet_db_lock()
+                    result = update_delivery_label_counter(phone, add_labels=add_labels, finished=finished)
+                logger.info("Label counter sheet updated row=%s value=%s", result["row"], result["value"])
+            except DeliverySheetError as exc:
+                logger.warning("Label counter sheet update skipped phone=%s: %s", phone, exc)
+            except Exception:
+                logger.exception("Label counter sheet update failed phone=%s attempt=%s", phone, attempt)
+                failed = True
+            finally:
+                release_delivery_sheet_db_lock(db_lock_connection)
+            if not failed:
+                break
+            # Пауза уже после снятия блокировки, чтобы не задерживать запись сумм.
+            if attempt < LABEL_COUNTER_SHEET_ATTEMPTS:
+                time.sleep(LABEL_COUNTER_SHEET_RETRY_SECONDS)
+
+
+def count_printed_label_in_sheet(session, job):
+    if not job.delivery_id or job.source not in {"auto", "manual"}:
+        return
+    entry = session.query(ForDelivery).filter(ForDelivery.id == job.delivery_id).first()
+    phone = get_delivery_sheet_phone(session, phone=job.phone, delivery_entry=entry)
+    # Клиент ещё в сборке — обычная наклейка; уже собран — допечатка, «м» остаётся.
+    queue_delivery_label_counter(phone, add_labels=1, finished=False if entry else None)
+
+
 def finish_label_print_job(job_id, ok, error=None):
     with Session(bind=engine) as session:
         job = session.query(LabelPrintJob).filter(LabelPrintJob.id == job_id).with_for_update().first()
         if not job:
             return False
         if ok:
+            if job.status != LABEL_PRINT_STATUS_PRINTED:
+                count_printed_label_in_sheet(session, job)
             job.status = LABEL_PRINT_STATUS_PRINTED
             job.printed_at = now_local()
             job.error = None
@@ -11563,7 +11671,7 @@ def start_label_print_api():
 
 def build_delivery_collection_finish_keyboard(delivery_id, page=0):
     keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("🏁 Закончить сборку", callback_data=f"delivery_collected_{delivery_id}"))
+    keyboard.add(InlineKeyboardButton("🏁 Закончить сборку", callback_data=f"delivery_finish_ask_{delivery_id}"))
     if label_print_api_enabled():
         keyboard.add(InlineKeyboardButton("🖨 Наклейка", callback_data=f"label_print_{delivery_id}"))
     keyboard.add(InlineKeyboardButton("⬅️ К списку", callback_data=f"collect_release_{delivery_id}_{page}"))
@@ -12340,8 +12448,10 @@ def finish_delivery_collection(delivery_id, collector_user_id=None, move_unplace
                 extra_entry.collection_started_at = None
                 continue
             session.delete(extra_entry)
+        label_counter_phone = get_delivery_sheet_phone(session, delivery_entry=delivery_entry)
         session.delete(delivery_entry)
         session.commit()
+    queue_delivery_label_counter(label_counter_phone, add_labels=0, finished=True)
 
     for post_id in affected_missing_post_ids:
         post = Posts.get_row_by_id(post_id)
@@ -12422,6 +12532,60 @@ def confirm_finish_delivery_with_missing(call):
             logger=logger,
         )
     show_delivery_collection_list(call.message.chat.id, message_id=call.message.message_id, page=0)
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_finish_ask_"))
+def ask_finish_delivery_collection(call):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+
+    delivery_id = parse_callback_int_suffix(call, "delivery_finish_ask_")
+    if delivery_id is None:
+        return
+    safe_answer_callback_query(call.id)
+
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(
+        InlineKeyboardButton("Да", callback_data=f"delivery_collected_{delivery_id}"),
+        InlineKeyboardButton("Нет", callback_data=f"delivery_finish_no_{delivery_id}"),
+    )
+    text = "Вы уверены что хотите закончить сборку?"
+    edited_message = safe_edit_message_text(
+        bot,
+        logger=logger,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=text,
+        reply_markup=keyboard,
+    )
+    if edited_message is None:
+        safe_send_message(bot, call.message.chat.id, text, logger=logger, reply_markup=keyboard)
+
+
+@bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_finish_no_"))
+def decline_finish_delivery_collection(call):
+    if not has_role(call.from_user.id, DELIVERY_COLLECTION_ROLES):
+        safe_answer_callback_query(call.id, "У вас нет прав для этой функции.", show_alert=True)
+        return
+
+    delivery_id = parse_callback_int_suffix(call, "delivery_finish_no_")
+    if delivery_id is None:
+        return
+    safe_answer_callback_query(call.id)
+
+    text = "Ну и пиздуй дальше собирать доставку"
+    keyboard = build_delivery_collection_finish_keyboard(delivery_id, page=0)
+    edited_message = safe_edit_message_text(
+        bot,
+        logger=logger,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=text,
+        reply_markup=keyboard,
+    )
+    if edited_message is None:
+        safe_send_message(bot, call.message.chat.id, text, logger=logger, reply_markup=keyboard)
 
 
 @bot.callback_query_handler(func=lambda call: callback_data_startswith(call, "delivery_finish_continue_"))
